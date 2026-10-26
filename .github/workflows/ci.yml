@@ -1,0 +1,72 @@
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Cancel outdated runs for the same branch or pull-request ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+          python3 --version
+          clang --version
+          clang++ --version
+          gcc --version
+          g++ --version
+          ar --version 2>&1 | head -n 1 || true
+          make --version 2>&1 | head -n 1 || true
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Rust tests
+        run: cargo test --locked --all-targets
+
+      - name: Release tests
+        run: cargo test --locked --release --all-targets
+
+      - name: Documentation
+        run: cargo doc --locked --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Build Forge
+        run: cargo build --locked --release
+
+      - name: Example integration tests
+        run: python3 dev/test_examples.py
