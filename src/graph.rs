@@ -318,9 +318,10 @@ mod tests {
             "{}",
             g.render_text()
         );
-        assert!(g
-            .render_dot()
-            .contains("\"libft/libft.a\" -> \"app\" [style=dashed];"));
+        assert!(
+            g.render_dot()
+                .contains("\"libft/libft.a\" -> \"app\" [style=dashed];")
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use crate::{
-    config::{manifest::Build, Config, ConfigError, Manifest},
+    config::{Config, ConfigError, Manifest, manifest::Build},
     discover::discover_sources,
     lang::{Lang, Toolchain},
     profile::validate_profiles,

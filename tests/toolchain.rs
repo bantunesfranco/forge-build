@@ -39,8 +39,7 @@ fn error(build_keys: &str, files: &[&str]) -> String {
 
 const CPP: &str = "compiler = \"clang++\"\nstandard = \"c++20\"";
 const C: &str = "compiler = \"clang\"\nstandard = \"c17\"";
-const MIXED: &str =
-    "c_compiler = \"clang\"\nc_standard = \"c17\"\ncxx_compiler = \"clang++\"\ncxx_standard = \"c++20\"";
+const MIXED: &str = "c_compiler = \"clang\"\nc_standard = \"c17\"\ncxx_compiler = \"clang++\"\ncxx_standard = \"c++20\"";
 
 #[test]
 fn cpp_only_project_with_the_shorthand_keys() {
@@ -96,11 +95,13 @@ fn missing_compiler_names_the_key_and_the_file() {
 #[test]
 fn only_languages_present_need_a_toolchain() {
     // no C++ sources, so no cxx_* keys are required
-    assert!(project(
-        "c_compiler = \"clang\"\nc_standard = \"c17\"",
-        &["src/main.c"]
-    )
-    .is_ok());
+    assert!(
+        project(
+            "c_compiler = \"clang\"\nc_standard = \"c17\"",
+            &["src/main.c"]
+        )
+        .is_ok()
+    );
 }
 
 #[test]

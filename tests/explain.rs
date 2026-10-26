@@ -8,7 +8,7 @@ use std::{
 };
 
 use forge_build::{
-    build::{build, prepare, BuildOptions},
+    build::{BuildOptions, build, prepare},
     config,
     executor::{CommandSpec, Executor, Outcome, ProcessExecutor},
     explain::explain,
@@ -51,8 +51,12 @@ fn write(root: &Path, rel: &str, text: &str) {
 fn setup() -> (tempfile::TempDir, PathBuf) {
     let t = tempfile::tempdir().unwrap();
     let root = t.path().canonicalize().unwrap();
-    write(&root, "Forge.toml", "[project]\nname = \"t\"\nversion = \"0.1.0\"\n\n[build]\ncompiler = \"g++\"\nstandard = \"c++20\"\n\
-        source_dirs = [\"src\"]\noutput = \"app\"\ndefault_profile = \"debug\"\n\n[build.flags]\ninclude_dirs = [\"include\"]\n\n[profile.debug]\nopt_level = 0\n");
+    write(
+        &root,
+        "Forge.toml",
+        "[project]\nname = \"t\"\nversion = \"0.1.0\"\n\n[build]\ncompiler = \"g++\"\nstandard = \"c++20\"\n\
+        source_dirs = [\"src\"]\noutput = \"app\"\ndefault_profile = \"debug\"\n\n[build.flags]\ninclude_dirs = [\"include\"]\n\n[profile.debug]\nopt_level = 0\n",
+    );
     write(&root, "include/a.hpp", "inline int a() { return 0; }\n");
     write(
         &root,

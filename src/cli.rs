@@ -2,13 +2,13 @@ use clap::{Parser, Subcommand};
 use std::{env::current_dir, fs, num::NonZeroUsize, path::PathBuf};
 
 use crate::{
-    build::{build, prepare, BuildOptions, BuildPlan},
+    build::{BuildOptions, BuildPlan, build, prepare},
     config::{find_manifest, load},
     executor::ProcessExecutor,
     explain::explain,
     graph::Graph,
     project::Project,
-    resolve::{resolve, Resolved},
+    resolve::{Resolved, resolve},
 };
 
 #[derive(Parser)]

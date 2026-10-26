@@ -2,7 +2,7 @@
 
 use std::{fmt, marker::PhantomData, str::FromStr};
 
-use serde::de::{self, value::SeqAccessDeserializer, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, MapAccess, SeqAccess, Visitor, value::SeqAccessDeserializer};
 use serde::{Deserialize, Deserializer};
 
 // ---------------------------------------------------------------- Define
@@ -138,7 +138,7 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for ListEdit<T> {
                         "remove" => ops.remove = map.next_value()?,
                         "set" => ops.set = Some(map.next_value()?),
                         other => {
-                            return Err(de::Error::unknown_field(other, &["add", "remove", "set"]))
+                            return Err(de::Error::unknown_field(other, &["add", "remove", "set"]));
                         }
                     }
                 }
@@ -199,7 +199,7 @@ impl FromStr for OptLevel {
             other => {
                 return Err(format!(
                     "invalid opt_level `{other}`; expected 0, 1, 2, 3, \"g\", \"s\", \"z\", or \"fast\""
-                ))
+                ));
             }
         })
     }

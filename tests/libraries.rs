@@ -8,7 +8,7 @@ use std::{
 };
 
 use forge_build::{
-    build::{build, BuildOptions},
+    build::{BuildOptions, build},
     config,
     executor::{CommandSpec, Executor, Outcome, ProcessExecutor},
     graph::{Graph, TaskKind},
@@ -83,10 +83,15 @@ fn project_with(flags: &str, files: &[&str]) -> Proj {
     for f in files {
         write(&root, f, "");
     }
-    write(&root, "Forge.toml", &format!(
-        "[project]\nname = \"t\"\nversion = \"0.1.0\"\n\n[build]\ncompiler = \"gcc\"\nstandard = \"c11\"\n\
+    write(
+        &root,
+        "Forge.toml",
+        &format!(
+            "[project]\nname = \"t\"\nversion = \"0.1.0\"\n\n[build]\ncompiler = \"gcc\"\nstandard = \"c11\"\n\
          source_dirs = [\"src\"]\noutput = \"app\"\ndefault_profile = \"debug\"\n\n\
-         [build.flags]\n{flags}\n\n[profile.debug]\nopt_level = 0\n"));
+         [build.flags]\n{flags}\n\n[profile.debug]\nopt_level = 0\n"
+        ),
+    );
     Proj { _t: t, root }
 }
 

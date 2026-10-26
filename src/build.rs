@@ -212,12 +212,12 @@ pub fn build(
                 // every output needs its directory (the depfile lives apart from the object)
                 let mut dir_failed = false;
                 for o in &task.outputs {
-                    if let Some(parent) = root.join(o).parent() {
-                        if let Err(e) = fs::create_dir_all(parent) {
-                            eprintln!("error: cannot create {}: {e}", parent.display());
-                            dir_failed = true;
-                            break;
-                        }
+                    if let Some(parent) = root.join(o).parent()
+                        && let Err(e) = fs::create_dir_all(parent)
+                    {
+                        eprintln!("error: cannot create {}: {e}", parent.display());
+                        dir_failed = true;
+                        break;
                     }
                 }
                 if dir_failed {
@@ -245,9 +245,7 @@ pub fn build(
                 s.spawn(move || {
                     let result =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exec.run(&spec)))
-                            .unwrap_or_else(|_| {
-                                Err(io::Error::other("executor panicked"))
-                            });
+                            .unwrap_or_else(|_| Err(io::Error::other("executor panicked")));
                     let _ = tx.send((id, result));
                 });
                 running += 1;

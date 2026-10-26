@@ -101,7 +101,8 @@ fn source_dirs_cannot_be_outside_root() {
 
 #[test]
 fn example_project_is_valid() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/hello/Forge.toml");
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/c-library/Forge.toml");
     Project::from_config(config::load(&path).unwrap()).unwrap();
 }
 
@@ -133,7 +134,6 @@ fn discovers_sources_as_sorted_relative_paths() {
     let f = Fixture::valid(); // already contains src/main.cpp
     f.touch("src/util/helper.cpp");
     f.touch("src/util/notes.txt"); // ignored: wrong extension
-    f.touch("src/old.c"); // ignored: C is out of v0.1
 
     let p = build(&f).unwrap();
 

@@ -63,25 +63,25 @@ impl Database {
     /// version) yields an empty database, which rebuilds everything.
     pub fn load_or_empty(path: &Path) -> Database {
         match fs::read(path) {
-            Ok(bytes) => {
-                match postcard::from_bytes::<Database>(&bytes) {
-                    Ok(db) if db.version == DB_VERSION => db,
-                    Ok(db) => {
-                        eprintln!(
+            Ok(bytes) => match postcard::from_bytes::<Database>(&bytes) {
+                Ok(db) if db.version == DB_VERSION => db,
+                Ok(db) => {
+                    eprintln!(
                         "warning: ignoring build database {} (version {}, expected {}); rebuilding",
-                        path.display(), db.version, DB_VERSION
+                        path.display(),
+                        db.version,
+                        DB_VERSION
                     );
-                        Database::new()
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "warning: ignoring unreadable build database {}: {e}; rebuilding",
-                            path.display()
-                        );
-                        Database::new()
-                    }
+                    Database::new()
                 }
-            }
+                Err(e) => {
+                    eprintln!(
+                        "warning: ignoring unreadable build database {}: {e}; rebuilding",
+                        path.display()
+                    );
+                    Database::new()
+                }
+            },
             Err(e) if e.kind() == io::ErrorKind::NotFound => Database::new(),
             Err(e) => {
                 eprintln!(
@@ -185,9 +185,11 @@ mod tests {
     #[test]
     fn missing_file_gives_empty_database() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(Database::load_or_empty(&dir.path().join("nope.db"))
-            .tasks
-            .is_empty());
+        assert!(
+            Database::load_or_empty(&dir.path().join("nope.db"))
+                .tasks
+                .is_empty()
+        );
     }
 
     #[test]

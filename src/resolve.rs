@@ -13,9 +13,9 @@ use std::{
 
 use crate::{
     config::{
+        ConfigError, Manifest,
         manifest::BuildProfile,
         types::{Define, OptLevel},
-        ConfigError, Manifest,
     },
     lang::{Lang, Toolchain},
     project::Project,
@@ -189,13 +189,17 @@ fn check_flag(field: &str, flag: &str) -> Result<(), ConfigError> {
     if flag.chars().any(char::is_whitespace) {
         return Err(ConfigError::invalid(
             field,
-            format!("`{flag}` contains whitespace; every entry is exactly one argument, so split it into separate entries"),
+            format!(
+                "`{flag}` contains whitespace; every entry is exactly one argument, so split it into separate entries"
+            ),
         ));
     }
     if flag.starts_with("-M") || flag.starts_with("-o") || matches!(flag, "-c" | "-E" | "-S") {
         return Err(ConfigError::invalid(
             field,
-            format!("`{flag}` is controlled by Forge (output, dependency files, compile-only) and cannot be set here"),
+            format!(
+                "`{flag}` is controlled by Forge (output, dependency files, compile-only) and cannot be set here"
+            ),
         ));
     }
     Ok(())
@@ -403,7 +407,9 @@ inherits = ["a", "b"]
 
     #[test]
     fn accepts_ordinary_flags() {
-        let m = manifest("[profile.x]\ncompile_flags = [\"-fsanitize=address\", \"-Wno-unused\", \"-march=native\"]");
+        let m = manifest(
+            "[profile.x]\ncompile_flags = [\"-fsanitize=address\", \"-Wno-unused\", \"-march=native\"]",
+        );
         assert!(validate_flags(&m).is_ok());
     }
 
@@ -423,9 +429,11 @@ default_profile = "debug"
 defines = ["A=1", "A=2"]
 "#;
         let m: Manifest = toml::from_str(text).unwrap();
-        assert!(validate_flags(&m)
-            .unwrap_err()
-            .to_string()
-            .contains("more than once"));
+        assert!(
+            validate_flags(&m)
+                .unwrap_err()
+                .to_string()
+                .contains("more than once")
+        );
     }
 }

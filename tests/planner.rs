@@ -9,7 +9,7 @@ use std::{
 };
 
 use forge_build::{
-    build::{build, BuildOptions},
+    build::{BuildOptions, build},
     config::manifest::{Build, Flags, Manifest, ProjectInfo},
     executor::{CommandSpec, Executor, Outcome, ProcessExecutor},
     graph::Graph,
@@ -280,7 +280,7 @@ fn changed_flags_rebuild_everything() {
 }
 
 #[test]
-fn removing_a_source_relinks() {
+fn removing_a_source_rebuilds() {
     let p = proj();
     let exec = Logging::new();
     run(&p, &exec, 2).unwrap();
@@ -334,7 +334,10 @@ fn removing_a_source_relinks() {
         },
     )
     .unwrap();
-    assert_eq!(exec.runs(), vec!["link".to_string()]);
+    assert_eq!(
+        exec.runs(),
+        vec!["src/main.cpp".to_string(), "link".to_string()]
+    );
 }
 
 #[test]

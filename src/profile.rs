@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use crate::config::{manifest::BuildProfile, ConfigError};
+use crate::config::{ConfigError, manifest::BuildProfile};
 
 pub fn validate_profiles(
     default: &str,

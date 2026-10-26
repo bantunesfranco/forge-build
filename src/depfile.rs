@@ -1,7 +1,7 @@
 //! Parser for Makefile-style dependency files (`gcc -MD` output).
 //!
 //! Adapted from the `depfile` module of the `shuriken` crate
-//! (https://docs.rs/shuriken), used under the MIT license; see
+//! (<https://docs.rs/shuriken>), used under the MIT license; see
 //! THIRD-PARTY-NOTICES.md. shuriken's parser reproduces the behavior of
 //! Ninja's `depfile_parser.in.cc` (Apache-2.0).
 //!
