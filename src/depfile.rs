@@ -1,9 +1,11 @@
 //! Parser for Makefile-style dependency files (`gcc -MD` output).
 //!
-//! Adapted from the `depfile` module of the `shuriken` crate
-//! (<https://docs.rs/shuriken>), used under the MIT license; see
-//! THIRD-PARTY-NOTICES.md. shuriken's parser reproduces the behavior of
-//! Ninja's `depfile_parser.in.cc` (Apache-2.0).
+//! Copyright "Alec Nunn <alec.nunn@gmail.com>. Copied without functional changes
+//! from the `depfile` module of the `shuriken` crate (<https://docs.rs/shuriken>),
+//! which is available under MIT OR Apache-2.0, the same terms as this project;
+//! see THIRD-PARTY-NOTICES.md. shuriken's parser reproduces the behavior of
+//! Ninja's `depfile_parser.in.cc` (Copyright <Ninja's copyright holder>,
+//! Apache-2.0).
 //!
 //! This follows what GCC and Clang actually emit, exactly as ninja's
 //! `depfile_parser.in.cc` does:

@@ -287,5 +287,18 @@ Linux and macOS with GCC or Clang. On Windows, use WSL. MSVC is not supported.
 
 ## License
 
-MIT, see [`LICENSE`](LICENSE). The depfile parser is adapted from other projects;
-see [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).
+Licensed under either of
+
+- Apache License, Version 2.0 ([`LICENSE-APACHE`](LICENSE-APACHE))
+- MIT license ([`LICENSE-MIT`](LICENSE-MIT))
+
+at your option.
+
+The dependency-file parser (`src/depfile.rs`) is adapted from other projects; see
+[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for
+inclusion in this project by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
