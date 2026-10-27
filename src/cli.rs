@@ -12,7 +12,7 @@ use crate::{
 };
 
 #[derive(Parser)]
-#[command(name = "forge-build", version, about)]
+#[command(name = "forge", version, about)]
 struct Cli {
     #[arg(short, long, global = true)]
     manifest: Option<PathBuf>,
@@ -69,9 +69,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &profile,
                 opts,
             ) {
-                Ok(_) => {
-                    println!("Build successfull")
-                }
+                Ok(_) => println!("Build successful"),
                 Err(e) => return Err(Box::new(e)),
             }
         }

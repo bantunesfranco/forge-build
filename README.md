@@ -8,7 +8,7 @@ explainable build plans.
 
 It is a learning project, not a replacement for Make, Ninja or CMake. The point is
 to implement the core ideas of an incremental build engine and make its decisions
-visible: every rebuild comes with a reason, and `forge-build explain` shows the
+visible: every rebuild comes with a reason, and `forge explain` shows the
 plan without running anything.
 
 ## Features
@@ -30,21 +30,21 @@ Requirements: a Rust toolchain, and `gcc` or `clang` (plus `ar` for libraries).
 ```text
 cargo install --path .
 cd examples/hello
-forge-build build
+forge build
 ./build/debug/hello
 ```
 
 ```text
-$ forge-build build
+$ forge build
 Compiling src/main.cpp
 Compiling src/greeting.cpp
 Linking build/debug/hello
 
-$ forge-build build
+$ forge build
 Build is up to date
 
 $ touch include/greeting.hpp && echo "// edit" >> include/greeting.hpp
-$ forge-build explain
+$ forge explain
 build/debug/obj/src/greeting.cpp.o: rebuild: include/greeting.hpp changed
 build/debug/obj/src/main.cpp.o: up to date
 build/debug/hello: rebuild: build/debug/obj/src/greeting.cpp.o was rebuilt
@@ -55,11 +55,11 @@ build/debug/hello: rebuild: build/debug/obj/src/greeting.cpp.o was rebuilt
 ## Commands
 
 | Command | What it does |
-|---|---|
-| `forge-build build [-j N] [-v]` | Build the selected profile. `-v` prints each command and why it runs. |
-| `forge-build explain [TARGET]` | Say what would rebuild, and why. A target can be an output file or a source file. |
-| `forge-build graph [--dot]` | Print the task graph; `--dot` emits Graphviz (`... \| dot -Tpng -o graph.png`). |
-| `forge-build clean [--all]` | Remove the selected profile's build directory, or all of `build/`. |
+| --- | --- |
+| `forge build [-j N] [-v]` | Build the selected profile. `-v` prints each command and why it runs. |
+| `forge explain [TARGET]` | Say what would rebuild, and why. A target can be an output file or a source file. |
+| `forge graph [--dot]` | Print the task graph; `--dot` emits Graphviz (`... \| dot -Tpng -o graph.png`). |
+| `forge clean [--all]` | Remove the selected profile's build directory, or all of `build/`. |
 
 Global options: `-p, --profile NAME` (default: `build.default_profile`) and
 `-m, --manifest PATH` (a `Forge.toml`, or a directory containing one).
@@ -74,14 +74,14 @@ their working directory.
 
 ```toml
 [project]
-name = "ft_ssl"
+name = "example"
 version = "0.1.0"
 
 [build]
 compiler = "gcc"            # shorthand for a project with one language
 standard = "c11"
 source_dirs = ["srcs"]      # .c .cc .cpp .cxx, searched recursively
-output = "ft_ssl"           # placed in build/<profile>/
+output = "example"          # placed in build/<profile>/
 default_profile = "debug"
 
 [build.flags]               # the base layer, shared by every profile
@@ -89,9 +89,9 @@ warnings = true             # -Wall -Wextra
 pedantic = true             # -Wpedantic
 error_on_warning = true     # -Werror
 defines = ["USE_FOO", "VERSION=3"]
-include_dirs = ["incs", "libft/incs"]
-lib_dirs = ["libft"]
-libs = ["ft"]
+include_dirs = ["incs", "libtest/incs"]
+lib_dirs = ["libtest"]
+libs = ["test"]
 
 [profile.debug]
 opt_level = 0
@@ -186,7 +186,7 @@ link task consumes the objects. Cycles and duplicate outputs are rejected.
 the first reason that applies:
 
 | Reason | Meaning |
-|---|---|
+| --- | --- |
 | `no previous build record` | Never built, or the last attempt left no trustworthy record. |
 | `<path> was rebuilt` | An upstream task is running, so this one must too. |
 | `command or compiler changed` | Flags, defines, standard, or the compiler's `--version` changed. |
@@ -234,7 +234,7 @@ Profiles do not share anything, so switching between them never rebuilds.
 ## Source map
 
 | Module | Role |
-|---|---|
+| --- | --- |
 | `config` | Manifest shape (serde), plus `Define`, `ListEdit`, `OptLevel` |
 | `project` | Path validation, source discovery, toolchain choice, build layout |
 | `profile`, `resolve` | Profile checks; layering a profile into compiler arguments |
@@ -279,7 +279,7 @@ Linux and macOS with GCC or Clang. On Windows, use WSL. MSVC is not supported.
 
 ## Roadmap
 
-1. Static library targets (`ar`), so Forge can build things like `libft` itself.
+1. Static library targets (`ar`)
 2. `pkg-config` support, with its flags in the fingerprint.
 3. Path dependencies, then fetching (git commit pin, tarball checksum, lockfile).
 4. CMake as a single opaque task producing headers and libraries.

@@ -2,19 +2,17 @@
 name = "forge-build"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99"
-description = "Simple C/C++ build system"
+rust-version = "1.88"
+description = "An incremental C/C++ build system with explainable rebuilds"
 license = "MIT OR Apache-2.0"
 authors = ["Bruno Franco <brunoantunesfranco@gmail.com>"]
 repository = "https://github.com/bantunesfranco/forge-build"
 homepage = "https://github.com/bantunesfranco/forge-build"
 categories = ["development-tools::build-utils"]
+keywords = ["build-system", "c", "cpp", "incremental", "make"]
 readme = "README.md"
 exclude = ["/.github"]
-
-[lib]
-name = "forge_build"
-path = "src/lib.rs"
+publish = false         # keep until ready to publish to crates.io
 
 [[bin]]
 name = "forge"
