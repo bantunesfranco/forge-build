@@ -2,7 +2,7 @@
 name = "forge-build"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "An incremental C/C++ build system with explainable rebuilds"
 license = "MIT OR Apache-2.0"
 authors = ["Bruno Franco <brunoantunesfranco@gmail.com>"]
