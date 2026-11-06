@@ -8,7 +8,7 @@
 
 use std::{
     collections::{BTreeMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use crate::{
@@ -59,6 +59,23 @@ pub struct Layered {
     pub defines: Vec<Define>,
     pub compile_flags: Vec<String>,
     pub link_flags: Vec<String>,
+}
+
+pub enum Origin {
+    System { found_by: String },  // "pkg-config:zlib"
+    Vendored { prefix: PathBuf }, // vendor/<name>/<profile>/install
+}
+
+pub struct ResolvedDep {
+    pub name: String,
+    pub version: Option<String>,
+    pub origin: Origin,
+    pub include_dirs: Vec<PathBuf>,
+    pub lib_dirs: Vec<PathBuf>,
+    pub libs: Vec<String>,
+    pub defines: Vec<Define>,
+    pub cflags: Vec<String>,
+    pub ldflags: Vec<String>,
 }
 
 /// Applies the base layer and the chain of `profile` to produce its settings.

@@ -280,10 +280,26 @@ Linux and macOS with GCC or Clang. On Windows, use WSL. MSVC is not supported.
 ## Roadmap
 
 1. Static library targets (`ar`)
-2. `pkg-config` support, with its flags in the fingerprint.
-3. Path dependencies, then fetching (git commit pin, tarball checksum, lockfile).
-4. CMake as a single opaque task producing headers and libraries.
-5. Early cutoff.
+2. Lockfile pinning for fetched Git dependencies and more portable archive handling.
+3. Dependency task caching and build logs.
+4. Early cutoff.
+
+## Dependencies
+
+`[dependencies.<name>]` entries are resolved during `forge build`. A `find`
+list tries system finders in order (`pkg-config:<module>` and `cmake:<package>`);
+`prefer = "system"` falls back to `[source]`, `"vendored"` always builds the
+source, and `"system-only"` reports a missing requirement. Git sources are
+checked out at `rev`; tar sources are verified against `sha256`; local path
+sources are also supported. Fetched and installed files are kept under
+`build/deps/` and removed by `forge clean --all`.
+
+Build backends are `make`, `cmake`, `autotools`, `none`, `self`, and `steps`.
+Omitting `system` detects a nested Forge project (`Forge.toml`), CMake,
+Autotools, or Makefile projects, in that order. Use
+`[dependencies.<name>.expose]` for projects without an install target, or for
+header-only sources. Custom build commands in `steps` accept `{prefix}`, `{cc}`,
+`{cxx}`, and `{jobs}` substitutions and run in the source directory.
 
 ## License
 

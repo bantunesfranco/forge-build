@@ -1,7 +1,6 @@
 //! Drives build() against a real g++ with a logging executor, to check the
 //! incremental behavior the plan's demo relies on.
 use std::{
-    collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
     str::FromStr,
@@ -10,7 +9,7 @@ use std::{
 
 use forge_build::{
     build::{BuildOptions, build},
-    config::manifest::{Build, Flags, Manifest, ProjectInfo},
+    config::manifest::{Build, Manifest},
     executor::{CommandSpec, Executor, Outcome, ProcessExecutor},
     graph::Graph,
     lang::Toolchain,
@@ -95,15 +94,10 @@ fn run(p: &Proj, exec: &Logging, jobs: usize) -> Result<(), forge_build::build::
                 standard: Some(String::from_str("c++20").unwrap()),
                 source_dirs: vec![PathBuf::from("src/")],
                 default_profile: String::from_str("debug").unwrap(),
-                c_compiler: None,
-                c_standard: None,
-                cxx_compiler: None,
-                cxx_standard: None,
-                flags: Flags::default(),
                 output: PathBuf::from("app"),
+                ..Build::default()
             },
-            profiles: BTreeMap::default(),
-            project: ProjectInfo::default(),
+            ..Manifest::default()
         },
         c: None,
         cpp: Some(Toolchain {
@@ -239,15 +233,10 @@ fn changed_flags_rebuild_everything() {
                 standard: Some(String::from_str("c++20").unwrap()),
                 source_dirs: vec![PathBuf::from("src/")],
                 default_profile: String::from_str("debug").unwrap(),
-                c_compiler: None,
-                c_standard: None,
-                cxx_compiler: None,
-                cxx_standard: None,
-                flags: Flags::default(),
                 output: PathBuf::from("app"),
+                ..Build::default()
             },
-            profiles: BTreeMap::default(),
-            project: ProjectInfo::default(),
+            ..Manifest::default()
         },
         c: None,
         cpp: Some(Toolchain {
@@ -297,15 +286,10 @@ fn removing_a_source_rebuilds() {
                 standard: Some(String::from_str("c++20").unwrap()),
                 source_dirs: vec![PathBuf::from("src/")],
                 default_profile: String::from_str("debug").unwrap(),
-                c_compiler: None,
-                c_standard: None,
-                cxx_compiler: None,
-                cxx_standard: None,
-                flags: Flags::default(),
                 output: PathBuf::from("app"),
+                ..Build::default()
             },
-            profiles: BTreeMap::default(),
-            project: ProjectInfo::default(),
+            ..Manifest::default()
         },
         c: None,
         cpp: Some(Toolchain {

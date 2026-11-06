@@ -1,7 +1,11 @@
 use std::path::{Component, Path, PathBuf};
 
 use crate::{
-    config::{Config, ConfigError, Manifest, manifest::Build},
+    config::{
+        Config, ConfigError, Manifest,
+        manifest::{Build, Dependency},
+        types::{Prefer, Source},
+    },
     discover::discover_sources,
     lang::{Lang, Toolchain},
     profile::validate_profiles,
@@ -68,6 +72,9 @@ impl Project {
         )?;
 
         check_overlap("build.source_dirs", &source_dirs)?;
+
+        validate_dependencies(&manifest)?;
+
         validate_output(&root, &manifest.build.output, &source_dirs)?;
 
         let sources = discover_sources(&root, &source_dirs)?;
@@ -359,6 +366,52 @@ fn validate_output(root: &Path, out: &Path, source_dirs: &[PathBuf]) -> Result<(
             "`{}` is inside a source directory",
             out.display()
         )));
+    }
+    Ok(())
+}
+
+// --------------------------- dependencies -------------------
+
+impl Dependency {
+    pub fn validate(&self, name: &str) -> Result<(), ConfigError> {
+        let bad = |m: &str| ConfigError::invalid(format!("dependency.{}", name), m);
+
+        match (self.prefer.unwrap_or(Prefer::System), &self.source) {
+            (Prefer::Vendored, None) => return Err(bad("prefer = \"vendored\" needs a [source]")),
+            (Prefer::SystemOnly, Some(_)) => {
+                return Err(bad("system-only conflicts with [source]"));
+            }
+            (Prefer::System, None) if self.find.is_empty() => {
+                return Err(bad("needs `find` entries or a [source]"));
+            }
+            _ => {}
+        }
+
+        if let Some(Source::Tar { sha256, .. }) = &self.source
+            && (sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Err(bad("sha256 must be 64 hex characters"));
+        }
+
+        if self.build.steps.is_some()
+            && !matches!(self.build.system.as_deref(), None | Some("steps"))
+        {
+            return Err(bad("`steps` can't be combined with another build.system"));
+        }
+        if self.build.system.as_deref() == Some("steps")
+            && self.build.steps.as_ref().is_none_or(Vec::is_empty)
+        {
+            return Err(bad(
+                "build.system = \"steps\" needs a non-empty `steps` array",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn validate_dependencies(m: &Manifest) -> Result<(), ConfigError> {
+    for (name, dep) in &m.dependencies {
+        dep.validate(name)?;
     }
     Ok(())
 }

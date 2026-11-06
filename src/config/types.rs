@@ -1,6 +1,6 @@
 //! Value types that appear in the manifest: macros, list edits, optimization levels.
 
-use std::{fmt, marker::PhantomData, str::FromStr};
+use std::{collections::BTreeMap, fmt, marker::PhantomData, path::PathBuf, str::FromStr};
 
 use serde::de::{self, MapAccess, SeqAccess, Visitor, value::SeqAccessDeserializer};
 use serde::{Deserialize, Deserializer};
@@ -226,6 +226,99 @@ impl<'de> Deserialize<'de> for OptLevel {
         d.deserialize_any(V)
     }
 }
+
+// ----------------------------- dependencies ------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Prefer {
+    System,     // try system, fall back to [source] if present
+    Vendored,   // always build from [source]
+    SystemOnly, // never fetch; fail with an install hint
+}
+
+/// "pkg-config:zlib", "cmake:fmt", "probe:zlib.h:z"
+#[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "String")]
+pub enum FindSpec {
+    PkgConfig(String),
+    CMake(String),
+    Probe { header: String, lib: String },
+}
+
+impl TryFrom<String> for FindSpec {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, String> {
+        match s.split_once(':') {
+            Some(("pkg-config", n)) if !n.is_empty() => Ok(Self::PkgConfig(n.into())),
+            Some(("cmake", n)) if !n.is_empty() => Ok(Self::CMake(n.into())),
+            Some(("probe", rest)) => match rest.split_once(':') {
+                Some((h, l)) => Ok(Self::Probe {
+                    header: h.into(),
+                    lib: l.into(),
+                }),
+                None => Err(format!("probe needs header:lib, got `{rest}`")),
+            },
+            _ => Err(format!(
+                "unknown find spec `{s}` (expected pkg-config:, cmake: or probe:)"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum Source {
+    /// `rev` may be a tag, branch or commit; the lockfile pins it to a commit.
+    Git {
+        url: String,
+        rev: String,
+        submodules: Option<bool>, // default false
+    },
+    /// Verified against `sha256` before extraction.
+    Tar {
+        url: String,
+        sha256: String,
+        strip_components: Option<u32>, // default 1
+    },
+    Path {
+        path: PathBuf,
+    },
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DepBuild {
+    /// None = auto-detect. A String because the backend registry is open
+    /// ("cmake", "meson", "self", "steps", ...).
+    pub system: Option<String>,
+    pub subdir: Option<PathBuf>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Custom commands with {prefix}, {cc}, {cxx}, {jobs} substitution.
+    pub steps: Option<Vec<String>>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Expose {
+    #[serde(default)]
+    pub include: Vec<PathBuf>,
+    #[serde(default)]
+    pub lib_dirs: Vec<PathBuf>,
+    #[serde(default)]
+    pub libs: Vec<String>,
+    #[serde(default)]
+    pub defines: Vec<Define>,
+    #[serde(default)]
+    pub cflags: Vec<String>,
+    #[serde(default)]
+    pub ldflags: Vec<String>,
+}
+
+// ------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

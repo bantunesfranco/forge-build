@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::Deserialize;
 
-use super::types::{Define, ListEdit, OptLevel};
+use super::types::{Define, DepBuild, Expose, FindSpec, ListEdit, OptLevel, Prefer, Source};
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -13,6 +13,8 @@ pub struct Manifest {
     pub build: Build,
     #[serde(default, rename = "profile")]
     pub profiles: BTreeMap<String, BuildProfile>,
+    #[serde(default)]
+    pub dependencies: BTreeMap<String, Dependency>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -70,4 +72,25 @@ pub struct BuildProfile {
     pub defines: ListEdit<Define>,
     pub compile_flags: ListEdit<String>,
     pub link_flags: ListEdit<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Dependency {
+    /// A string: pkg-config versions ("1.0.2k") are not always semver.
+    pub version: Option<String>,
+    /// Defaults to `System`; resolved in project.rs, like the other Option layers.
+    pub prefer: Option<Prefer>,
+    #[serde(default)]
+    pub find: Vec<FindSpec>,
+    /// Defaults to true.
+    pub required: Option<bool>,
+    /// Added to the consumer when this dependency resolves (e.g. HAVE_FOO).
+    #[serde(default)]
+    pub defines: Vec<Define>,
+    pub source: Option<Source>,
+    #[serde(default)]
+    pub build: DepBuild,
+    /// Manual exposure; overrides pkg-config and convention discovery.
+    pub expose: Option<Expose>,
 }

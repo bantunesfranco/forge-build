@@ -49,10 +49,8 @@ enum Commands {
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Cli = Cli::parse();
     let manifest: PathBuf = find_manifest(args.manifest.as_deref())?;
-    let project: Project = Project::from_config(load(&manifest)?)?;
+    let mut project: Project = Project::from_config(load(&manifest)?)?;
     let profile: String = project.select_profile(args.profile.as_deref())?;
-    let graph: Graph = Graph::from_project(&project, &profile)?;
-    let resolved: Resolved = resolve(&project, &profile)?;
 
     match args.command {
         Some(Commands::Build { jobs, verbose }) => {
@@ -60,6 +58,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 jobs: jobs.map_or_else(|| BuildOptions::default().jobs, |j| j.get()),
                 verbose,
             };
+
+            crate::dependencies::prepare(&mut project, &profile, opts.jobs)?;
+            let graph: Graph = Graph::from_project(&project, &profile)?;
+            let resolved: Resolved = resolve(&project, &profile)?;
 
             match build(
                 &project,
@@ -74,6 +76,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Some(Commands::Graph { dot }) => {
+            let graph: Graph = Graph::from_project(&project, &profile)?;
             println!("{}", graph.render(dot));
         }
         Some(Commands::Clean { all }) => {
@@ -98,6 +101,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Some(Commands::Explain { target }) => {
+            let graph: Graph = Graph::from_project(&project, &profile)?;
+            let resolved: Resolved = resolve(&project, &profile)?;
             let plan: BuildPlan = prepare(&graph, &project, &resolved, &ProcessExecutor, &profile);
             let cwd: PathBuf = current_dir().unwrap();
             match explain(&graph, &plan, target.as_deref(), &project.root, &cwd) {
