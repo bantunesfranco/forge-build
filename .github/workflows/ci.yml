@@ -69,5 +69,47 @@ jobs:
       - name: Build Forge
         run: cargo build --locked --release
 
-      - name: Example integration tests
+      - name: Example and dependency integration tests
         run: python3 dev/test_examples.py
+
+  coverage:
+    name: Rust coverage (Ubuntu)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89"
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Generate LCOV report
+        run: cargo llvm-cov --locked --all-targets --lcov --output-path lcov.info
+
+      - name: SonarQube Cloud scan
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: SonarSource/sonarqube-scan-action@v8.3.0
+        with:
+          args: >-
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
+            -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }}
+            -Dsonar.sources=src
+            -Dsonar.tests=tests
+            -Dsonar.rust.lcov.reportPaths=lcov.info
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-coverage-lcov
+          path: lcov.info
+          if-no-files-found: error
+          retention-days: 14

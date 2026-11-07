@@ -15,6 +15,7 @@ Optional environment variables:
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -293,6 +294,148 @@ def test_mixed_language(temp_root: Path) -> None:
     print("[PASS] mixed-language")
 
 
+def test_steps_dependency(temp_root: Path) -> None:
+    """Build and link a local dependency through the custom steps backend."""
+    print("[TEST] steps dependency")
+
+    require_tool("ar")
+    dependency = temp_root / "tiny-dependency"
+    dependency.mkdir()
+    (dependency / "tiny.h").write_text(
+        "int tiny_value(void);\n", encoding="utf-8"
+    )
+    (dependency / "tiny.c").write_text(
+        "int tiny_value(void) { return 17; }\n", encoding="utf-8"
+    )
+
+    project = temp_root / "dependency-consumer"
+    (project / "src").mkdir(parents=True)
+    (project / "src" / "main.c").write_text(
+        '#include "tiny.h"\n'
+        "int main(void) { return tiny_value() == 17 ? 0 : 1; }\n",
+        encoding="utf-8",
+    )
+    compiler = os.environ.get("CC") or shutil.which("clang") or shutil.which("gcc")
+    if not compiler:
+        raise IntegrationTestFailure(
+            "No suitable C compiler found for dependency test"
+        )
+
+    manifest = f'''[project]
+name = "dependency-consumer"
+version = "0.1.0"
+
+[build]
+compiler = {json.dumps(compiler)}
+standard = "c11"
+source_dirs = ["src"]
+output = "dependency-consumer"
+default_profile = "debug"
+
+[profile.debug]
+opt_level = 0
+
+[dependencies.tiny]
+prefer = "vendored"
+
+[dependencies.tiny.source]
+type = "path"
+path = "../tiny-dependency"
+
+[dependencies.tiny.build]
+system = "steps"
+steps = [
+  'mkdir -p "{{prefix}}/include" "{{prefix}}/lib"',
+  '"{{cc}}" -c tiny.c -o tiny.o',
+  'ar rcs "{{prefix}}/lib/libtiny.a" tiny.o',
+  'cp tiny.h "{{prefix}}/include/tiny.h"',
+]
+'''
+    (project / "Forge.toml").write_text(manifest, encoding="utf-8")
+
+    build(project)
+    run_program(project, "dependency-consumer", "debug", [])
+    print("[PASS] steps dependency")
+
+
+def test_forge_dependency_auto_detection(temp_root: Path) -> None:
+    """A nested Forge.toml selects the recursive Forge backend automatically."""
+    print("[TEST] Forge dependency auto-detection")
+
+    dependency = temp_root / "nested-forge"
+    (dependency / "src").mkdir(parents=True)
+    (dependency / "src" / "main.c").write_text(
+        "int main(void) { return 0; }\n", encoding="utf-8"
+    )
+    (dependency / "Forge.toml").write_text(
+        '''[project]
+name = "nested-forge"
+version = "0.1.0"
+
+[build]
+compiler = "cc"
+standard = "c11"
+source_dirs = ["src"]
+output = "nested-output"
+default_profile = "debug"
+
+[profile.debug]
+opt_level = 0
+''',
+        encoding="utf-8",
+    )
+
+    project = temp_root / "forge-consumer"
+    (project / "src").mkdir(parents=True)
+    (project / "src" / "main.c").write_text(
+        "int main(void) { return 0; }\n", encoding="utf-8"
+    )
+    compiler = os.environ.get("CC") or shutil.which("clang") or shutil.which("gcc")
+    if not compiler:
+        raise IntegrationTestFailure(
+            "No suitable C compiler found for dependency test"
+        )
+    (project / "Forge.toml").write_text(
+        f'''[project]
+name = "forge-consumer"
+version = "0.1.0"
+
+[build]
+compiler = {json.dumps(compiler)}
+standard = "c11"
+source_dirs = ["src"]
+output = "forge-consumer"
+default_profile = "debug"
+
+[profile.debug]
+opt_level = 0
+
+[dependencies.nested]
+prefer = "vendored"
+
+[dependencies.nested.source]
+type = "path"
+path = "../nested-forge"
+
+[dependencies.nested.expose]
+include = []
+lib_dirs = []
+libs = []
+''',
+        encoding="utf-8",
+    )
+
+    build(project)
+    child_output = executable(dependency, "nested-output", "debug")
+    if not child_output.is_file():
+        raise IntegrationTestFailure(
+            "Nested Forge dependency was not built automatically; expected "
+            f"{child_output}"
+        )
+    run_program(project, "forge-consumer", "debug", [])
+    print("[PASS] Forge dependency auto-detection")
+
+
 def main() -> int:
     if not FORGE.is_file():
         print(
@@ -332,6 +475,8 @@ def main() -> int:
             test_c_library(temp_root)
             test_cpp_profiles(temp_root)
             test_mixed_language(temp_root)
+            test_steps_dependency(temp_root)
+            test_forge_dependency_auto_detection(temp_root)
 
     except (IntegrationTestFailure, OSError) as error:
         print(f"\n[FAIL] {error}", file=sys.stderr)

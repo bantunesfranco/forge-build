@@ -326,19 +326,11 @@ fn build_dependency(
         .as_ref()
         .map(|x| x.program.as_str())
         .unwrap_or("c++");
-    let system = dep.build.system.as_deref().unwrap_or_else(|| {
-        if work.join("Forge.toml").is_file() {
-            "self"
-        } else if work.join("CMakeLists.txt").is_file() {
-            "cmake"
-        } else if work.join("configure").is_file() {
-            "autotools"
-        } else if work.join("Makefile").is_file() || work.join("makefile").is_file() {
-            "make"
-        } else {
-            "none"
-        }
-    });
+    let system = dep
+        .build
+        .system
+        .as_deref()
+        .unwrap_or_else(|| detect_build_system(&work));
     let args: Vec<String> = dep
         .build
         .args
@@ -579,6 +571,10 @@ pub fn prepare(project: &mut Project, profile: &str, jobs: usize) -> Result<(), 
                 .flags
                 .libs
                 .extend(e.libs.iter().cloned());
+        } else {
+            // By convention, an installed dependency exposes a library with
+            // the same name as its manifest entry; use [expose] to override.
+            project.manifest.build.flags.libs.push(name.clone());
         }
         project
             .manifest
@@ -617,5 +613,51 @@ fn add_directory(root: &Path, dirs: &mut Vec<PathBuf>, path: PathBuf) {
         && !dirs.contains(&p)
     {
         dirs.push(p);
+    }
+}
+
+fn detect_build_system(work: &Path) -> &'static str {
+    if work.join("Forge.toml").is_file() {
+        "self"
+    } else if work.join("CMakeLists.txt").is_file() {
+        "cmake"
+    } else if work.join("configure").is_file() {
+        "autotools"
+    } else if work.join("Makefile").is_file() || work.join("makefile").is_file() {
+        "make"
+    } else {
+        "none"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::detect_build_system;
+    use std::fs;
+
+    #[test]
+    fn auto_detects_supported_build_files_in_precedence_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        assert_eq!(detect_build_system(root), "none");
+
+        fs::write(root.join("Makefile"), "").unwrap();
+        assert_eq!(detect_build_system(root), "make");
+
+        fs::write(root.join("configure"), "").unwrap();
+        assert_eq!(detect_build_system(root), "autotools");
+
+        fs::write(root.join("CMakeLists.txt"), "").unwrap();
+        assert_eq!(detect_build_system(root), "cmake");
+
+        fs::write(root.join("Forge.toml"), "").unwrap();
+        assert_eq!(detect_build_system(root), "self");
+    }
+
+    #[test]
+    fn makefile_detection_accepts_lowercase_filename() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("makefile"), "").unwrap();
+        assert_eq!(detect_build_system(temp.path()), "make");
     }
 }
