@@ -93,6 +93,7 @@ fn detail(graph: &Graph, plan: &BuildPlan, id: TaskId) -> String {
     let task = &graph.tasks[id];
     let kind = match task.kind {
         TaskKind::Compile => "compile",
+        TaskKind::Archive => "archive",
         TaskKind::Link => "link",
     };
     let mut out = String::new();

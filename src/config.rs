@@ -83,10 +83,14 @@ pub fn load(path: &PathBuf) -> Result<Config, ConfigError> {
         path: path.into(),
         source,
     })?;
-    let manifest = toml::from_str(text.as_str()).map_err(|source| ConfigError::Parse {
-        path: path.into(),
-        source,
-    })?;
+    let mut manifest: Manifest =
+        toml::from_str(text.as_str()).map_err(|source| ConfigError::Parse {
+            path: path.into(),
+            source,
+        })?;
+    manifest
+        .normalize()
+        .map_err(|message| ConfigError::invalid("manifest", message))?;
     Ok(Config {
         path: path.into(),
         content: manifest,

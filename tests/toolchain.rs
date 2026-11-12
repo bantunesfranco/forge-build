@@ -135,13 +135,13 @@ fn standard_must_match_the_language() {
 #[test]
 fn layout_helpers_keep_objects_and_depfiles_apart() {
     let p = project(MIXED, &["src/util.c", "src/util.cpp"]).unwrap();
-    let c = p.object_path("debug", Path::new("src/util.c"));
-    let cpp = p.object_path("debug", Path::new("src/util.cpp"));
+    let c = p.target_object_path("debug", "app", Path::new("src/util.c"));
+    let cpp = p.target_object_path("debug", "app", Path::new("src/util.cpp"));
     assert_ne!(c, cpp);
-    assert_eq!(c, Path::new("build/debug/obj/src/util.c.o"));
+    assert_eq!(c, Path::new("build/debug/obj/app/src/util.c.o"));
     assert_eq!(
-        p.depfile_path("debug", Path::new("src/util.c")),
-        Path::new("build/debug/dep/src/util.c.o.d")
+        p.target_depfile_path("debug", "app", Path::new("src/util.c")),
+        Path::new("build/debug/dep/app/src/util.c.o.d")
     );
 }
 

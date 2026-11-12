@@ -1,7 +1,7 @@
 mod common;
 
 use common::Fixture;
-use forge_build::{config, project::Project};
+use forge_build::{config, config::types::OptLevel, graph::Graph, project::Project};
 
 fn build(f: &Fixture) -> Result<Project, config::ConfigError> {
     Project::from_config(config::load(&f.manifest())?)
@@ -104,6 +104,83 @@ fn example_project_is_valid() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/c-library/Forge.toml");
     Project::from_config(config::load(&path).unwrap()).unwrap();
+}
+
+#[test]
+fn package_manifest_defaults_profiles_and_builds_named_target_ownership() {
+    let f = Fixture::valid();
+    f.touch("lib/core.cpp");
+    std::fs::write(
+        f.manifest(),
+        r#"
+edition = "2026"
+[package]
+name = "multi-target"
+version = "1.0.0"
+[lang]
+cxx = "c++20"
+[profile.profiled]
+inherits = "release"
+debug_info = true
+[lib.core]
+sources = ["lib/**/*.cpp"]
+include = ["include"]
+[bin.app]
+sources = ["src/**/*.cpp"]
+deps = ["core"]
+"#,
+    )
+    .unwrap();
+
+    let p = build(&f).unwrap();
+    assert_eq!(p.targets.len(), 2);
+    assert_eq!(p.targets[0].name, "core");
+    assert_eq!(
+        p.targets[0].sources,
+        vec![std::path::PathBuf::from("lib/core.cpp")]
+    );
+    assert_eq!(p.targets[1].deps, vec!["core".to_string()]);
+    assert_eq!(p.manifest.profiles["debug"].opt_level, Some(OptLevel::O0));
+    assert_eq!(p.manifest.profiles["debug"].debug_info, Some(true));
+    assert_eq!(p.manifest.profiles["release"].opt_level, Some(OptLevel::O2));
+    assert_eq!(p.manifest.profiles["release"].debug_info, Some(false));
+    assert_eq!(p.select_profile(Some("profiled")).unwrap(), "profiled");
+
+    let graph = Graph::from_project(&p, "debug").unwrap();
+    assert!(
+        graph
+            .tasks
+            .iter()
+            .any(|t| { t.outputs == vec![std::path::PathBuf::from("build/debug/lib/libcore.a")] })
+    );
+}
+
+#[test]
+fn target_source_dirs_are_scanned_recursively() {
+    let f = Fixture::valid();
+    f.touch("library/src/core.cpp");
+    std::fs::write(
+        f.manifest(),
+        r#"
+edition = "2026"
+[package]
+name = "library-only"
+version = "1.0.0"
+[lang]
+cxx = "c++20"
+[lib.core]
+source_dirs = ["library"]
+"#,
+    )
+    .unwrap();
+
+    let p = build(&f).unwrap();
+    assert_eq!(p.targets.len(), 1);
+    assert_eq!(
+        p.targets[0].sources,
+        vec![std::path::PathBuf::from("library/src/core.cpp")]
+    );
+    assert_eq!(p.manifest.edition.as_deref(), Some("2026"));
 }
 
 #[test]

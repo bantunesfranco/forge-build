@@ -1,13 +1,17 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::{lang::Lang, project::Project};
+use crate::{
+    lang::Lang,
+    project::{BuildTargetKind, Project},
+};
 
 pub type TaskId = usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskKind {
     Compile,
+    Archive,
     Link,
 }
 
@@ -37,6 +41,8 @@ pub enum GraphError {
     DuplicateOutput { path: PathBuf },
     #[error("dependency cycle involving: {}", .0.join(", "))]
     Cycle(Vec<String>),
+    #[error("unknown target `{0}`")]
+    UnknownTarget(String),
 }
 
 #[derive(Debug, Clone)]
@@ -89,33 +95,102 @@ impl Graph {
 
     pub fn from_project(project: &Project, profile: &str) -> Result<Graph, GraphError> {
         let mut tasks = Vec::new();
-        let mut objects = Vec::new();
-
-        for src in &project.sources {
-            let obj = project.object_path(profile, src);
-            let dep = project.depfile_path(profile, src);
-            tasks.push(Task {
-                kind: TaskKind::Compile,
-                lang: Lang::from_path(src).expect("discovered sources have a known language"),
-                inputs: vec![src.clone()],
-                implicit_inputs: vec![],
-                outputs: vec![obj.clone(), dep],
-            });
-            objects.push(obj);
-        }
-
-        let any_cxx = project
-            .sources
+        let outputs: HashMap<String, PathBuf> = project
+            .targets
             .iter()
-            .any(|s| Lang::from_path(s) == Some(Lang::Cxx));
-        tasks.push(Task {
-            kind: TaskKind::Link,
-            lang: if any_cxx { Lang::Cxx } else { Lang::C },
-            inputs: objects,
-            implicit_inputs: project.library_files(),
-            outputs: vec![project.output_path(profile)],
-        });
+            .map(|t| (t.name.clone(), project.target_output_path(profile, t)))
+            .collect();
+        let mut target_objects: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        for target in &project.targets {
+            let mut objects = Vec::new();
+            for src in &target.sources {
+                let obj = project.target_object_path(profile, &target.name, src);
+                tasks.push(Task {
+                    kind: TaskKind::Compile,
+                    lang: Lang::from_path(src).expect("discovered sources have a known language"),
+                    inputs: vec![src.clone()],
+                    implicit_inputs: vec![],
+                    outputs: vec![
+                        obj.clone(),
+                        project.target_depfile_path(profile, &target.name, src),
+                    ],
+                });
+                objects.push(obj);
+            }
+            target_objects.insert(target.name.clone(), objects);
+        }
+        for target in &project.targets {
+            let mut objects = target_objects[&target.name].clone();
+            let any_cxx = target
+                .sources
+                .iter()
+                .any(|s| Lang::from_path(s) == Some(Lang::Cxx));
+            let lang = if any_cxx { Lang::Cxx } else { Lang::C };
+            match target.kind {
+                BuildTargetKind::StaticLibrary => {
+                    let implicit_inputs = target
+                        .deps
+                        .iter()
+                        .filter_map(|d| outputs.get(d).cloned())
+                        .collect();
+                    tasks.push(Task {
+                        kind: TaskKind::Archive,
+                        lang,
+                        inputs: objects,
+                        implicit_inputs,
+                        outputs: vec![outputs[&target.name].clone()],
+                    });
+                }
+                BuildTargetKind::Binary => {
+                    let mut seen = std::collections::HashSet::new();
+                    let mut libs = Vec::new();
+                    collect_libraries(project, target, &outputs, &mut seen, &mut libs);
+                    objects.extend(libs);
+                    tasks.push(Task {
+                        kind: TaskKind::Link,
+                        lang,
+                        inputs: objects,
+                        implicit_inputs: project.library_files(),
+                        outputs: vec![outputs[&target.name].clone()],
+                    });
+                }
+            }
+        }
         Graph::new(tasks)
+    }
+
+    /// Keep a target's task and its complete producer/dependency closure.
+    pub fn select_target(
+        &self,
+        project: &Project,
+        profile: &str,
+        name: &str,
+    ) -> Result<Graph, GraphError> {
+        let target = project
+            .targets
+            .iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| GraphError::UnknownTarget(name.to_string()))?;
+        let output = project.target_output_path(profile, target);
+        let root = self
+            .tasks
+            .iter()
+            .position(|t| t.outputs.first() == Some(&output))
+            .ok_or_else(|| GraphError::UnknownTarget(name.to_string()))?;
+        let mut keep = std::collections::HashSet::new();
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            if keep.insert(id) {
+                stack.extend(self.deps(id).iter().copied());
+            }
+        }
+        Graph::new(
+            self.tasks
+                .iter()
+                .enumerate()
+                .filter_map(|(id, task)| keep.contains(&id).then_some(task.clone()))
+                .collect(),
+        )
     }
 
     pub fn deps(&self, id: TaskId) -> &[TaskId] {
@@ -142,6 +217,7 @@ impl Graph {
             let t = &self.tasks[id];
             let kind = match t.kind {
                 TaskKind::Compile => "compile",
+                TaskKind::Archive => "archive",
                 TaskKind::Link => "link",
             };
             for o in &t.outputs {
@@ -175,6 +251,28 @@ impl Graph {
         }
         out.push_str("}\n");
         out
+    }
+}
+
+fn collect_libraries<'a>(
+    project: &'a Project,
+    target: &'a crate::project::BuildTarget,
+    outputs: &HashMap<String, PathBuf>,
+    seen: &mut std::collections::HashSet<String>,
+    found: &mut Vec<PathBuf>,
+) {
+    for dep in &target.deps {
+        let Some(library) = project
+            .targets
+            .iter()
+            .find(|t| t.name.as_str() == dep.as_str() && t.kind == BuildTargetKind::StaticLibrary)
+        else {
+            continue;
+        };
+        if seen.insert(library.name.clone()) {
+            found.push(outputs[&library.name].clone());
+            collect_libraries(project, library, outputs, seen, found);
+        }
     }
 }
 

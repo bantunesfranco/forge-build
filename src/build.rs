@@ -55,6 +55,15 @@ fn path_arg(p: &Path) -> String {
 /// The command for a task. The program and `-std=` come from the task's
 /// language (a link task takes the C++ driver if any object is C++).
 pub fn command_for(task: &Task, r: &Resolved, project: &Project) -> CommandSpec {
+    if task.kind == TaskKind::Archive {
+        let mut args = vec!["crs".to_string(), path_arg(&task.outputs[0])];
+        args.extend(task.inputs.iter().map(|p| path_arg(p)));
+        return CommandSpec {
+            program: std::env::var("AR").unwrap_or_else(|_| "ar".into()),
+            args,
+            cwd: project.root.clone(),
+        };
+    }
     let toolchain = r.toolchain(task.lang);
     let mut args = Vec::new();
     match task.kind {
@@ -70,6 +79,7 @@ pub fn command_for(task: &Task, r: &Resolved, project: &Project) -> CommandSpec 
             args.extend(task.inputs.iter().map(|p| path_arg(p)));
             args.extend(r.link_args.iter().cloned());
         }
+        TaskKind::Archive => unreachable!("archive tasks return above"),
     }
 
     args.push("-o".into());
@@ -227,6 +237,7 @@ pub fn build(
 
                 match task.kind {
                     TaskKind::Compile => println!("Compiling {}", task.inputs[0].display()),
+                    TaskKind::Archive => println!("Archiving {}", out.display()),
                     TaskKind::Link => println!("Linking {}", out.display()),
                 }
                 if opts.verbose {
@@ -332,11 +343,11 @@ pub fn prepare(
 ) -> BuildPlan {
     // ---- plan: no process is run for tasks that are up to date ----
     let db_file = db_path(project, profile);
-    let mut db = Database::load_or_empty(&db_file);
+    let db = Database::load_or_empty(&db_file);
 
-    // drop records of tasks that no longer exist (e.g. a deleted source)
-    let live: HashSet<&PathBuf> = graph.tasks.iter().map(|t| &t.outputs[0]).collect();
-    db.tasks.retain(|key, _| live.contains(key));
+    // Keep records for tasks outside a selected target's closure. They remain
+    // useful if a later invocation builds the full project; stale records are
+    // harmless because only graph tasks are ever considered by the planner.
 
     let specs: Vec<CommandSpec> = graph
         .tasks

@@ -17,6 +17,7 @@ use crate::{
         types::{FindSpec, ListEdit, Prefer, Source},
     },
     project::Project,
+    resolve,
 };
 
 fn run(program: &str, args: &[String], cwd: &Path) -> Result<Output, String> {
@@ -340,10 +341,70 @@ fn build_dependency(
                 .replace("{cc}", cc)
                 .replace("{cxx}", cxx)
                 .replace("{jobs}", &jobs.to_string())
+                .replace("{profile}", profile)
         })
         .collect();
     match system {
         "none" => (),
+        "sources" => {
+            let resolved = resolve::resolve(project, profile).map_err(|e| e.to_string())?;
+            let patterns = if dep.build.files.is_empty() {
+                vec!["**/*.c", "**/*.cc", "**/*.cpp", "**/*.cxx"]
+            } else {
+                dep.build.files.iter().map(String::as_str).collect()
+            };
+            let mut sources = Vec::new();
+            for entry in walkdir::WalkDir::new(&work) {
+                let entry = entry.map_err(|e| e.to_string())?;
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let rel = entry
+                    .path()
+                    .strip_prefix(&work)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if patterns.iter().any(|pattern| simple_glob(pattern, &rel)) {
+                    sources.push(entry.path().to_path_buf());
+                }
+            }
+            sources.sort();
+            if sources.is_empty() {
+                return Err(format!("dependency `{name}` source build matched no files"));
+            }
+            let obj_dir = prefix.parent().unwrap().join("source-objects");
+            fs::create_dir_all(&obj_dir).map_err(|e| e.to_string())?;
+            let mut objects = Vec::new();
+            for (index, source) in sources.iter().enumerate() {
+                let program = match source.extension().and_then(|x| x.to_str()) {
+                    Some("c") => cc,
+                    _ => cxx,
+                };
+                let object = obj_dir.join(format!("{index}.o"));
+                let mut argv = vec!["-I".into(), work.display().to_string()];
+                for include in &project.include_dirs {
+                    argv.push("-I".into());
+                    argv.push(include.display().to_string());
+                }
+                argv.extend(resolved.common_args.iter().cloned());
+                argv.extend([
+                    "-c".into(),
+                    source.display().to_string(),
+                    "-o".into(),
+                    object.display().to_string(),
+                ]);
+                argv.extend(args.iter().cloned());
+                success_env(program, &argv, root, &dep.build.env)?;
+                objects.push(object);
+            }
+            let lib_dir = prefix.join("lib");
+            fs::create_dir_all(&lib_dir).map_err(|e| e.to_string())?;
+            let archive = lib_dir.join(format!("lib{name}.a"));
+            let mut argv = vec!["rcs".into(), archive.display().to_string()];
+            argv.extend(objects.iter().map(|p| p.display().to_string()));
+            success_env("ar", &argv, root, &dep.build.env)?;
+        }
         "make" => {
             let mut a = vec![format!("-j{jobs}")];
             a.extend(args.iter().cloned());
@@ -366,6 +427,16 @@ fn build_dependency(
                 build.display().to_string(),
                 format!("-DCMAKE_INSTALL_PREFIX={p}"),
             ];
+            a.push(format!(
+                "-DCMAKE_BUILD_TYPE={}",
+                if profile == "release" {
+                    "Release"
+                } else if profile == "debug" {
+                    "Debug"
+                } else {
+                    profile
+                }
+            ));
             a.extend(args.iter().cloned());
             success_env("cmake", &a, root, &dep.build.env)?;
             success_env(
@@ -382,6 +453,35 @@ fn build_dependency(
             success_env(
                 "cmake",
                 &["--install".into(), build.display().to_string()],
+                root,
+                &dep.build.env,
+            )?;
+        }
+        "meson" => {
+            let build = prefix.parent().unwrap().join("meson-build");
+            let mut setup = vec![
+                "setup".into(),
+                build.display().to_string(),
+                work.display().to_string(),
+                format!("--prefix={p}"),
+            ];
+            setup.extend(args.iter().cloned());
+            success_env("meson", &setup, root, &dep.build.env)?;
+            success_env(
+                "meson",
+                &[
+                    "compile".into(),
+                    "-C".into(),
+                    build.display().to_string(),
+                    "-j".into(),
+                    jobs.to_string(),
+                ],
+                root,
+                &dep.build.env,
+            )?;
+            success_env(
+                "meson",
+                &["install".into(), "-C".into(), build.display().to_string()],
                 root,
                 &dep.build.env,
             )?;
@@ -414,7 +514,8 @@ fn build_dependency(
                     .replace("{prefix}", &p)
                     .replace("{cc}", cc)
                     .replace("{cxx}", cxx)
-                    .replace("{jobs}", &jobs.to_string());
+                    .replace("{jobs}", &jobs.to_string())
+                    .replace("{profile}", profile);
                 #[cfg(windows)]
                 let (shell, argv) = ("cmd", vec!["/C".to_owned(), command]);
                 #[cfg(not(windows))]
@@ -435,14 +536,18 @@ fn build_dependency(
 /// Resolve dependencies and add their include/library flags to the project.
 /// This is called by the CLI for build commands, before graph planning.
 pub fn prepare(project: &mut Project, profile: &str, jobs: usize) -> Result<(), ConfigError> {
-    let names: Vec<String> = project.manifest.dependencies.keys().cloned().collect();
+    let names = dependency_order(&project.manifest.dependencies)?;
     for name in names {
         let dep = project
             .manifest
             .dependencies
             .get(&name)
             .expect("dependency exists");
-        let prefer = dep.prefer.unwrap_or(Prefer::System);
+        let prefer = if dep.resolve.first().is_some_and(|x| x == "source") {
+            Prefer::Vendored
+        } else {
+            dep.prefer.unwrap_or(Prefer::System)
+        };
         let mut system = None;
         if prefer != Prefer::Vendored {
             for finder in &dep.find {
@@ -552,16 +657,24 @@ pub fn prepare(project: &mut Project, profile: &str, jobs: usize) -> Result<(), 
         let includes = exposure
             .map(|e| e.include.clone())
             .unwrap_or_else(|| vec![PathBuf::from("include")]);
-        let lib_dirs = exposure
-            .map(|e| e.lib_dirs.clone())
-            .unwrap_or_else(|| vec![PathBuf::from("lib"), PathBuf::from("lib64")]);
-        let base = if manual { source } else { prefix };
+        let mut lib_dirs = exposure.map(|e| e.lib_dirs.clone()).unwrap_or_default();
+        if lib_dirs.is_empty() {
+            lib_dirs = vec![PathBuf::from("lib"), PathBuf::from("lib64")];
+        }
+        let base = if manual { source } else { prefix.clone() };
         for dir in includes {
             let p = base.join(dir);
             add_directory(&project.root, &mut project.include_dirs, p);
         }
+        let lib_base = if dep.build.system.as_deref() == Some("sources")
+            || dep.build.kind.as_deref() == Some("sources")
+        {
+            &prefix
+        } else {
+            &base
+        };
         for dir in lib_dirs {
-            let p = base.join(dir);
+            let p = lib_base.join(dir);
             add_directory(&project.root, &mut project.lib_dirs, p);
         }
         if let Some(e) = exposure {
@@ -607,6 +720,44 @@ pub fn prepare(project: &mut Project, profile: &str, jobs: usize) -> Result<(), 
     Ok(())
 }
 
+fn dependency_order(deps: &BTreeMap<String, Dependency>) -> Result<Vec<String>, ConfigError> {
+    fn visit(
+        name: &str,
+        deps: &BTreeMap<String, Dependency>,
+        active: &mut Vec<String>,
+        done: &mut std::collections::BTreeSet<String>,
+        result: &mut Vec<String>,
+    ) -> Result<(), ConfigError> {
+        if done.contains(name) {
+            return Ok(());
+        }
+        if active.iter().any(|v| v == name) {
+            active.push(name.to_owned());
+            return Err(ConfigError::invalid(
+                "dependencies",
+                format!("dependency cycle: {}", active.join(" -> ")),
+            ));
+        }
+        let dep = deps.get(name).ok_or_else(|| {
+            ConfigError::invalid("dependencies", format!("unknown dependency `{name}`"))
+        })?;
+        active.push(name.to_owned());
+        for child in &dep.deps {
+            visit(child, deps, active, done, result)?;
+        }
+        active.pop();
+        done.insert(name.to_owned());
+        result.push(name.to_owned());
+        Ok(())
+    }
+    let mut result = Vec::new();
+    let mut done = std::collections::BTreeSet::new();
+    for name in deps.keys() {
+        visit(name, deps, &mut Vec::new(), &mut done, &mut result)?;
+    }
+    Ok(result)
+}
+
 fn add_directory(root: &Path, dirs: &mut Vec<PathBuf>, path: PathBuf) {
     if let Ok(p) = root.join(path).canonicalize()
         && p.is_dir()
@@ -628,6 +779,30 @@ fn detect_build_system(work: &Path) -> &'static str {
     } else {
         "none"
     }
+}
+
+fn simple_glob(pattern: &str, value: &str) -> bool {
+    let (p, v) = (
+        pattern.replace('\\', "/").into_bytes(),
+        value.as_bytes().to_vec(),
+    );
+    fn go(p: &[u8], v: &[u8]) -> bool {
+        if p.is_empty() {
+            return v.is_empty();
+        }
+        if p.starts_with(b"**/") {
+            return go(&p[3..], v)
+                || v.iter()
+                    .enumerate()
+                    .any(|(i, c)| *c == b'/' && go(&p[3..], &v[i + 1..]));
+        }
+        match p[0] {
+            b'*' => go(&p[1..], v) || (!v.is_empty() && v[0] != b'/' && go(p, &v[1..])),
+            b'?' => !v.is_empty() && v[0] != b'/' && go(&p[1..], &v[1..]),
+            c => !v.is_empty() && c == v[0] && go(&p[1..], &v[1..]),
+        }
+    }
+    go(&p, &v)
 }
 
 #[cfg(test)]

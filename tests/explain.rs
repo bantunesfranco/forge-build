@@ -55,7 +55,7 @@ fn setup() -> (tempfile::TempDir, PathBuf) {
         &root,
         "Forge.toml",
         "[project]\nname = \"t\"\nversion = \"0.1.0\"\n\n[build]\ncompiler = \"g++\"\nstandard = \"c++20\"\n\
-        source_dirs = [\"src\"]\noutput = \"app\"\ndefault_profile = \"debug\"\n\n[build.flags]\ninclude_dirs = [\"include\"]\n\n[profile.debug]\nopt_level = 0\n",
+        source_dirs = [\"src\"]\noutput = \"app\"\ndefault_profile = \"debug\"\n\n[build.flags]\ninclude_dirs = [\"include\"]\n\n[profile.debug]\nopt_level = 0\n\n[bin.app]\nsources = [\"src/main.cpp\"]\n\n[bin.other]\nsources = [\"src/other.cpp\"]\n",
     );
     write(&root, "include/a.hpp", "inline int a() { return 0; }\n");
     write(
@@ -63,7 +63,11 @@ fn setup() -> (tempfile::TempDir, PathBuf) {
         "src/main.cpp",
         "#include \"a.hpp\"\nint main() { return a(); }\n",
     );
-    write(&root, "src/other.cpp", "int other() { return 1; }\n");
+    write(
+        &root,
+        "src/other.cpp",
+        "int other() { return 1; }\nint main() { return other(); }\n",
+    );
     (t, root)
 }
 
@@ -83,11 +87,19 @@ fn explain_matches_what_build_then_does_and_runs_nothing() {
         verbose: false,
     };
 
-    // before the first build: everything is out of date
+    // A named graph/explanation is the target closure, without unrelated tasks.
+    let app_graph = graph.select_target(&project, "debug", "app").unwrap();
+    assert_eq!(app_graph.tasks.len(), 2);
+    let app_plan = prepare(&app_graph, &project, &resolved, &exec, "debug");
+    let app_text = explain(&app_graph, &app_plan, None, &root, &root).unwrap();
+    assert!(app_text.contains("2 of 2 tasks need to run."), "{app_text}");
+    assert!(!app_text.contains("bin/other"), "{app_text}");
+
+    // before the first full build: everything is out of date
     let plan = prepare(&graph, &project, &resolved, &exec, "debug");
     let text = explain(&graph, &plan, None, &root, &root).unwrap();
     assert!(
-        text.contains("no previous build record") && text.contains("3 of 3"),
+        text.contains("no previous build record") && text.contains("4 of 4"),
         "{text}"
     );
 
@@ -116,15 +128,17 @@ fn explain_matches_what_build_then_does_and_runs_nothing() {
     let plan = prepare(&graph, &project, &resolved, &exec, "debug");
     let text = explain(&graph, &plan, None, &root, &root).unwrap();
     assert!(
-        text.contains("build/debug/obj/src/main.cpp.o: rebuild: include/a.hpp changed"),
+        text.contains("build/debug/obj/app/src/main.cpp.o: rebuild: include/a.hpp changed"),
         "{text}"
     );
     assert!(
-        text.contains("build/debug/obj/src/other.cpp.o: up to date"),
+        text.contains("build/debug/obj/other/src/other.cpp.o: up to date"),
         "{text}"
     );
     assert!(
-        text.contains("build/debug/app: rebuild: build/debug/obj/src/main.cpp.o was rebuilt"),
+        text.contains(
+            "build/debug/bin/app: rebuild: build/debug/obj/app/src/main.cpp.o was rebuilt"
+        ),
         "{text}"
     );
 

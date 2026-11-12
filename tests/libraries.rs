@@ -198,7 +198,7 @@ fn rebuilding_a_library_relinks_and_nothing_else() {
         .unwrap();
     };
     let exit = || {
-        Command::new(p.root.join("build/debug/app"))
+        Command::new(p.root.join("build/debug/bin/app"))
             .status()
             .unwrap()
             .code()

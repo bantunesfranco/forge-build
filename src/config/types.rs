@@ -286,18 +286,17 @@ pub enum Source {
     },
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Default)]
 pub struct DepBuild {
     /// None = auto-detect. A String because the backend registry is open
     /// ("cmake", "meson", "self", "steps", ...).
     pub system: Option<String>,
+    pub kind: Option<String>,
+    pub files: Vec<String>,
     pub subdir: Option<PathBuf>,
-    #[serde(default)]
     pub args: Vec<String>,
     /// Custom commands with {prefix}, {cc}, {cxx}, {jobs} substitution.
     pub steps: Option<Vec<String>>,
-    #[serde(default)]
     pub env: BTreeMap<String, String>,
 }
 
@@ -316,6 +315,53 @@ pub struct Expose {
     pub cflags: Vec<String>,
     #[serde(default)]
     pub ldflags: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for DepBuild {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Raw {
+            system: Option<String>,
+            #[serde(rename = "type")]
+            kind: Option<String>,
+            files: Vec<String>,
+            subdir: Option<PathBuf>,
+            args: Vec<String>,
+            steps: Option<Vec<String>>,
+            env: BTreeMap<String, String>,
+        }
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = DepBuild;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a build backend name or build table")
+            }
+            fn visit_str<E: de::Error>(self, s: &str) -> Result<Self::Value, E> {
+                Ok(DepBuild {
+                    system: Some(match s {
+                        "header-only" => "none".into(),
+                        other => other.into(),
+                    }),
+                    ..DepBuild::default()
+                })
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                let raw = Raw::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                let system = raw.system.or_else(|| raw.kind.clone());
+                Ok(DepBuild {
+                    system,
+                    kind: raw.kind,
+                    files: raw.files,
+                    subdir: raw.subdir,
+                    args: raw.args,
+                    steps: raw.steps,
+                    env: raw.env,
+                })
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 // ------------------------------------------------------------------------

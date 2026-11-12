@@ -15,7 +15,6 @@ Optional environment variables:
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
@@ -33,27 +32,21 @@ FORGE = Path(
 
 PROJECTS = {
     "c-library": {
-        "default_output": "c-library",
         "expected_output": [
             "sqrt(25.0) = 5.0",
             "clamp(42, 0, 10) = 10.0",
         ],
-        "compiler": "CC",
     },
     "cpp-profiles": {
-        "default_output": "cpp-profiles",
         "expected_output": [
             "Hello, Forge!",
         ],
-        "compiler": "CXX",
     },
     "mixed-language": {
-        "default_output": "mixed-language",
         "expected_output": [
             "Message: Hello from Forge",
             "Checksum: 0x",
         ],
-        "compiler": "CXX",
     },
 }
 
@@ -158,7 +151,7 @@ def executable(project: Path, name: str, profile: str) -> Path:
     if sys.platform == "win32":
         name += ".exe"
 
-    return project / "build" / profile / name
+    return project / "build" / profile / "bin" / name
 
 
 def run_program(
@@ -294,6 +287,26 @@ def test_mixed_language(temp_root: Path) -> None:
     print("[PASS] mixed-language")
 
 
+def test_dependencies(temp_root: Path) -> None:
+    """Build and run the example that consumes a local source dependency."""
+    print("[TEST] dependencies")
+
+    source = require_project("dependencies")
+    dependency_project = temp_root / "c-library"
+    if not dependency_project.is_dir():
+        copy_project(require_project("c-library"), temp_root)
+    project = copy_project(source, temp_root)
+    expected = PROJECTS["c-library"]["expected_output"]
+
+    build(project)
+    run_program(project, "dependencies", "debug", expected)
+
+    build(project, profile="release")
+    run_program(project, "dependencies", "release", expected)
+
+    print("[PASS] dependencies")
+
+
 def test_steps_dependency(temp_root: Path) -> None:
     """Build and link a local dependency through the custom steps backend."""
     print("[TEST] steps dependency")
@@ -315,40 +328,30 @@ def test_steps_dependency(temp_root: Path) -> None:
         "int main(void) { return tiny_value() == 17 ? 0 : 1; }\n",
         encoding="utf-8",
     )
-    compiler = os.environ.get("CC") or shutil.which("clang") or shutil.which("gcc")
-    if not compiler:
-        raise IntegrationTestFailure(
-            "No suitable C compiler found for dependency test"
-        )
+    manifest = '''edition = "2026"
 
-    manifest = f'''[project]
+[package]
 name = "dependency-consumer"
 version = "0.1.0"
 
-[build]
-compiler = {json.dumps(compiler)}
-standard = "c11"
-source_dirs = ["src"]
-output = "dependency-consumer"
-default_profile = "debug"
+[lang]
+c = "c11"
 
-[profile.debug]
-opt_level = 0
+[bin.dependency-consumer]
+sources = ["src/main.c"]
+deps = ["tiny"]
 
 [dependencies.tiny]
-prefer = "vendored"
-
-[dependencies.tiny.source]
-type = "path"
 path = "../tiny-dependency"
+resolve = ["source"]
 
 [dependencies.tiny.build]
 system = "steps"
 steps = [
-  'mkdir -p "{{prefix}}/include" "{{prefix}}/lib"',
-  '"{{cc}}" -c tiny.c -o tiny.o',
-  'ar rcs "{{prefix}}/lib/libtiny.a" tiny.o',
-  'cp tiny.h "{{prefix}}/include/tiny.h"',
+  'mkdir -p "{prefix}/include" "{prefix}/lib"',
+  '"{cc}" -c tiny.c -o tiny.o',
+  'ar rcs "{prefix}/lib/libtiny.a" tiny.o',
+  'cp tiny.h "{prefix}/include/tiny.h"',
 ]
 '''
     (project / "Forge.toml").write_text(manifest, encoding="utf-8")
@@ -368,19 +371,17 @@ def test_forge_dependency_auto_detection(temp_root: Path) -> None:
         "int main(void) { return 0; }\n", encoding="utf-8"
     )
     (dependency / "Forge.toml").write_text(
-        '''[project]
+        '''edition = "2026"
+
+[package]
 name = "nested-forge"
 version = "0.1.0"
 
-[build]
-compiler = "cc"
-standard = "c11"
-source_dirs = ["src"]
-output = "nested-output"
-default_profile = "debug"
+[lang]
+c = "c11"
 
-[profile.debug]
-opt_level = 0
+[bin.nested-output]
+sources = ["src/main.c"]
 ''',
         encoding="utf-8",
     )
@@ -390,32 +391,26 @@ opt_level = 0
     (project / "src" / "main.c").write_text(
         "int main(void) { return 0; }\n", encoding="utf-8"
     )
-    compiler = os.environ.get("CC") or shutil.which("clang") or shutil.which("gcc")
-    if not compiler:
-        raise IntegrationTestFailure(
-            "No suitable C compiler found for dependency test"
-        )
     (project / "Forge.toml").write_text(
-        f'''[project]
+        '''edition = "2026"
+
+[package]
 name = "forge-consumer"
 version = "0.1.0"
 
-[build]
-compiler = {json.dumps(compiler)}
-standard = "c11"
-source_dirs = ["src"]
-output = "forge-consumer"
-default_profile = "debug"
+[lang]
+c = "c11"
 
-[profile.debug]
-opt_level = 0
+[bin.forge-consumer]
+sources = ["src/main.c"]
+deps = ["nested"]
 
 [dependencies.nested]
-prefer = "vendored"
-
-[dependencies.nested.source]
-type = "path"
 path = "../nested-forge"
+resolve = ["source"]
+
+[dependencies.nested.build]
+system = "self"
 
 [dependencies.nested.expose]
 include = []
@@ -475,6 +470,7 @@ def main() -> int:
             test_c_library(temp_root)
             test_cpp_profiles(temp_root)
             test_mixed_language(temp_root)
+            test_dependencies(temp_root)
             test_steps_dependency(temp_root)
             test_forge_dependency_auto_detection(temp_root)
 

@@ -1,4 +1,5 @@
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 use crate::{
     config::{
@@ -6,7 +7,7 @@ use crate::{
         manifest::{Build, Dependency},
         types::{Prefer, Source},
     },
-    discover::discover_sources,
+    discover::{discover_patterns, discover_sources},
     lang::{Lang, Toolchain},
     profile::validate_profiles,
     resolve,
@@ -22,8 +23,25 @@ pub struct Project {
     pub lib_dirs: Vec<PathBuf>,
     /// Relative to `root`, sorted.
     pub sources: Vec<PathBuf>,
+    /// Named package targets. `sources` remains the union used to select the
+    /// project's language toolchains; graph construction uses this ownership.
+    pub targets: Vec<BuildTarget>,
     pub c: Option<Toolchain>,
     pub cpp: Option<Toolchain>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuildTargetKind {
+    StaticLibrary,
+    Binary,
+}
+
+#[derive(Clone, Debug)]
+pub struct BuildTarget {
+    pub name: String,
+    pub kind: BuildTargetKind,
+    pub sources: Vec<PathBuf>,
+    pub deps: Vec<String>,
 }
 
 /// Where a directory is allowed to be.
@@ -48,6 +66,7 @@ impl Project {
             })?;
 
         let manifest = cfg.content;
+        validate_tools(&manifest.tools)?;
         validate_profiles(&manifest.build.default_profile, &manifest.profiles)?;
         resolve::validate_flags(&manifest)?;
 
@@ -74,10 +93,103 @@ impl Project {
         check_overlap("build.source_dirs", &source_dirs)?;
 
         validate_dependencies(&manifest)?;
+        let mut names = std::collections::HashSet::new();
+        for name in manifest
+            .lib
+            .keys()
+            .chain(manifest.bin.keys())
+            .chain(manifest.dependencies.keys())
+        {
+            if name.is_empty()
+                || !name.chars().enumerate().all(|(i, c)| {
+                    if i == 0 {
+                        c.is_ascii_alphabetic() || c == '_'
+                    } else {
+                        c.is_ascii_alphanumeric() || c == '_' || c == '-'
+                    }
+                })
+            {
+                return Err(ConfigError::invalid(
+                    "target/dependency name",
+                    format!("`{name}` is not a valid name"),
+                ));
+            }
+            if !names.insert(name.clone()) {
+                return Err(ConfigError::invalid(
+                    "target/dependency name",
+                    format!("`{name}` is declared more than once"),
+                ));
+            }
+        }
+        for (name, target) in manifest.lib.iter().chain(manifest.bin.iter()) {
+            let mut deps = target.deps.clone();
+            if let Some(platform) = target.platform.get(current_platform()) {
+                deps.extend(platform.deps.iter().cloned());
+            }
+            for dep in deps {
+                if !names.contains(&dep) {
+                    return Err(ConfigError::invalid(
+                        format!("target.{name}.deps"),
+                        format!("unknown target or dependency `{dep}`"),
+                    ));
+                }
+            }
+        }
 
         validate_output(&root, &manifest.build.output, &source_dirs)?;
 
-        let sources = discover_sources(&root, &source_dirs)?;
+        let mut targets = Vec::new();
+        for (name, target) in &manifest.lib {
+            let mut patterns = target.sources.clone();
+            let mut target_dirs = target.source_dirs.clone();
+            let mut deps = target.deps.clone();
+            if let Some(platform) = target.platform.get(current_platform()) {
+                patterns.extend(platform.sources.iter().cloned());
+                target_dirs.extend(platform.source_dirs.iter().cloned());
+                deps.extend(platform.deps.iter().cloned());
+            }
+            targets.push(BuildTarget {
+                name: name.clone(),
+                kind: BuildTargetKind::StaticLibrary,
+                sources: discover_target_sources(&root, name, &patterns, &target_dirs)?,
+                deps,
+            });
+        }
+        for (name, target) in &manifest.bin {
+            let mut patterns = target.sources.clone();
+            let mut target_dirs = target.source_dirs.clone();
+            let mut deps = target.deps.clone();
+            if let Some(platform) = target.platform.get(current_platform()) {
+                patterns.extend(platform.sources.iter().cloned());
+                target_dirs.extend(platform.source_dirs.iter().cloned());
+                deps.extend(platform.deps.iter().cloned());
+            }
+            targets.push(BuildTarget {
+                name: name.clone(),
+                kind: BuildTargetKind::Binary,
+                sources: discover_target_sources(&root, name, &patterns, &target_dirs)?,
+                deps,
+            });
+        }
+        if targets.is_empty() {
+            let sources = if manifest.build.source_patterns.is_empty() {
+                discover_sources(&root, &source_dirs)?
+            } else {
+                discover_patterns(&root, &manifest.build.source_patterns)?
+            };
+            targets.push(BuildTarget {
+                name: manifest.build.output.to_string_lossy().into_owned(),
+                kind: BuildTargetKind::Binary,
+                sources: sources.clone(),
+                deps: Vec::new(),
+            });
+        }
+        let mut sources: Vec<PathBuf> = targets
+            .iter()
+            .flat_map(|t| t.sources.iter().cloned())
+            .collect();
+        sources.sort();
+        sources.dedup();
         let (c, cpp) = resolve_toolchains(&manifest.build, &sources)?;
 
         Ok(Project {
@@ -87,6 +199,7 @@ impl Project {
             include_dirs,
             lib_dirs,
             sources,
+            targets,
             c,
             cpp,
         })
@@ -164,6 +277,129 @@ impl Project {
     pub fn output_path(&self, profile: &str) -> PathBuf {
         self.build_dir(profile).join(&self.manifest.build.output)
     }
+
+    pub fn target_object_path(&self, profile: &str, target: &str, src: &Path) -> PathBuf {
+        let mut name = src.as_os_str().to_owned();
+        name.push(".o");
+        self.build_dir(profile).join("obj").join(target).join(name)
+    }
+
+    pub fn target_depfile_path(&self, profile: &str, target: &str, src: &Path) -> PathBuf {
+        let mut name = src.as_os_str().to_owned();
+        name.push(".o.d");
+        self.build_dir(profile).join("dep").join(target).join(name)
+    }
+
+    pub fn target_output_path(&self, profile: &str, target: &BuildTarget) -> PathBuf {
+        match target.kind {
+            BuildTargetKind::Binary => self.build_dir(profile).join("bin").join(&target.name),
+            BuildTargetKind::StaticLibrary => self
+                .build_dir(profile)
+                .join("lib")
+                .join(format!("lib{}.a", target.name)),
+        }
+    }
+}
+
+fn discover_target_sources(
+    root: &Path,
+    name: &str,
+    patterns: &[String],
+    dirs: &[PathBuf],
+) -> Result<Vec<PathBuf>, ConfigError> {
+    let mut found = if patterns.is_empty() {
+        Vec::new()
+    } else {
+        discover_patterns(root, patterns)?
+    };
+    let resolved_dirs = resolve_all(
+        root,
+        &format!("target.{name}.source_dirs"),
+        dirs,
+        Scope::InsideRoot,
+    )?;
+    if !resolved_dirs.is_empty() {
+        found.extend(discover_sources(root, &resolved_dirs)?);
+    }
+    found.sort();
+    found.dedup();
+    if found.is_empty() {
+        return Err(ConfigError::invalid(
+            format!("target.{name}.sources"),
+            "no sources found; set sources or source_dirs",
+        ));
+    }
+    Ok(found)
+}
+
+fn current_platform() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "other"
+    }
+}
+
+fn validate_tools(tools: &std::collections::BTreeMap<String, String>) -> Result<(), ConfigError> {
+    for (name, requirement) in tools {
+        let output = Command::new(name).arg("--version").output().map_err(|e| {
+            ConfigError::invalid(
+                format!("tools.{name}"),
+                format!("required tool not found: {e}"),
+            )
+        })?;
+        if !output.status.success() {
+            return Err(ConfigError::invalid(
+                format!("tools.{name}"),
+                "could not read tool version",
+            ));
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let version = text
+            .split(|c: char| !c.is_ascii_digit() && c != '.')
+            .find(|part| {
+                part.contains('.') && part.chars().next().is_some_and(|c| c.is_ascii_digit())
+            })
+            .unwrap_or("");
+        if let Some(minimum) = requirement.strip_prefix(">=")
+            && (version.is_empty()
+                || compare_versions(version, minimum.trim()) == std::cmp::Ordering::Less)
+        {
+            return Err(ConfigError::invalid(
+                format!("tools.{name}"),
+                format!(
+                    "requires {requirement}, found {}",
+                    if version.is_empty() {
+                        "unknown version"
+                    } else {
+                        version
+                    }
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    let a: Vec<u64> = left.split('.').map(|v| v.parse().unwrap_or(0)).collect();
+    let b: Vec<u64> = right.split('.').map(|v| v.parse().unwrap_or(0)).collect();
+    for i in 0..a.len().max(b.len()) {
+        match a
+            .get(i)
+            .copied()
+            .unwrap_or(0)
+            .cmp(&b.get(i).copied().unwrap_or(0))
+        {
+            std::cmp::Ordering::Equal => continue,
+            order => return order,
+        }
+    }
+    std::cmp::Ordering::Equal
 }
 
 // ------------------------------------------------------------ toolchains

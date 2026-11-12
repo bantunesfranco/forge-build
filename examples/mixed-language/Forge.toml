@@ -1,21 +1,12 @@
-[project]
+edition = "2026"
+
+[package]
 name = "mixed-language"
 version = "0.1.0"
-authors = []
 
-[build]
-cxx_compiler = "clang++"
-cxx_standard = "c++20"
-c_compiler = "clang"
-c_standard = "c11"
-source_dirs = ["src"]
-output = "mixed-language"
-default_profile = "debug"
-
-[build.flags]
-warnings = true
-pedantic = true
-include_dirs = ["include"]
+[lang]
+c = "c11"
+cxx = "c++20"
 
 [profile.debug]
 opt_level = 0
@@ -24,3 +15,7 @@ debug_info = true
 [profile.release]
 opt_level = 2
 debug_info = false
+
+[bin.mixed-language]
+sources = ["src/**/*.c", "src/**/*.cpp"]
+include = ["include"]

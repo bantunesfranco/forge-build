@@ -13,7 +13,7 @@ use forge_build::{
     executor::{CommandSpec, Executor, Outcome, ProcessExecutor},
     graph::Graph,
     lang::Toolchain,
-    project::Project,
+    project::{BuildTarget, BuildTargetKind, Project},
     resolve::Resolved,
 };
 
@@ -79,12 +79,19 @@ fn proj() -> Proj {
 }
 
 fn run(p: &Proj, exec: &Logging, jobs: usize) -> Result<(), forge_build::build::BuildError> {
+    let sources = vec![
+        PathBuf::from("src/main.cpp"),
+        PathBuf::from("src/other.cpp"),
+    ];
     let project = Project {
         root: p.root.clone(),
-        sources: vec![
-            PathBuf::from("src/main.cpp"),
-            PathBuf::from("src/other.cpp"),
-        ],
+        sources: sources.clone(),
+        targets: vec![BuildTarget {
+            name: "app".into(),
+            kind: BuildTargetKind::Binary,
+            sources,
+            deps: vec![],
+        }],
         source_dirs: vec![PathBuf::from("src/")],
         include_dirs: vec![PathBuf::from("include/")],
         lib_dirs: vec![],
@@ -134,8 +141,8 @@ fn incremental_behaviour() {
     // clean build: 2 compiles + link
     run(&p, &exec, 2).unwrap();
     assert_eq!(exec.runs().len(), 3, "{:?}", exec.runs());
-    assert!(p.root.join("build/debug/app").exists());
-    assert!(p.root.join("build/debug/dep/src/main.cpp.o.d").exists());
+    assert!(p.root.join("build/debug/bin/app").exists());
+    assert!(p.root.join("build/debug/dep/app/src/main.cpp.o.d").exists());
 
     // unchanged: nothing runs
     exec.clear();
@@ -160,7 +167,7 @@ fn incremental_behaviour() {
     assert!(exec.runs().is_empty(), "{:?}", exec.runs());
 
     // deleted object is recreated, and the link reruns
-    fs::remove_file(p.root.join("build/debug/obj/src/other.cpp.o")).unwrap();
+    fs::remove_file(p.root.join("build/debug/obj/app/src/other.cpp.o")).unwrap();
     exec.clear();
     run(&p, &exec, 2).unwrap();
     let mut r = exec.runs();
@@ -218,12 +225,19 @@ fn changed_flags_rebuild_everything() {
     let exec = Logging::new();
     run(&p, &exec, 2).unwrap();
 
+    let sources = vec![
+        PathBuf::from("src/main.cpp"),
+        PathBuf::from("src/other.cpp"),
+    ];
     let project = Project {
         root: p.root.clone(),
-        sources: vec![
-            PathBuf::from("src/main.cpp"),
-            PathBuf::from("src/other.cpp"),
-        ],
+        sources: sources.clone(),
+        targets: vec![BuildTarget {
+            name: "app".into(),
+            kind: BuildTargetKind::Binary,
+            sources,
+            deps: vec![],
+        }],
         source_dirs: vec![PathBuf::from("src/")],
         include_dirs: vec![PathBuf::from("include/")],
         lib_dirs: vec![],
@@ -274,9 +288,16 @@ fn removing_a_source_rebuilds() {
     let exec = Logging::new();
     run(&p, &exec, 2).unwrap();
 
+    let sources = vec![PathBuf::from("src/main.cpp")];
     let project = Project {
         root: p.root.clone(),
-        sources: vec![PathBuf::from("src/main.cpp")],
+        sources: sources.clone(),
+        targets: vec![BuildTarget {
+            name: "app".into(),
+            kind: BuildTargetKind::Binary,
+            sources,
+            deps: vec![],
+        }],
         source_dirs: vec![PathBuf::from("src/")],
         include_dirs: vec![PathBuf::from("include/")],
         lib_dirs: vec![],
@@ -329,8 +350,8 @@ fn parallel_build_matches_sequential_results() {
     let p = proj();
     let exec = Logging::new();
     run(&p, &exec, 8).unwrap();
-    assert!(p.root.join("build/debug/app").exists());
-    let o = std::process::Command::new(p.root.join("build/debug/app"))
+    assert!(p.root.join("build/debug/bin/app").exists());
+    let o = std::process::Command::new(p.root.join("build/debug/bin/app"))
         .status()
         .unwrap();
     assert!(o.success());

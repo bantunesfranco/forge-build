@@ -31,14 +31,14 @@ Requirements: a Rust toolchain, and `gcc` or `clang` (plus `ar` for libraries).
 cargo install --path .
 cd examples/hello
 forge build
-./build/debug/hello
+./build/debug/bin/hello
 ```
 
 ```text
 $ forge build
 Compiling src/main.cpp
 Compiling src/greeting.cpp
-Linking build/debug/hello
+Linking build/debug/bin/hello
 
 $ forge build
 Build is up to date
@@ -47,7 +47,7 @@ $ touch include/greeting.hpp && echo "// edit" >> include/greeting.hpp
 $ forge explain
 build/debug/obj/src/greeting.cpp.o: rebuild: include/greeting.hpp changed
 build/debug/obj/src/main.cpp.o: up to date
-build/debug/hello: rebuild: build/debug/obj/src/greeting.cpp.o was rebuilt
+build/debug/bin/hello: rebuild: build/debug/obj/hello/src/greeting.cpp.o was rebuilt
 
 2 of 3 tasks need to run.
 ```
@@ -56,9 +56,9 @@ build/debug/hello: rebuild: build/debug/obj/src/greeting.cpp.o was rebuilt
 
 | Command | What it does |
 | --- | --- |
-| `forge build [-j N] [-v]` | Build the selected profile. `-v` prints each command and why it runs. |
-| `forge explain [TARGET]` | Say what would rebuild, and why. A target can be an output file or a source file. |
-| `forge graph [--dot]` | Print the task graph; `--dot` emits Graphviz (`... \| dot -Tpng -o graph.png`). |
+| `forge build [NAME] [-j N] [-v]` | Build all targets, or the named target and its dependency closure. `-v` prints each command and why it runs. |
+| `forge explain [PATH\|NAME]` | Say what would rebuild, and why. A selector can be an output file, source file, or target name. |
+| `forge graph [NAME] [--dot]` | Print all tasks or a target's dependency closure; `--dot` emits Graphviz (`... \| dot -Tpng -o graph.png`). |
 | `forge clean [--all]` | Remove the selected profile's build directory, or all of `build/`. |
 
 Global options: `-p, --profile NAME` (default: `build.default_profile`) and
@@ -71,6 +71,37 @@ the same thing wherever you run the command, and compilers run with the root as
 their working directory.
 
 ## Configuration
+
+The package-oriented manifest form declares language standards separately
+from targets and supports recursive source globs. See the full [manifest
+specification](docs/manifest-spec.md) for keys, defaults, dependency behavior,
+and examples:
+
+```toml
+[package]
+name = "hello"
+version = "1.0.0"
+
+[lang]
+c = "c17"
+cxx = "c++20"
+
+[tools]
+cmake = ">=3.20"
+
+[profile.debug]
+opt = 0
+debug = true
+
+[bin.hello]
+sources = ["src/**/*.cpp"]
+include = { public = ["include"] }
+```
+
+The new form uses `CC` and `CXX` from the environment (falling back to `cc`
+and `c++`). Named libraries and binaries form separate build targets. Binary
+targets are written to `build/<profile>/bin/<name>`, and static libraries to
+`build/<profile>/lib/lib<name>.a`.
 
 ```toml
 [project]
@@ -123,8 +154,9 @@ cxx_standard = "c++20"
 A language only needs a toolchain if the sources contain it. The bare keys in a
 mixed project are rejected as ambiguous, and so is a standard that belongs to the
 wrong language (`c++20` for C sources). A link uses the C++ driver when any object
-is C++, so `libstdc++` gets linked, and the C compiler otherwise. Forge never
-searches for a compiler: the manifest names it.
+is C++, so `libstdc++` gets linked, and the C compiler otherwise. Set `CC` and
+`CXX` in the environment or a user toolchain file to choose compilers; manifests
+only declare language standards.
 
 ### Profiles
 
@@ -223,10 +255,11 @@ per task, in one piece, so parallel builds stay readable.
 **Layout.**
 
 ```text
-build/<profile>/obj/<source>.o       objects, mirroring the source path
-build/<profile>/dep/<source>.o.d     depfiles
-build/<profile>/<output>             the executable
-build/<profile>/forge.db             records for this profile
+build/<profile>/obj/<target>/<source>.o  objects, grouped by target
+build/<profile>/dep/<target>/<source>.o.d depfiles
+build/<profile>/bin/<target>             executable targets
+build/<profile>/lib/lib<target>.a        static library targets
+build/<profile>/forge.db                 records for this profile
 ```
 
 Profiles do not share anything, so switching between them never rebuilds.

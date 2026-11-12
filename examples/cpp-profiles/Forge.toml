@@ -1,21 +1,11 @@
+edition = "2026"
 
-[project]
+[package]
 name = "cpp-profiles"
 version = "0.1.0"
-authors = []
 
-[build]
-compiler = "clang++"
-standard = "c++20"
-source_dirs = ["src"]
-output = "cpp-profiles"
-default_profile = "debug"
-
-[build.flags]
-warnings = true
-pedantic = true
-include_dirs = ["include"]
-defines = ["APP_NAME=\"Forge Example\""]
+[lang]
+cxx = "c++20"
 
 [profile.debug]
 opt_level = 0
@@ -29,3 +19,10 @@ defines = { add = ["NDEBUG"], remove = ["APP_DEBUG"] }
 
 [profile.debug_release]
 inherits = ["debug", "release"]
+
+[build.flags]
+defines = ["APP_NAME=\"Forge Example\""]
+
+[bin.cpp-profiles]
+sources = ["src/**/*.cpp"]
+include = ["include"]

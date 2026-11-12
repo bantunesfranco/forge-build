@@ -31,6 +31,7 @@ The suite invokes Forge as a real subprocess and tests the projects under `examp
 - **`c-library`** — builds and runs a C application, tests the release profile, and checks cleaning.
 - **`cpp-profiles`** — builds and runs a C++ application with debug and release profiles, and checks graph and explain output.
 - **`mixed-language`** — builds and runs a C++ application containing C source files, using the configured C++ compiler.
+- **`dependencies`** — builds and runs an application against the sibling `c-library` source dependency.
 
 Each example is copied into a temporary directory before testing, so generated files and build artifacts do not modify the original examples.
 
@@ -41,7 +42,7 @@ FORGE_BIN=target/debug/forge \
   python3 dev/test_examples.py
 ```
 
-Compiler selection is configured in each example's `forge.toml`. Set `CC` and `CXX` to select the available compilers used by the test environment:
+Compiler selection follows the environment (`CC` and `CXX`). Set them to choose the compilers used by Forge and the test environment:
 
 ```sh
 CC=clang CXX=clang++ \

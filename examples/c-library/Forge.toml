@@ -1,22 +1,11 @@
+edition = "2026"
 
-[project]
+[package]
 name = "c-library"
 version = "0.1.0"
-authors = []
 
-[build]
-compiler = "clang"
-standard = "c17"
-source_dirs = ["src"]
-output = "c-library"
-default_profile = "debug"
-
-[build.flags]
-warnings = true
-pedantic = true
-error_on_warning = false
-include_dirs = ["include"]
-libs = ["m"]
+[lang]
+c = "c17"
 
 [profile.debug]
 opt_level = 0
@@ -25,3 +14,12 @@ debug_info = true
 [profile.release]
 opt_level = 2
 debug_info = false
+
+[lib.math_utils]
+sources = ["src/math_utils.c"]
+include = { public = ["include"] }
+system_libs = ["m"]
+
+[bin.c-library]
+sources = ["src/main.c"]
+deps = ["math_utils"]

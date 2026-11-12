@@ -28,6 +28,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Build {
+        /// Build this target and its dependency closure (default: all targets).
+        target: Option<String>,
         #[arg(short, long)]
         jobs: Option<NonZeroUsize>,
         #[arg(short, long)]
@@ -38,6 +40,8 @@ enum Commands {
         all: bool,
     },
     Graph {
+        /// Show this target and its dependency closure (default: all targets).
+        target: Option<String>,
         #[arg(long)]
         dot: bool,
     },
@@ -53,14 +57,21 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let profile: String = project.select_profile(args.profile.as_deref())?;
 
     match args.command {
-        Some(Commands::Build { jobs, verbose }) => {
+        Some(Commands::Build {
+            target,
+            jobs,
+            verbose,
+        }) => {
             let opts = BuildOptions {
                 jobs: jobs.map_or_else(|| BuildOptions::default().jobs, |j| j.get()),
                 verbose,
             };
 
             crate::dependencies::prepare(&mut project, &profile, opts.jobs)?;
-            let graph: Graph = Graph::from_project(&project, &profile)?;
+            let mut graph: Graph = Graph::from_project(&project, &profile)?;
+            if let Some(name) = target.as_deref() {
+                graph = graph.select_target(&project, &profile, name)?;
+            }
             let resolved: Resolved = resolve(&project, &profile)?;
 
             match build(
@@ -75,8 +86,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => return Err(Box::new(e)),
             }
         }
-        Some(Commands::Graph { dot }) => {
-            let graph: Graph = Graph::from_project(&project, &profile)?;
+        Some(Commands::Graph { target, dot }) => {
+            let mut graph: Graph = Graph::from_project(&project, &profile)?;
+            if let Some(name) = target.as_deref() {
+                graph = graph.select_target(&project, &profile, name)?;
+            }
             println!("{}", graph.render(dot));
         }
         Some(Commands::Clean { all }) => {
@@ -101,11 +115,21 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Some(Commands::Explain { target }) => {
-            let graph: Graph = Graph::from_project(&project, &profile)?;
+            let mut graph: Graph = Graph::from_project(&project, &profile)?;
+            let mut explain_path = target.clone();
+            if let Some(raw) = target.as_deref()
+                && let Some(named) = project
+                    .targets
+                    .iter()
+                    .find(|t| t.name.as_str() == raw.to_string_lossy().as_ref())
+            {
+                graph = graph.select_target(&project, &profile, &named.name)?;
+                explain_path = Some(project.target_output_path(&profile, named));
+            }
             let resolved: Resolved = resolve(&project, &profile)?;
             let plan: BuildPlan = prepare(&graph, &project, &resolved, &ProcessExecutor, &profile);
             let cwd: PathBuf = current_dir().unwrap();
-            match explain(&graph, &plan, target.as_deref(), &project.root, &cwd) {
+            match explain(&graph, &plan, explain_path.as_deref(), &project.root, &cwd) {
                 Ok(str) => {
                     println!("{}", str)
                 }
