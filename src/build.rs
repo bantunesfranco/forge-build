@@ -13,6 +13,7 @@ use crate::{
     fingerprint,
     graph::{Graph, Task, TaskId, TaskKind},
     headers,
+    lang::Driver,
     planner::{self, DirtyReason},
     project::Project,
     resolve::Resolved,
@@ -56,6 +57,18 @@ fn path_arg(p: &Path) -> String {
 /// language (a link task takes the C++ driver if any object is C++).
 pub fn command_for(task: &Task, r: &Resolved, project: &Project) -> CommandSpec {
     if task.kind == TaskKind::Archive {
+        if project.uses_msvc() {
+            let mut args = vec![
+                "/nologo".to_string(),
+                format!("/OUT:{}", path_arg(&task.outputs[0])),
+            ];
+            args.extend(task.inputs.iter().map(|p| path_arg(p)));
+            return CommandSpec {
+                program: "lib.exe".into(),
+                args,
+                cwd: project.root.clone(),
+            };
+        }
         let mut args = vec!["crs".to_string(), path_arg(&task.outputs[0])];
         args.extend(task.inputs.iter().map(|p| path_arg(p)));
         return CommandSpec {
@@ -69,14 +82,38 @@ pub fn command_for(task: &Task, r: &Resolved, project: &Project) -> CommandSpec 
     match task.kind {
         TaskKind::Compile => {
             args.extend(r.compile_args(task.lang));
-            args.push("-MMD".into());
-            args.push("-MF".into());
-            args.push(path_arg(&task.outputs[1]));
-            args.push("-c".into());
-            args.push(path_arg(&task.inputs[0]));
+            if toolchain.driver() == Driver::Msvc {
+                args.extend([
+                    "/nologo".into(),
+                    "/FS".into(),
+                    "/c".into(),
+                    "/sourceDependencies".into(),
+                    path_arg(&task.outputs[1]),
+                    format!("/Fo{}", path_arg(&task.outputs[0])),
+                    path_arg(&task.inputs[0]),
+                ]);
+            } else {
+                args.extend([
+                    "-MMD".into(),
+                    "-MF".into(),
+                    path_arg(&task.outputs[1]),
+                    "-c".into(),
+                    path_arg(&task.inputs[0]),
+                ]);
+            }
         }
         TaskKind::Link => {
             args.extend(task.inputs.iter().map(|p| path_arg(p)));
+            if toolchain.driver() == Driver::Msvc {
+                args.push("/link".into());
+                args.extend(r.link_args.iter().cloned());
+                args.push(format!("/OUT:{}", path_arg(&task.outputs[0])));
+                return CommandSpec {
+                    program: toolchain.program.clone(),
+                    args,
+                    cwd: project.root.clone(),
+                };
+            }
             args.extend(r.link_args.iter().cloned());
         }
         TaskKind::Archive => unreachable!("archive tasks return above"),

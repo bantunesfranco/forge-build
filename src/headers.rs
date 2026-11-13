@@ -46,10 +46,37 @@ fn clean(p: &Path) -> PathBuf {
 /// and the headers it included), normalized and de-duplicated, in order.
 pub fn read_headers(root: &Path, depfile: &Path) -> Result<Vec<PathBuf>, String> {
     let bytes = fs::read(depfile).map_err(|e| format!("cannot read {}: {e}", depfile.display()))?;
-    let parsed = parse_depfile(&bytes).map_err(|e| format!("{}: {e}", depfile.display()))?;
-
     let mut out: Vec<PathBuf> = Vec::new();
-    for raw in &parsed.ins {
+    let paths = if bytes.iter().copied().find(|b| !b.is_ascii_whitespace()) == Some(b'{') {
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", depfile.display()))?;
+        let data = json.get("Data").unwrap_or(&json);
+        let mut paths = Vec::new();
+        if let Some(source) = data.get("Source").and_then(serde_json::Value::as_str) {
+            paths.push(source.to_owned());
+        }
+        for key in ["Includes", "ImportedHeaderUnits"] {
+            if let Some(entries) = data.get(key).and_then(serde_json::Value::as_array) {
+                for entry in entries {
+                    if let Some(path) = entry.as_str() {
+                        paths.push(path.to_owned());
+                    } else if let Some(path) = entry
+                        .get("Path")
+                        .or_else(|| entry.get("Header"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        paths.push(path.to_owned());
+                    }
+                }
+            }
+        }
+        paths
+    } else {
+        parse_depfile(&bytes)
+            .map_err(|e| format!("{}: {e}", depfile.display()))?
+            .ins
+    };
+    for raw in &paths {
         let p = normalize(root, raw);
         if !out.contains(&p) {
             out.push(p);

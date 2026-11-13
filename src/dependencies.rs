@@ -16,6 +16,7 @@ use crate::{
         manifest::Dependency,
         types::{FindSpec, ListEdit, Prefer, Source},
     },
+    lang::Lang,
     project::Project,
     resolve,
 };
@@ -71,7 +72,15 @@ fn pkg_config(name: &str, version: Option<&str>) -> Result<Vec<String>, String> 
     }
     let out = success(
         "pkg-config",
-        &["--cflags".into(), "--libs".into(), name.into()],
+        // Include private dependencies too: a system package may resolve to a
+        // static archive, whose transitive link libraries (e.g. GLFW's X11
+        // dependencies) are commonly listed in Libs.private.
+        &[
+            "--static".into(),
+            "--cflags".into(),
+            "--libs".into(),
+            name.into(),
+        ],
         Path::new("."),
     )?;
     Ok(String::from_utf8_lossy(&out.stdout)
@@ -377,33 +386,86 @@ fn build_dependency(
             fs::create_dir_all(&obj_dir).map_err(|e| e.to_string())?;
             let mut objects = Vec::new();
             for (index, source) in sources.iter().enumerate() {
-                let program = match source.extension().and_then(|x| x.to_str()) {
+                let lang = match source.extension().and_then(|x| x.to_str()) {
                     Some("c") => cc,
                     _ => cxx,
                 };
-                let object = obj_dir.join(format!("{index}.o"));
-                let mut argv = vec!["-I".into(), work.display().to_string()];
-                for include in &project.include_dirs {
-                    argv.push("-I".into());
-                    argv.push(include.display().to_string());
+                let is_msvc = project.uses_msvc();
+                let program = lang;
+                let object = obj_dir.join(if is_msvc {
+                    format!("{index}.obj")
+                } else {
+                    format!("{index}.o")
+                });
+                let mut argv = if is_msvc {
+                    vec![
+                        "/nologo".into(),
+                        "/FS".into(),
+                        format!("/I{}", work.display()),
+                    ]
+                } else {
+                    vec!["-I".into(), work.display().to_string()]
+                };
+                if let Some(expose) = &dep.expose {
+                    for include in &expose.include {
+                        argv.push(if is_msvc {
+                            format!("/I{}", work.join(include).display())
+                        } else {
+                            "-I".into()
+                        });
+                        if !is_msvc {
+                            argv.push(work.join(include).display().to_string());
+                        }
+                    }
                 }
-                argv.extend(resolved.common_args.iter().cloned());
-                argv.extend([
-                    "-c".into(),
-                    source.display().to_string(),
-                    "-o".into(),
-                    object.display().to_string(),
-                ]);
+                for include in &project.include_dirs {
+                    argv.push(if is_msvc {
+                        format!("/I{}", include.display())
+                    } else {
+                        "-I".into()
+                    });
+                    if !is_msvc {
+                        argv.push(include.display().to_string());
+                    }
+                }
+                argv.extend(resolved.compile_args(
+                    if source.extension().and_then(|x| x.to_str()) == Some("c") {
+                        Lang::C
+                    } else {
+                        Lang::Cxx
+                    },
+                ));
+                if is_msvc {
+                    argv.extend([
+                        "/c".into(),
+                        format!("/Fo{}", object.display()),
+                        source.display().to_string(),
+                    ]);
+                } else {
+                    argv.extend([
+                        "-c".into(),
+                        source.display().to_string(),
+                        "-o".into(),
+                        object.display().to_string(),
+                    ]);
+                }
                 argv.extend(args.iter().cloned());
                 success_env(program, &argv, root, &dep.build.env)?;
                 objects.push(object);
             }
             let lib_dir = prefix.join("lib");
             fs::create_dir_all(&lib_dir).map_err(|e| e.to_string())?;
-            let archive = lib_dir.join(format!("lib{name}.a"));
-            let mut argv = vec!["rcs".into(), archive.display().to_string()];
-            argv.extend(objects.iter().map(|p| p.display().to_string()));
-            success_env("ar", &argv, root, &dep.build.env)?;
+            if project.uses_msvc() {
+                let archive = lib_dir.join(format!("{name}.lib"));
+                let mut argv = vec!["/nologo".into(), format!("/OUT:{}", archive.display())];
+                argv.extend(objects.iter().map(|p| p.display().to_string()));
+                success_env("lib.exe", &argv, root, &dep.build.env)?;
+            } else {
+                let archive = lib_dir.join(format!("lib{name}.a"));
+                let mut argv = vec!["rcs".into(), archive.display().to_string()];
+                argv.extend(objects.iter().map(|p| p.display().to_string()));
+                success_env("ar", &argv, root, &dep.build.env)?;
+            }
         }
         "make" => {
             let mut a = vec![format!("-j{jobs}")];

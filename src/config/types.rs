@@ -338,11 +338,14 @@ impl<'de> Deserialize<'de> for DepBuild {
                 f.write_str("a build backend name or build table")
             }
             fn visit_str<E: de::Error>(self, s: &str) -> Result<Self::Value, E> {
+                let (system, kind) = match s {
+                    "header-only" => ("none", None),
+                    "sources" => ("sources", Some("sources".into())),
+                    other => (other, None),
+                };
                 Ok(DepBuild {
-                    system: Some(match s {
-                        "header-only" => "none".into(),
-                        other => other.into(),
-                    }),
+                    system: Some(system.into()),
+                    kind,
                     ..DepBuild::default()
                 })
             }

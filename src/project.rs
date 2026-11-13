@@ -8,7 +8,7 @@ use crate::{
         types::{Prefer, Source},
     },
     discover::{discover_patterns, discover_sources},
-    lang::{Lang, Toolchain},
+    lang::{Driver, Lang, Toolchain},
     profile::validate_profiles,
     resolve,
 };
@@ -54,6 +54,14 @@ enum Scope {
 }
 
 impl Project {
+    pub fn uses_msvc(&self) -> bool {
+        self.sources
+            .iter()
+            .find_map(|source| Lang::from_path(source))
+            .and_then(|lang| self.toolchain(lang))
+            .is_some_and(|toolchain| toolchain.driver() == Driver::Msvc)
+    }
+
     pub fn from_config(cfg: Config) -> Result<Self, ConfigError> {
         let root = cfg
             .path
@@ -230,9 +238,16 @@ impl Project {
         let mut found: Vec<PathBuf> = Vec::new();
         for lib in &self.manifest.build.flags.libs {
             for dir in &self.lib_dirs {
-                let hits: Vec<PathBuf> = ["so", "dylib", "a"]
+                let hits: Vec<PathBuf> = ["so", "dylib", "a", "lib"]
                     .iter()
-                    .map(|ext| dir.join(format!("lib{lib}.{ext}")))
+                    .flat_map(|ext| {
+                        let name = if *ext == "lib" {
+                            format!("{lib}.{ext}")
+                        } else {
+                            format!("lib{lib}.{ext}")
+                        };
+                        [dir.join(name)]
+                    })
                     .filter(|p| p.is_file())
                     .collect();
                 if !hits.is_empty() {
@@ -264,39 +279,64 @@ impl Project {
 
     pub fn object_path(&self, profile: &str, src: &Path) -> PathBuf {
         let mut name = src.as_os_str().to_owned();
-        name.push(".o");
+        name.push(if self.uses_msvc() { ".obj" } else { ".o" });
         self.build_dir(profile).join("obj").join(name)
     }
 
     pub fn depfile_path(&self, profile: &str, src: &Path) -> PathBuf {
         let mut name = src.as_os_str().to_owned();
-        name.push(".o.d");
+        name.push(if self.uses_msvc() {
+            ".obj.json"
+        } else {
+            ".o.d"
+        });
         self.build_dir(profile).join("dep").join(name)
     }
 
     pub fn output_path(&self, profile: &str) -> PathBuf {
-        self.build_dir(profile).join(&self.manifest.build.output)
+        let mut output = self.manifest.build.output.clone();
+        if self.uses_msvc() && output.extension().is_none() {
+            output.set_extension("exe");
+        }
+        self.build_dir(profile).join(output)
     }
 
     pub fn target_object_path(&self, profile: &str, target: &str, src: &Path) -> PathBuf {
         let mut name = src.as_os_str().to_owned();
-        name.push(".o");
+        name.push(if self.uses_msvc() { ".obj" } else { ".o" });
         self.build_dir(profile).join("obj").join(target).join(name)
     }
 
     pub fn target_depfile_path(&self, profile: &str, target: &str, src: &Path) -> PathBuf {
         let mut name = src.as_os_str().to_owned();
-        name.push(".o.d");
+        name.push(if self.uses_msvc() {
+            ".obj.json"
+        } else {
+            ".o.d"
+        });
         self.build_dir(profile).join("dep").join(target).join(name)
     }
 
     pub fn target_output_path(&self, profile: &str, target: &BuildTarget) -> PathBuf {
         match target.kind {
-            BuildTargetKind::Binary => self.build_dir(profile).join("bin").join(&target.name),
-            BuildTargetKind::StaticLibrary => self
-                .build_dir(profile)
-                .join("lib")
-                .join(format!("lib{}.a", target.name)),
+            BuildTargetKind::Binary => {
+                let name =
+                    if self.uses_msvc() && !target.name.to_ascii_lowercase().ends_with(".exe") {
+                        format!("{}.exe", target.name)
+                    } else {
+                        target.name.clone()
+                    };
+                self.build_dir(profile).join("bin").join(name)
+            }
+            BuildTargetKind::StaticLibrary => {
+                self.build_dir(profile)
+                    .join("lib")
+                    .join(if self.uses_msvc() {
+                        format!("{}.lib", target.name)
+                    } else {
+                        format!("lib{}.a", target.name)
+                    })
+            }
         }
     }
 }
@@ -404,7 +444,8 @@ fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
 
 // ------------------------------------------------------------ toolchains
 
-/// Chooses a compiler and standard for each language present in `sources`.
+/// Chooses a compiler and standard for each language present in `sources`, and
+/// retains explicitly configured language toolchains for source-built deps.
 ///
 /// Like Make's `CC`/`CXX`, each language has its own compiler. The bare
 /// `compiler`/`standard` keys are a shorthand for a project with exactly one
@@ -435,7 +476,18 @@ fn resolve_toolchains(
                 compiler: &Option<String>,
                 standard: &Option<String>|
      -> Result<Option<Toolchain>, ConfigError> {
-        let Some(src) = src else { return Ok(None) };
+        let Some(src) = src else {
+            // A dependency built from sources can contain C even when the
+            // consumer project only has C++ sources (or vice versa). Keep a
+            // fully specified language toolchain available for that case.
+            return Ok(match (compiler, standard) {
+                (Some(program), Some(standard)) => Some(Toolchain {
+                    program: program.clone(),
+                    standard: standard.clone(),
+                }),
+                _ => None,
+            });
+        };
         let (bare_compiler, bare_standard) = (&b.compiler, &b.standard);
 
         for (key, specific, bare) in [

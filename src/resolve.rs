@@ -17,7 +17,7 @@ use crate::{
         manifest::BuildProfile,
         types::{Define, OptLevel},
     },
-    lang::{Lang, Toolchain},
+    lang::{Driver, Lang, Toolchain},
     project::Project,
 };
 
@@ -45,7 +45,12 @@ impl Resolved {
 
     /// `-std=...` followed by the common flags.
     pub fn compile_args(&self, lang: Lang) -> Vec<String> {
-        let mut args = vec![format!("-std={}", self.toolchain(lang).standard)];
+        let toolchain = self.toolchain(lang);
+        let msvc = toolchain.driver() == Driver::Msvc;
+        let mut args = vec![standard_flag(&toolchain.standard, msvc)];
+        if msvc && lang == Lang::Cxx {
+            args.push("/EHsc".into());
+        }
         args.extend(self.common_args.iter().cloned());
         args
     }
@@ -154,36 +159,78 @@ fn arg_path(root: &Path, p: &Path) -> String {
 pub fn resolve(project: &Project, profile: &str) -> Result<Resolved, ConfigError> {
     let layered = layer(&project.manifest, profile)?;
     let flags = &project.manifest.build.flags;
+    let msvc = project.uses_msvc();
 
     let mut common = Vec::new();
     if flags.warnings == Some(true) {
-        common.push("-Wall".to_string());
-        common.push("-Wextra".to_string());
+        if msvc {
+            common.push("/W4".to_string());
+        } else {
+            common.push("-Wall".to_string());
+            common.push("-Wextra".to_string());
+        }
     }
     if flags.pedantic == Some(true) {
-        common.push("-Wpedantic".to_string());
+        common.push(if msvc { "/permissive-" } else { "-Wpedantic" }.to_string());
     }
     if flags.error_on_warning == Some(true) {
-        common.push("-Werror".to_string());
+        common.push(if msvc { "/WX" } else { "-Werror" }.to_string());
     }
     if let Some(o) = layered.opt_level {
-        common.push(o.flag().to_string());
+        common.push(if msvc { msvc_opt_flag(o) } else { o.flag() }.to_string());
+        if msvc && o == OptLevel::Ofast {
+            common.push("/fp:fast".into());
+        }
     }
     if layered.debug_info {
-        common.push("-g".to_string());
+        common.push(if msvc { "/Zi" } else { "-g" }.to_string());
     }
-    common.extend(layered.defines.iter().map(|d| d.to_string()));
+    common.extend(layered.defines.iter().map(|d| {
+        if msvc {
+            format!(
+                "/D{}{}",
+                d.name,
+                d.value.as_ref().map_or(String::new(), |v| format!("={v}"))
+            )
+        } else {
+            d.to_string()
+        }
+    }));
     for dir in &project.include_dirs {
-        common.push(format!("-I{}", arg_path(&project.root, dir)));
+        common.push(format!(
+            "{}{}",
+            if msvc { "/I" } else { "-I" },
+            arg_path(&project.root, dir)
+        ));
     }
     common.extend(layered.compile_flags);
 
     let mut link = layered.link_flags;
+    if msvc && layered.debug_info {
+        link.push("/DEBUG".into());
+    }
     for dir in &project.lib_dirs {
-        link.push(format!("-L{}", arg_path(&project.root, dir)));
+        link.push(if msvc {
+            format!("/LIBPATH:{}", arg_path(&project.root, dir))
+        } else {
+            format!("-L{}", arg_path(&project.root, dir))
+        });
     }
     for lib in &flags.libs {
-        link.push(format!("-l{lib}"));
+        if msvc {
+            link.push(
+                if lib.contains('/')
+                    || lib.contains('\\')
+                    || lib.to_ascii_lowercase().ends_with(".lib")
+                {
+                    lib.clone()
+                } else {
+                    format!("{lib}.lib")
+                },
+            );
+        } else {
+            link.push(format!("-l{lib}"));
+        }
     }
 
     Ok(Resolved {
@@ -192,6 +239,31 @@ pub fn resolve(project: &Project, profile: &str) -> Result<Resolved, ConfigError
         common_args: common,
         link_args: link,
     })
+}
+
+fn standard_flag(standard: &str, msvc: bool) -> String {
+    if !msvc {
+        return format!("-std={standard}");
+    }
+    let standard = standard
+        .strip_prefix("gnu++")
+        .map(|version| format!("c++{version}"))
+        .or_else(|| {
+            standard
+                .strip_prefix("gnu")
+                .map(|version| format!("c{version}"))
+        })
+        .unwrap_or_else(|| standard.to_string());
+    format!("/std:{standard}")
+}
+
+fn msvc_opt_flag(level: OptLevel) -> &'static str {
+    match level {
+        OptLevel::O0 | OptLevel::Og => "/Od",
+        OptLevel::O1 | OptLevel::Os | OptLevel::Oz => "/O1",
+        OptLevel::O2 | OptLevel::O3 => "/O2",
+        OptLevel::Ofast => "/O2",
+    }
 }
 
 // ------------------------------------------------------------ validation

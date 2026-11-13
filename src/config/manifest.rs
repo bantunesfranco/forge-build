@@ -242,13 +242,13 @@ impl Manifest {
                 std::env::var("CC")
                     .ok()
                     .or(toolchain.c)
-                    .unwrap_or_else(|| "cc".into()),
+                    .unwrap_or_else(|| if cfg!(windows) { "cl" } else { "cc" }.into()),
             );
             self.build.cxx_compiler = Some(
                 std::env::var("CXX")
                     .ok()
                     .or(toolchain.cxx)
-                    .unwrap_or_else(|| "c++".into()),
+                    .unwrap_or_else(|| if cfg!(windows) { "cl" } else { "c++" }.into()),
             );
             if self.build.default_profile.is_empty() {
                 self.build.default_profile = "debug".into();
