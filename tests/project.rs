@@ -242,7 +242,7 @@ fn only_languages_present_need_a_standard() {
 }
 
 #[test]
-fn git_cmake_and_system_dependencies_are_not_supported_yet() {
+fn cmake_and_system_dependencies_are_not_supported_yet() {
     for (dep, what) in [
         (
             "git = \"https://example.com/glad\"
@@ -250,12 +250,6 @@ rev = \"1\"
 kind = \"cmake\"
 expose = { target = \"glad\" }",
             "`cmake`",
-        ),
-        (
-            "git = \"https://example.com/glad\"
-rev = \"1\"
-kind = \"header-only\"",
-            "git source",
         ),
         (
             "kind = \"system\"

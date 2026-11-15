@@ -8,12 +8,12 @@ use std::{
 
 use crate::{
     build::{BuildOptions, BuildPlan, build, prepare},
-    config::{ConfigError, Diagnostics, Level, find_manifest},
+    config::{self, ConfigError, Diagnostics, Level, find_manifest},
     configure::{
         model::Invocation,
         options::{CACHE_FILE, load_cache, parse_cli_opt, save_cache},
     },
-    deps::{Phase, prepare_all},
+    deps::{self, Phase, prepare_all},
     executor::{Executor, ProcessExecutor},
     explain::explain,
     graph::Graph,
@@ -61,6 +61,11 @@ enum Commands {
     Explain {
         target: Option<PathBuf>,
     },
+    /// Resolve git dependencies again and rewrite project.lock.
+    Update {
+        /// Update only this git dependency (default: all of them).
+        dep: Option<String>,
+    },
 }
 
 /// Prints what configure had to say, before any command runs.
@@ -105,6 +110,9 @@ fn load_project(
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Cli = Cli::parse();
     let manifest: PathBuf = find_manifest(args.manifest.as_deref())?;
+    if let Some(Commands::Update { dep }) = &args.command {
+        return update(&manifest, dep.as_deref());
+    }
     let mut project: Project = load_project(&manifest, args.profile, &args.opt, &ProcessExecutor)?;
     print_diagnostics(&project.diagnostics);
 
@@ -183,9 +191,23 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => return Err(Box::new(e)),
             }
         }
-        None => {}
+        Some(Commands::Update { .. }) | None => {}
     }
 
+    Ok(())
+}
+
+/// `forge update`: needs the manifest only, so no compiler has to be found.
+fn update(manifest: &Path, dep: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let m = config::load(manifest)?;
+    let root = match manifest.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let mut diagnostics = Diagnostics::default();
+    let result = deps::update(root, &m, dep, &mut diagnostics);
+    print_diagnostics(&diagnostics);
+    result?;
     Ok(())
 }
 
@@ -265,6 +287,20 @@ mod tests {
         .to_string();
         assert!(e.contains("level"), "{e}");
         assert!(!root.join(CACHE_FILE).exists());
+    }
+
+    #[test]
+    fn update_needs_no_compiler_and_rejects_unknown_names() {
+        let (_t, root) = project_dir();
+        let manifest = root.join("project.toml");
+        // No git dependency: nothing to do, nothing written.
+        update(&manifest, None).unwrap();
+        assert!(!root.join("project.lock").exists());
+        let e = update(&manifest, Some("glm")).unwrap_err().to_string();
+        assert!(
+            e.contains("glm") && e.contains("not a git dependency"),
+            "{e}"
+        );
     }
 
     #[test]

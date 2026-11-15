@@ -198,7 +198,7 @@ fn root_relative(root: &Path, full: &Path) -> PathBuf {
 /// Where relative paths of one unit are anchored.
 struct PathCx<'a> {
     root: &'a Path,
-    /// `None` for a git dependency that is not fetched yet.
+    /// `None` for a `system` dependency, which has no directory.
     base: Option<&'a Path>,
     system_includes: bool,
     os: Os,
@@ -647,7 +647,10 @@ fn dependency_unit(
             }
             Some(dir)
         }
-        DepSource::Git { .. } | DepSource::Host => None,
+        // The checkout directory is fixed, so nothing needs to be on disk yet:
+        // `deps::prepare_all` fetches it before the files are looked for.
+        DepSource::Git { .. } => Some(crate::deps::git::source_dir(root, name)),
+        DepSource::Host => None,
     };
     let base_dir_rel = scalar_string(&merged, "root")?.map(PathBuf::from);
     let base = source_dir.as_ref().map(|dir| match &base_dir_rel {

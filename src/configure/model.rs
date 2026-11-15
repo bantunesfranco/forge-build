@@ -33,7 +33,6 @@ pub struct Invocation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncludeDir {
     /// Relative to the project root when inside it, absolute otherwise.
-    /// (Relative as written for a git dependency that is not fetched yet.)
     pub path: PathBuf,
     /// Compiled as a system include (`-isystem`, `-external:I`).
     pub system: bool,
@@ -72,7 +71,9 @@ pub enum UnitKind {
 #[derive(Debug, Clone)]
 pub struct DepDetails {
     pub source: DepSource,
-    /// `path` joined to the manifest directory; for `git`, `None` until fetched.
+    /// `path` joined to the manifest directory, or for `git` the checkout
+    /// directory `build/deps/<name>/source` (it need not exist yet: it is
+    /// fetched when the dependency is prepared). `None` for `system`.
     pub source_dir: Option<PathBuf>,
     /// The `root` key: a subdirectory of `source_dir` that is the base of
     /// `files`, `include` and `lib_dir`.
@@ -99,8 +100,8 @@ pub struct Unit {
     pub public: Settings,
     /// Dependency names with the visibility they were listed with.
     pub deps: Vec<(String, Visibility)>,
-    /// The directory `include` and `sources` are relative to. For a git
-    /// dependency that is not fetched yet this is empty.
+    /// The directory `include` and `sources` are relative to. Empty for a
+    /// `system` dependency.
     pub base_dir: PathBuf,
     /// Relative to the project root, `/`-separated. Empty for dependencies
     /// (their files are resolved when they are prepared).
@@ -444,7 +445,13 @@ mod tests {
     fn spec_example_dependency_details() {
         let c = cfg(SPEC, SPEC_FILES, LINUX);
         let glfw = unit(&c, "glfw").dep.as_ref().unwrap();
-        assert!(glfw.source_dir.is_none());
+        // A git dependency has its checkout directory before anything is fetched.
+        assert!(
+            glfw.source_dir
+                .as_ref()
+                .unwrap()
+                .ends_with("build/deps/glfw/source")
+        );
         assert_eq!(glfw.cmake_options["GLFW_BUILD_X11"], "ON");
         assert_eq!(glfw.cmake_options["GLFW_INSTALL"], "OFF");
         assert_eq!(glfw.expose, ["glfw"]);
@@ -936,7 +943,7 @@ features = [\"x\"]
     }
 
     #[test]
-    fn path_dependency_must_exist_and_git_is_unresolved() {
+    fn path_dependency_must_exist_and_git_has_a_checkout_dir() {
         let e = err(
             "[dependency.d]\npath = \"missing\"\nkind = \"header-only\"\n",
             &[],
@@ -948,11 +955,21 @@ features = [\"x\"]
         let c = cfg(src, &[], LINUX);
         let g = unit(&c, "g");
         let d = g.dep.as_ref().unwrap();
-        assert!(d.source_dir.is_none());
+        // Nothing is on disk yet, but the directories are already known.
+        assert!(
+            d.source_dir
+                .as_ref()
+                .unwrap()
+                .ends_with("build/deps/g/source")
+        );
         assert_eq!(d.base_dir_rel, Some(PathBuf::from("sub")));
         assert_eq!(d.files, ["src/*.c"]);
         assert!(g.sources.is_empty());
-        assert_eq!(g.public.include[0].path, PathBuf::from("inc"));
+        assert!(g.base_dir.ends_with("build/deps/g/source/sub"));
+        assert_eq!(
+            g.public.include[0].path,
+            PathBuf::from("build/deps/g/source/sub/inc")
+        );
     }
 
     #[test]
