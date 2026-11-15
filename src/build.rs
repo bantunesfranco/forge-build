@@ -286,6 +286,17 @@ pub fn build(
                     break;
                 }
 
+                // `ar` adds to an existing archive and never drops members, so
+                // a removed or renamed source would stay in the library.
+                if task.kind == TaskKind::Archive
+                    && let Err(e) = fs::remove_file(root.join(out))
+                    && e.kind() != io::ErrorKind::NotFound
+                {
+                    eprintln!("error: cannot remove {}: {e}", out.display());
+                    failed += 1;
+                    break;
+                }
+
                 match task.kind {
                     TaskKind::Compile => println!("Compiling {}", task.inputs[0].display()),
                     TaskKind::Archive => println!("Archiving {}", out.display()),
