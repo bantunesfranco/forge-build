@@ -9,6 +9,7 @@ pub mod discover;
 pub mod executor;
 pub mod explain;
 pub mod fingerprint;
+pub mod flags;
 pub mod graph;
 pub mod headers;
 pub mod lang;
