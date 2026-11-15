@@ -1,6 +1,7 @@
 pub mod build;
 pub mod cli;
 pub mod config;
+pub mod configure;
 pub mod database;
 pub mod dependencies;
 pub mod depfile;
