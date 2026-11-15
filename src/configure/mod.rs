@@ -23,7 +23,7 @@ use crate::config::{
 use crate::discover::discover_globs;
 use crate::platform::{host_os_arch, llvm_triple};
 use features::{ActiveFeature, select_features};
-use lookup::{Alias, LookupCtx, uses_platform_lookup};
+use lookup::{Alias, LookupCtx, expand, uses_platform_lookup};
 use merge::{Layer, Merged, Removals, Sourced, merge, merge_with};
 use model::{
     Configured, DepDetails, IncludeDir, Invocation, ProfileScalars, Settings, Unit, UnitKind,
@@ -59,6 +59,8 @@ const ABI_FLAG_PREFIXES: &[&str] = &[
     "-fno-rtti",
     "/GR-",
 ];
+/// `-m` flags that do not change the ABI or code generation of a library.
+const NON_ABI_FLAGS: &[&str] = &["-mtune=", "-mwindows", "-mconsole", "-mthreads"];
 const ABI_DEFINES: &[&str] = &[
     "_GLIBCXX_USE_CXX11_ABI",
     "_ITERATOR_DEBUG_LEVEL",
@@ -755,7 +757,26 @@ fn dependency_unit(
     }];
     let (merged, active) = cx.merge_unit(layers, alias.as_ref())?;
 
-    let source_dir = match &decl.source {
+    // Lookups may appear in any value (spec 4.5), including where a dependency lives.
+    let lctx = cx.lookup(alias.as_ref());
+    let expanded = |field: &str, text: &str| {
+        expand(text, &lctx)
+            .map_err(|message| ConfigError::invalid(origin, format!("`{field}`: {message}")))
+    };
+    let source = match &decl.source {
+        DepSource::Path(p) => {
+            DepSource::Path(PathBuf::from(expanded("path", &p.to_string_lossy())?))
+        }
+        // `git` and `rev` take no lookups (schema): the lockfile pins one commit.
+        DepSource::Git { .. } | DepSource::Host => decl.source.clone(),
+    };
+    let find = decl
+        .find
+        .as_deref()
+        .map(|f| expanded("find", f))
+        .transpose()?;
+
+    let source_dir = match &source {
         DepSource::Path(p) => {
             let dir = root.join(p);
             if !dir.is_dir() {
@@ -830,11 +851,11 @@ fn dependency_unit(
         output: name.to_string(),
         subsystem: None,
         dep: Some(DepDetails {
-            source: decl.source.clone(),
+            source,
             source_dir,
             base_dir_rel,
             alias,
-            find: decl.find.clone(),
+            find,
             system_headers: decl.system_headers,
             expose: decl.expose.clone(),
             cmake_options,
@@ -852,7 +873,9 @@ fn dependency_unit(
 fn warn_abi(name: &str, origin: &str, private: &Settings, diags: &mut Diagnostics) {
     let hint = "make it public so consumers compile identically";
     for f in &private.flags {
-        if ABI_FLAG_PREFIXES.iter().any(|p| f.starts_with(p)) {
+        if ABI_FLAG_PREFIXES.iter().any(|p| f.starts_with(p))
+            && !NON_ABI_FLAGS.iter().any(|p| f.starts_with(p))
+        {
             diags.warn(format!(
                 "{origin}: private flag `{f}` in `{name}` is ABI-affecting; {hint} (`flags.public`)"
             ));

@@ -290,8 +290,17 @@ const TOP_LEVEL: &[&str] = &[
 ];
 
 pub fn parse_manifest(t: toml::Table) -> Result<Manifest, ConfigError> {
-    for name in t.keys() {
+    for (name, value) in &t {
         if !TOP_LEVEL.contains(&name.as_str()) {
+            if !value.is_table() {
+                return Err(ConfigError::invalid(
+                    "manifest",
+                    format!(
+                        "`{name}` is a key outside any table; keys go inside a table such as `[workspace]` (tables: {})",
+                        TOP_LEVEL.join(", ")
+                    ),
+                ));
+            }
             return Err(ConfigError::invalid(
                 "manifest",
                 format!(
@@ -314,7 +323,17 @@ pub fn parse_manifest(t: toml::Table) -> Result<Manifest, ConfigError> {
         let origin = format!("feature.{name}");
         let decl = match options.get(name) {
             Some(opt) => parse_variants(&origin, name, body, opt)?,
-            None => FeatureDecl::Bundle(parse_feature_body(&origin, body)?),
+            None => {
+                if let Some((child, _)) = body.iter().find(|(k, v)| v.is_table() && *k != "when") {
+                    return Err(ConfigError::invalid(
+                        &origin,
+                        format!(
+                            "`{child}` is a sub-table, but there is no option `{name}`, so this is a bundle and takes its keys directly (declare `[option.{name}]` to give it one table per option value)"
+                        ),
+                    ));
+                }
+                FeatureDecl::Bundle(parse_feature_body(&origin, body)?)
+            }
         };
         features.insert(name.clone(), decl);
     }
@@ -443,8 +462,9 @@ fn parse_entries(
 ) -> Result<Vec<Entry>, ConfigError> {
     let mut entries = Vec::with_capacity(body.len());
     for (raw, value) in body {
-        let key = parse_key(raw, |n| rules.rule(n))
-            .map_err(|message| ConfigError::invalid(origin, message))?;
+        let key = parse_key(raw, |n| rules.rule(n)).map_err(|message| {
+            ConfigError::invalid(origin, with_table_hint(raw, message, rules))
+        })?;
         if value.is_table() && !TABLE_VALUED.contains(&key.name.as_str()) {
             return Err(ConfigError::invalid(
                 origin,
@@ -458,6 +478,19 @@ fn parse_entries(
         });
     }
     Ok(entries)
+}
+
+/// For a dotted key such as `requires.tool` or `options.GLFW_X`, whose first
+/// segment takes a table: `message` plus the inline-table spelling.
+fn with_table_hint(raw: &str, message: String, rules: &Rules) -> String {
+    match raw.split_once('.') {
+        Some((name, rest)) if TABLE_VALUED.contains(&name) && rules.rule(name).is_some() => {
+            format!(
+                "{message}; `{name}` takes an inline table and a dotted key is a flat name here, so write `{name} = {{ {rest} = ... }}` for a table entry"
+            )
+        }
+        _ => message,
+    }
 }
 
 /// Removes the structural entry `name` (a key with no suffixes) from `entries`.
@@ -572,7 +605,20 @@ fn parse_option(origin: &str, body: &toml::Table) -> Result<OptionDecl, ConfigEr
                     }
                 });
             }
-            "values" => values = Some(want_string_array(origin, "values", &e.value)?),
+            "values" => {
+                let list = want_string_array(origin, "values", &e.value)?;
+                if let Some(dup) = list
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, v)| list[..i].contains(v).then_some(v))
+                {
+                    return Err(ConfigError::invalid(
+                        origin,
+                        format!("`values` lists `{dup}` more than once"),
+                    ));
+                }
+                values = Some(list);
+            }
             "default" => {
                 if e.value.is_array() || e.value.is_table() {
                     return Err(ConfigError::invalid(
@@ -734,6 +780,14 @@ fn parse_dependency(origin: &str, body: &toml::Table) -> Result<DependencyDecl, 
     let path = take_string(origin, &mut entries, "path")?;
     let find = take_string(origin, &mut entries, "find")?;
 
+    for (field, value) in [("git", &git), ("rev", &rev)] {
+        if value.as_deref().is_some_and(|v| v.contains("${")) {
+            return Err(ConfigError::invalid(
+                origin,
+                format!("`{field}` takes no lookups: the lockfile pins one commit per dependency"),
+            ));
+        }
+    }
     let source = match (kind, git, path) {
         (DepKind::System, None, None) if rev.is_none() => DepSource::Host,
         (DepKind::System, ..) => {
@@ -869,6 +923,49 @@ mod tests {
     }
 
     #[test]
+    fn bare_top_level_key_is_not_an_unknown_table() {
+        let e = err("name = \"x\"\n");
+        assert!(e.contains("`name` is a key outside any table"), "{e}");
+    }
+
+    #[test]
+    fn dotted_table_keys_get_the_inline_table_hint() {
+        let e = err("[workspace]\nrequires.tool = \">=0.1\"\n");
+        assert!(e.contains("requires = { tool = ... }"), "{e}");
+        let e = err("[dependency.d]\nkind = \"cmake\"\npath = \"d\"\nexpose.target = \"x\"\n");
+        assert!(e.contains("expose = { target = ... }"), "{e}");
+        let e = err("[dependency.d]\nkind = \"cmake\"\npath = \"d\"\noptions.GLFW_X = true\n");
+        assert!(e.contains("options = { GLFW_X = ... }"), "{e}");
+        // Not a table-valued key of this table: the plain message.
+        let e = err("[lib.a]\nalias.arch = { x86_64 = \"x\" }\n");
+        assert!(
+            e.contains("unknown key `alias`") && !e.contains("inline table"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn feature_sub_table_without_an_option_says_bundle() {
+        let e = err("[feature.simd.avx2]\ndefines = [\"A\"]\n");
+        assert!(
+            e.contains("feature.simd") && e.contains("no option `simd`") && e.contains("bundle"),
+            "{e}"
+        );
+        // `when` is the one sub-table a bundle has.
+        m("[feature.f]\nwhen = { os = \"linux\" }\n").unwrap();
+    }
+
+    #[test]
+    fn duplicate_enum_values_are_rejected() {
+        let e =
+            err("[option.o]\ntype = \"enum\"\nvalues = [\"a\", \"b\", \"a\"]\ndefault = \"a\"\n");
+        assert!(
+            e.contains("option.o") && e.contains("`a` more than once"),
+            "{e}"
+        );
+    }
+
+    #[test]
     fn unknown_key_names_table() {
         assert!(
             err("[lib.a]\nsources=[\"a.c\"]\ndefnes=[]\n").contains("lib.a: unknown key `defnes`")
@@ -907,6 +1004,17 @@ mod tests {
         assert!(
             err("[dependency.d]\nkind=\"system\"\nfind=\"X\"\npath=\"a\"\n").contains("system")
         );
+    }
+
+    #[test]
+    fn git_and_rev_take_no_lookups() {
+        let e = err("[dependency.d]\nkind=\"header-only\"\ngit=\"u/${os}\"\nrev=\"x\"\n");
+        assert!(
+            e.contains("dependency.d") && e.contains("`git` takes no lookups"),
+            "{e}"
+        );
+        let e = err("[dependency.d]\nkind=\"header-only\"\ngit=\"u\"\nrev=\"${arch}\"\n");
+        assert!(e.contains("`rev` takes no lookups"), "{e}");
     }
 
     #[test]

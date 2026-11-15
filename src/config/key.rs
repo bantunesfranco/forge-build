@@ -68,7 +68,9 @@ pub fn parse_key(raw: &str, rule_for: impl Fn(&str) -> Option<KeyRule>) -> Resul
     }
 
     let mut visibility = Visibility::Private;
+    let mut vis_given = false;
     if let Some(v) = segs.peek().and_then(|s| Visibility::parse(s)) {
+        vis_given = true;
         if !rule.visibility {
             return Err(format!("`{name}` does not accept visibility (`{raw}`)"));
         }
@@ -84,9 +86,7 @@ pub fn parse_key(raw: &str, rule_for: impl Fn(&str) -> Option<KeyRule>) -> Resul
         match Condition::parse(seg) {
             Some(c) => condition = Some(c),
             None if Visibility::parse(seg).is_some() => {
-                return Err(format!(
-                    "visibility must come before the condition (`{raw}`)"
-                ));
+                return Err(wrong_visibility(raw, vis_given));
             }
             None => return Err(format!("unknown condition `{seg}` in `{raw}`")),
         }
@@ -99,7 +99,7 @@ pub fn parse_key(raw: &str, rule_for: impl Fn(&str) -> Option<KeyRule>) -> Resul
                  use a feature `when` for combined cases"
             )
         } else if Visibility::parse(extra).is_some() {
-            format!("visibility must come before the condition (`{raw}`)")
+            wrong_visibility(raw, vis_given)
         } else {
             format!("unknown condition `{extra}` in `{raw}`")
         });
@@ -111,6 +111,14 @@ pub fn parse_key(raw: &str, rule_for: impl Fn(&str) -> Option<KeyRule>) -> Resul
         condition,
         remove,
     })
+}
+
+fn wrong_visibility(raw: &str, already_given: bool) -> String {
+    if already_given {
+        format!("only one visibility is allowed per key (`{raw}`)")
+    } else {
+        format!("visibility must come before the condition (`{raw}`)")
+    }
 }
 
 #[cfg(test)]
@@ -196,6 +204,14 @@ mod tests {
                 .unwrap_err()
                 .contains("before the condition")
         );
+    }
+
+    #[test]
+    fn rejects_two_visibilities() {
+        let e = parse_key("defines.public.private", r).unwrap_err();
+        assert!(e.contains("only one visibility"), "{e}");
+        let e = parse_key("defines.public.windows.private", r).unwrap_err();
+        assert!(e.contains("only one visibility"), "{e}");
     }
 
     #[test]

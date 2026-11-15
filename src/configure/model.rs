@@ -616,14 +616,7 @@ mod tests {
 
     #[test]
     fn remove_can_drop_a_value_a_feature_adds() {
-        let src = "[workspace]
-features = [\"f\"]
-[feature.f]
-defines = [\"A\", \"B\"]
-[bin.app]
-sources = [\"a.c\"]
-remove.defines = [\"A\"]
-";
+        let src = "[workspace]\nfeatures = [\"f\"]\n[feature.f]\ndefines = [\"A\", \"B\"]\n[bin.app]\nsources = [\"a.c\"]\nremove.defines = [\"A\"]\n";
         let c = cfg(src, &["a.c"], LINUX);
         assert!(!has_define(&unit(&c, "app").private, "A"));
         assert!(has_define(&unit(&c, "app").private, "B"));
@@ -631,16 +624,7 @@ remove.defines = [\"A\"]
 
     #[test]
     fn profile_remove_drops_a_workspace_value() {
-        let src = "[workspace]
-defines = [\"LOG\", \"KEEP\"]
-[profile.release]
-remove.defines = [\"LOG\"]
-[bin.app]
-sources = [\"a.c\"]
-[dependency.d]
-path = \"d\"
-kind = \"header-only\"
-";
+        let src = "[workspace]\ndefines = [\"LOG\", \"KEEP\"]\n[profile.release]\nremove.defines = [\"LOG\"]\n[bin.app]\nsources = [\"a.c\"]\n[dependency.d]\npath = \"d\"\nkind = \"header-only\"\n";
         let inv = Invocation {
             profile: Some("release".into()),
             ..Invocation::default()
@@ -654,14 +638,7 @@ kind = \"header-only\"
 
     #[test]
     fn target_root_applies_to_its_own_paths_only() {
-        let src = "[workspace]
-include.public = [\"include\"]
-sources = [\"common/*.cpp\"]
-[lib.engine]
-root = \"engine\"
-sources = [\"srcs/*.cpp\"]
-include.public = [\"inc\"]
-";
+        let src = "[workspace]\ninclude.public = [\"include\"]\nsources = [\"common/*.cpp\"]\n[lib.engine]\nroot = \"engine\"\nsources = [\"srcs/*.cpp\"]\ninclude.public = [\"inc\"]\n";
         let c = cfg(
             src,
             &["engine/srcs/a.cpp", "common/w.cpp", "engine/common/no.cpp"],
@@ -684,22 +661,7 @@ include.public = [\"inc\"]
 
     #[test]
     fn feature_and_profile_paths_follow_the_manifest_dir_but_a_dependencys_own_base() {
-        let src = "[workspace]
-features = [\"f\"]
-[feature.f]
-include.public = [\"fi\"]
-[profile.debug]
-include = [\"pi\"]
-[lib.engine]
-root = \"engine\"
-sources = [\"a.cpp\"]
-[dependency.d]
-path = \"vendor/d\"
-kind = \"header-only\"
-root = \"sub\"
-features = [\"f\"]
-include.public = [\"di\"]
-";
+        let src = "[workspace]\nfeatures = [\"f\"]\n[feature.f]\ninclude.public = [\"fi\"]\n[profile.debug]\ninclude = [\"pi\"]\n[lib.engine]\nroot = \"engine\"\nsources = [\"a.cpp\"]\n[dependency.d]\npath = \"vendor/d\"\nkind = \"header-only\"\nroot = \"sub\"\nfeatures = [\"f\"]\ninclude.public = [\"di\"]\n";
         let c = cfg(src, &["engine/a.cpp", "vendor/d/sub/"], LINUX);
         let paths =
             |s: &Settings| -> Vec<PathBuf> { s.include.iter().map(|i| i.path.clone()).collect() };
@@ -719,11 +681,7 @@ include.public = [\"di\"]
 
     #[test]
     fn inherited_include_does_not_make_a_lib_header_only() {
-        let src = "[workspace]
-include = [\"inc\"]
-[lib.hdr]
-defines = [\"X\"]
-";
+        let src = "[workspace]\ninclude = [\"inc\"]\n[lib.hdr]\ndefines = [\"X\"]\n";
         let e = err(src, &[], LINUX);
         assert!(
             e.contains("lib.hdr") && e.contains("needs `sources`"),
@@ -733,9 +691,7 @@ defines = [\"X\"]
 
     #[test]
     fn include_under_any_condition_makes_a_lib_header_only() {
-        let src = "[lib.hdr]
-include.public.windows = [\"inc\"]
-";
+        let src = "[lib.hdr]\ninclude.public.windows = [\"inc\"]\n";
         let c = cfg(src, &[], LINUX);
         assert_eq!(unit(&c, "hdr").kind, UnitKind::InterfaceLib);
     }
@@ -743,20 +699,12 @@ include.public.windows = [\"inc\"]
     #[test]
     fn output_must_be_a_single_file_name() {
         for bad in ["", "a/b", "a\\\\b", "..", ".", "../../x", "/abs"] {
-            let src = format!(
-                "[bin.m]
-sources = [\"a.c\"]
-output = \"{bad}\"
-"
-            );
+            let src = format!("[bin.m]\nsources = [\"a.c\"]\noutput = \"{bad}\"\n");
             let e = err(&src, &["a.c"], LINUX);
             assert!(e.contains("bin.m") && e.contains("`output`"), "{bad}: {e}");
         }
         let c = cfg(
-            "[bin.m]
-sources = [\"a.c\"]
-output = \"my.tool\"
-",
+            "[bin.m]\nsources = [\"a.c\"]\noutput = \"my.tool\"\n",
             &["a.c"],
             LINUX,
         );
@@ -765,47 +713,20 @@ output = \"my.tool\"
 
     #[test]
     fn duplicate_outputs_of_the_same_kind_are_rejected() {
-        let src = "[bin.a]
-sources = [\"a.c\"]
-output = \"tool\"
-[bin.b]
-sources = [\"a.c\"]
-output = \"tool\"
-";
+        let src = "[bin.a]\nsources = [\"a.c\"]\noutput = \"tool\"\n[bin.b]\nsources = [\"a.c\"]\noutput = \"tool\"\n";
         let e = err(src, &["a.c"], LINUX);
         assert!(
             e.contains("tool") && e.contains("bin.a") && e.contains("bin.b"),
             "{e}"
         );
-        let src = "[lib.a]
-sources = [\"a.c\"]
-output = \"x\"
-[lib.b]
-sources = [\"a.c\"]
-output = \"x\"
-";
+        let src = "[lib.a]\nsources = [\"a.c\"]\noutput = \"x\"\n[lib.b]\nsources = [\"a.c\"]\noutput = \"x\"\n";
         let e = err(src, &["a.c"], LINUX);
         assert!(e.contains("lib.a") && e.contains("lib.b"), "{e}");
         // A lib and a bin land in different directories; an interface lib has no file.
-        let src = "[lib.a]
-sources = [\"a.c\"]
-output = \"x\"
-[bin.b]
-sources = [\"a.c\"]
-output = \"x\"
-[lib.h]
-include = [\"i\"]
-output = \"x\"
-";
+        let src = "[lib.a]\nsources = [\"a.c\"]\noutput = \"x\"\n[bin.b]\nsources = [\"a.c\"]\noutput = \"x\"\n[lib.h]\ninclude = [\"i\"]\noutput = \"x\"\n";
         cfg(src, &["a.c"], LINUX);
         // `tool` and `Tool.exe` are the same file on Windows only.
-        let src = "[bin.a]
-sources = [\"a.c\"]
-output = \"tool\"
-[bin.b]
-sources = [\"a.c\"]
-output = \"Tool.exe\"
-";
+        let src = "[bin.a]\nsources = [\"a.c\"]\noutput = \"tool\"\n[bin.b]\nsources = [\"a.c\"]\noutput = \"Tool.exe\"\n";
         cfg(src, &["a.c"], LINUX);
         let e = err(src, &["a.c"], WINDOWS);
         assert!(e.contains("bin.a") && e.contains("bin.b"), "{e}");
@@ -818,12 +739,7 @@ output = \"Tool.exe\"
             ("deps.macos = [\"nosuchdep\"]", "nosuchdep"),
             ("features.linux = [\"nofeature\"]", "nofeature"),
         ] {
-            let src = format!(
-                "[lib.a]
-sources = [\"a.c\"]
-{line}
-"
-            );
+            let src = format!("[lib.a]\nsources = [\"a.c\"]\n{line}\n");
             for platform in [WINDOWS, LINUX, MACOS] {
                 let e = err(&src, &["a.c"], platform);
                 assert!(e.contains("lib.a") && e.contains(wanted), "{line}: {e}");
@@ -1026,6 +942,10 @@ files = [\"x.c\"]
         // Public is fine, and so is a bin or a non-ABI flag.
         let src = "[lib.a]\nsources = [\"a.c\"]\nflags.public = [\"-mavx2\"]\nflags = [\"-fPIC\"]\n[bin.m]\nsources = [\"a.c\"]\nflags = [\"-mavx2\"]\n";
         assert!(warnings(&cfg(src, &["a.c"], LINUX)).is_empty());
+
+        // `-m` flags that do not touch the ABI are left alone.
+        let src = "[lib.a]\nsources = [\"a.c\"]\nflags = [\"-mtune=native\", \"-mwindows\"]\n";
+        assert!(warnings(&cfg(src, &["a.c"], LINUX)).is_empty());
     }
 
     #[test]
@@ -1076,33 +996,7 @@ features = [\"x\"]
 
     #[test]
     fn kind_specific_keys_on_the_wrong_kind_warn() {
-        let src = "
-[dependency.h]
-path = \"h\"
-kind = \"header-only\"
-libs = [\"x\"]
-lib_dir = \"l\"
-files = [\"a.c\"]
-find = \"X\"
-expose = { target = \"t\" }
-options.linux = { A = true }
-[dependency.c]
-path = \"c\"
-kind = \"cmake\"
-libs = [\"x\"]
-files = [\"a.c\"]
-expose = { target = \"t\" }
-options = { A = true }
-[dependency.p]
-path = \"p\"
-kind = \"prebuilt\"
-libs = [\"x\"]
-expose = { target = \"t\" }
-[dependency.s]
-kind = \"system\"
-find = \"X\"
-options = { A = true }
-";
+        let src = "\n[dependency.h]\npath = \"h\"\nkind = \"header-only\"\nlibs = [\"x\"]\nlib_dir = \"l\"\nfiles = [\"a.c\"]\nfind = \"X\"\nexpose = { target = \"t\" }\noptions.linux = { A = true }\n[dependency.c]\npath = \"c\"\nkind = \"cmake\"\nlibs = [\"x\"]\nfiles = [\"a.c\"]\nexpose = { target = \"t\" }\noptions = { A = true }\n[dependency.p]\npath = \"p\"\nkind = \"prebuilt\"\nlibs = [\"x\"]\nexpose = { target = \"t\" }\n[dependency.s]\nkind = \"system\"\nfind = \"X\"\noptions = { A = true }\n";
         let c = cfg(src, &["h/", "c/", "p/"], LINUX);
         let w = warnings(&c);
         let on = |dep: &str, key: &str| {
@@ -1241,6 +1135,20 @@ options = { A = true }
             g.public.include[0].path,
             PathBuf::from("build/deps/g/source/sub/inc")
         );
+    }
+
+    #[test]
+    fn dependency_path_and_find_expand_lookups() {
+        let src = "[dependency.d]\npath = \"vendor/${os}\"\nkind = \"header-only\"\n[dependency.s]\nkind = \"system\"\nfind = \"pkg_${arch}\"\n";
+        let c = cfg(src, &["vendor/linux/"], LINUX);
+        let d = unit(&c, "d").dep.as_ref().unwrap();
+        assert!(d.source_dir.as_ref().unwrap().ends_with("vendor/linux"));
+        assert_eq!(
+            unit(&c, "s").dep.as_ref().unwrap().find.as_deref(),
+            Some("pkg_x86_64")
+        );
+        let e = err(src, &["vendor/linux/"], WINDOWS);
+        assert!(e.contains("dependency.d") && e.contains("vendor"), "{e}");
     }
 
     #[test]

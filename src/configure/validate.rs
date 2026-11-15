@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use crate::config::{
     ConfigError,
-    schema::{FeatureDecl, Manifest, Table, TargetKind},
+    schema::{DepSource, DependencyDecl, FeatureDecl, Manifest, Table, TargetKind},
     types::{Define, Opt, Subsystem, Warnings},
     vocab::{Arch, Compiler, Os, Platform},
 };
@@ -56,6 +56,9 @@ pub fn validate(m: &Manifest) -> Result<(), ConfigError> {
         for entry in &table.entries {
             names.entry(table, entry)?;
         }
+    }
+    for dep in m.dependencies.values() {
+        names.dependency_source(dep)?;
     }
     Ok(())
 }
@@ -125,11 +128,9 @@ impl Names<'_> {
         Ok(())
     }
 
-    /// Every string in the value must expand, so unknown lookups and unknown
-    /// `${option.x}` names are found whatever the condition.
-    fn lookups(&self, table: &Table, e: &crate::config::schema::Entry) -> Result<(), ConfigError> {
-        // Platform lookups always succeed, so any platform will do here.
-        let ctx = LookupCtx {
+    /// Platform lookups always succeed, so any platform will do here.
+    fn dummy_ctx(&self) -> LookupCtx<'_> {
+        LookupCtx {
             options: &self.options,
             platform: Platform {
                 os: Os::Linux,
@@ -138,10 +139,38 @@ impl Names<'_> {
             },
             profile: "debug",
             alias: None,
-        };
+        }
+    }
+
+    /// Every string in the value must expand, so unknown lookups and unknown
+    /// `${option.x}` names are found whatever the condition.
+    fn lookups(&self, table: &Table, e: &crate::config::schema::Entry) -> Result<(), ConfigError> {
+        let ctx = self.dummy_ctx();
         check_strings(&e.value, &ctx).map_err(|message| {
             ConfigError::invalid(&table.origin, format!("`{}`: {message}", e.raw_key))
         })
+    }
+
+    /// The lookups in `path` and `find`.
+    fn dependency_source(&self, dep: &DependencyDecl) -> Result<(), ConfigError> {
+        let origin = &dep.settings.origin;
+        let path;
+        let fields: Vec<(&str, &str)> = match &dep.source {
+            DepSource::Path(p) => {
+                path = p.to_string_lossy().into_owned();
+                vec![("path", path.as_str())]
+            }
+            DepSource::Git { .. } | DepSource::Host => Vec::new(),
+        };
+        let ctx = self.dummy_ctx();
+        for (field, text) in fields
+            .into_iter()
+            .chain(dep.find.as_deref().map(|f| ("find", f)))
+        {
+            expand(text, &ctx)
+                .map_err(|message| ConfigError::invalid(origin, format!("`{field}`: {message}")))?;
+        }
+        Ok(())
     }
 
     fn dependency(&self, s: &Sourced, dep: &str) -> Result<(), ConfigError> {
@@ -320,6 +349,18 @@ mod tests {
             "[dependency.d]\npath = \"d\"\nkind = \"header-only\"\ndeps.macos = [\"zz\"]\n",
         );
         assert!(e.starts_with("dependency.d: ") && e.contains("`zz`"), "{e}");
+    }
+
+    #[test]
+    fn dependency_source_lookups_are_checked() {
+        let e = rejected("[dependency.d]\npath = \"v/${bogus}\"\nkind = \"header-only\"\n");
+        assert!(
+            e.starts_with("dependency.d: ") && e.contains("`path`") && e.contains("bogus"),
+            "{e}"
+        );
+        let e = rejected("[dependency.d]\nkind = \"system\"\nfind = \"x${nope}\"\n");
+        assert!(e.contains("`find`"), "{e}");
+        check("[dependency.d]\npath = \"v/${os}\"\nkind = \"header-only\"\n").unwrap();
     }
 
     #[test]

@@ -71,6 +71,22 @@ fn describe_guard(w: &When) -> String {
     axes.join(", ")
 }
 
+/// The `default.<condition>` keys that would select another value, one per
+/// axis of the guard the platform fails.
+fn failing_defaults(w: &When, p: &Platform) -> String {
+    let mut keys = Vec::new();
+    if w.arch.is_some_and(|a| a != p.arch) {
+        keys.push(format!("`default.{}`", p.arch.as_str()));
+    }
+    if w.os.is_some_and(|o| o != p.os) {
+        keys.push(format!("`default.{}`", p.os.as_str()));
+    }
+    if w.compiler.is_some_and(|c| !c.matches(p.compiler)) {
+        keys.push(format!("`default.{}`", p.compiler.as_str()));
+    }
+    keys.join(" or ")
+}
+
 fn guard_mismatch(
     name: &str,
     value: &str,
@@ -87,8 +103,8 @@ fn guard_mismatch(
             )
         }
         OptionSource::Default => format!(
-            "the default of option `{name}`; add `default.{}` to the option to pick a value for this architecture",
-            p.arch.as_str()
+            "the default of option `{name}`; add {} to the option to pick a value for this platform",
+            failing_defaults(&body.when, p)
         ),
     };
     ConfigError::invalid(
@@ -234,7 +250,27 @@ when = { arch = "x86_64" }
         );
         let e = run(&m, &ARM64, &[], &[]).unwrap_err().to_string();
         assert!(
-            e.contains("default.arm64") && e.contains("the default of option `simd`"),
+            e.contains("`default.arm64`") && e.contains("the default of option `simd`"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn default_guard_hint_names_the_failing_axis() {
+        let m = manifest(
+            r#"
+[option.simd]
+type    = "enum"
+values  = ["none", "avx2"]
+default = "avx2"
+
+[feature.simd.avx2]
+when = { os = "windows", compiler = "msvc" }
+"#,
+        );
+        let e = run(&m, &X64, &[], &[]).unwrap_err().to_string();
+        assert!(
+            e.contains("`default.linux` or `default.gcc`") && !e.contains("default.x86_64"),
             "{e}"
         );
     }

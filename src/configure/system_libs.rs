@@ -31,6 +31,8 @@ fn frameworks(names: &[&str]) -> Vec<SystemLib> {
 pub fn resolve_logical(name: &str, os: Os) -> Option<Vec<SystemLib>> {
     Some(match (name, os) {
         ("opengl", Os::Windows) => libs(&["opengl32"]),
+        // The spec table says "`GL` (via find)"; this links `-lGL` and does not
+        // look for it, which is enough where libGL is on the default path.
         ("opengl", Os::Linux | Os::Bsd) => libs(&["GL"]),
         ("opengl", Os::Macos) => frameworks(&["OpenGL"]),
 
