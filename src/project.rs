@@ -7,6 +7,7 @@ use crate::{
         manifest::{Build, Dependency},
         types::{Prefer, Source},
     },
+    configure::model::compare_versions,
     discover::{discover_patterns, discover_sources},
     lang::{Driver, Lang, Toolchain},
     profile::validate_profiles,
@@ -422,23 +423,6 @@ fn validate_tools(tools: &std::collections::BTreeMap<String, String>) -> Result<
         }
     }
     Ok(())
-}
-
-fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
-    let a: Vec<u64> = left.split('.').map(|v| v.parse().unwrap_or(0)).collect();
-    let b: Vec<u64> = right.split('.').map(|v| v.parse().unwrap_or(0)).collect();
-    for i in 0..a.len().max(b.len()) {
-        match a
-            .get(i)
-            .copied()
-            .unwrap_or(0)
-            .cmp(&b.get(i).copied().unwrap_or(0))
-        {
-            std::cmp::Ordering::Equal => continue,
-            order => return order,
-        }
-    }
-    std::cmp::Ordering::Equal
 }
 
 // ------------------------------------------------------------ toolchains
