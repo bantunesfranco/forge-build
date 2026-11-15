@@ -115,8 +115,22 @@ Git dependencies are checked out under `build/deps/` and removed by
 dependency resolved to. Commit it. Builds use the pinned commit; `forge update`
 (or `forge update <dep>`) resolves again and rewrites it.
 
+Only dependencies that a lib or bin reaches on the current platform (through `deps`,
+of any visibility, or through other dependencies) are fetched, found or built; the
+others are skipped with an `info:` line, so a dependency that only one platform uses
+does not have to exist on the others. Their `project.lock` entries are kept.
+`forge clean` fetches and builds nothing. A relative `git` URL (`./repo`,
+`../repo`) is taken from the manifest directory.
+
 A static CMake library does not report the system libraries it needs, so add them
-with `system` keys on the dependency.
+with `system` keys on the dependency. Only static libraries can be exposed: a
+`SHARED_LIBRARY` target is an error (set `BUILD_SHARED_LIBS=OFF` or expose a static
+target). forge picks the CMake generator so that the dependency is built with its own
+compiler: `CMAKE_GENERATOR` if set, otherwise Ninja if it is installed, otherwise on
+Windows the Visual Studio default for `cl` (plus `-T ClangCL` for `clang-cl`) or
+`MinGW Makefiles` for `gcc`; `clang` on Windows needs Ninja. `llvm-ar` and `llvm-lib`
+are passed on as `CMAKE_AR`, so LTO builds archive the same way as forge's own
+libraries. A changed `options` entry or generator configures from a clean cache.
 
 ### Cross builds
 

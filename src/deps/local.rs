@@ -10,7 +10,7 @@ use crate::{
         model::{Configured, UnitKind},
     },
     deps::Prepared,
-    discover::{discover_globs, slash_relative},
+    discover::{check_patterns, discover_globs, slash_relative},
     executor::path_arg,
 };
 
@@ -88,6 +88,8 @@ fn sources_of(c: &Configured, root: &Path, unit: usize) -> Result<Vec<PathBuf>, 
             ),
         ));
     }
+    check_patterns("files", root, &u.base_dir, &dep.files, &found)
+        .map_err(|message| ConfigError::invalid(field, message))?;
     Ok(found)
 }
 

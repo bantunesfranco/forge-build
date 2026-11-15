@@ -480,6 +480,53 @@ fn an_unreached_sources_dependency_has_no_target() {
     assert!(project.targets.iter().all(|t| t.name != "s"));
 }
 
+#[test]
+fn a_literal_sources_entry_that_matches_nothing_is_an_error() {
+    let f = Fixture::new(&manifest(
+        "[bin.app]\nsources = [\"main.c\", \"typo.c\", \"src/*.c\"]\n",
+    ));
+    f.touch("main.c");
+    f.touch("src/a.c");
+    let e = f.error();
+    assert!(
+        e.contains("bin.app") && e.contains("`typo.c`") && e.contains("matches no C/C++ file"),
+        "{e}"
+    );
+    // A glob that matches nothing is allowed while another entry matches.
+    let f = Fixture::new(&manifest(
+        "[bin.app]\nsources = [\"main.c\", \"gen/*.c\"]\n",
+    ));
+    f.touch("main.c");
+    f.load().unwrap();
+}
+
+#[test]
+fn dot_dot_in_a_sources_pattern_is_an_error() {
+    let f = Fixture::new(&manifest(
+        "[bin.app]\nsources = [\"main.c\", \"../shared/*.c\"]\n",
+    ));
+    f.touch("main.c");
+    let e = f.error();
+    assert!(
+        e.contains("bin.app") && e.contains("cannot contain `..`"),
+        "{e}"
+    );
+}
+
+#[test]
+fn a_literal_files_entry_of_a_sources_dependency_must_exist() {
+    let f = Fixture::new(&manifest(
+        "[dependency.s]\npath = \"vendor/s\"\nkind = \"sources\"\nfiles = [\"s.c\", \"gone.c\"]\n[bin.app]\nsources = [\"main.c\"]\ndeps = [\"s\"]\n",
+    ));
+    f.touch("main.c");
+    f.touch("vendor/s/s.c");
+    let e = f.error();
+    assert!(
+        e.contains("dependency.s") && e.contains("`files` entry `gone.c`"),
+        "{e}"
+    );
+}
+
 // ---- real builds ----
 
 struct Logging(Mutex<Vec<CommandSpec>>);

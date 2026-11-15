@@ -58,6 +58,41 @@ pub fn discover_globs(
     Ok(found)
 }
 
+/// Checks `patterns` of `key` (`sources` or `files`) against what
+/// `discover_globs(root, base, patterns)` found, for a caller that reports the
+/// message under its own field: a pattern may not contain `..` (the walk stays
+/// below `base`, so it could never match; use `root` or a path dependency
+/// instead), and an entry without `*` or `?` names one file, which must exist
+/// and be a C/C++ file. A typo among other entries would otherwise pass
+/// silently.
+pub fn check_patterns(
+    key: &str,
+    root: &Path,
+    base: &Path,
+    patterns: &[String],
+    found: &[PathBuf],
+) -> Result<(), String> {
+    for pattern in patterns {
+        let slashed = pattern.replace('\\', "/");
+        if slashed.split('/').any(|part| part == "..") {
+            return Err(format!(
+                "`{key}` entry `{pattern}` cannot contain `..`: patterns match below the base directory (set `root`, or use a path dependency)"
+            ));
+        }
+        if slashed.contains(['*', '?']) {
+            continue;
+        }
+        let file = slashed.strip_prefix("./").unwrap_or(&slashed);
+        if !found.contains(&slash_relative(root, &base.join(file))) {
+            return Err(format!(
+                "`{key}` entry `{pattern}` matches no C/C++ file in {}",
+                slash_relative(root, base).display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// `path` relative to `root` with `/` separators; unchanged when outside `root`.
 pub fn slash_relative(root: &Path, path: &Path) -> PathBuf {
     match path.strip_prefix(root) {

@@ -20,7 +20,7 @@ use crate::config::{
     types::{Define, DepKind, Opt, check_flag},
     vocab::{Os, Platform},
 };
-use crate::discover::discover_globs;
+use crate::discover::{check_patterns, discover_globs};
 use crate::platform::{host_os_arch, llvm_triple};
 use features::{ActiveFeature, select_features};
 use lookup::{Alias, LookupCtx, expand, uses_platform_lookup};
@@ -613,6 +613,9 @@ pub fn configure(
                     ),
                 ));
             }
+            check_patterns("sources", root, &base, &own_patterns, &found)
+                .and_then(|()| check_patterns("sources", root, root, &outer_patterns, &found))
+                .map_err(|message| ConfigError::invalid(origin, message))?;
             found
         };
 
