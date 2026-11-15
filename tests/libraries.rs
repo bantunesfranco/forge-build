@@ -393,6 +393,93 @@ fn options_on_header_only_warns() {
     );
 }
 
+/// An OS name that is not this machine's.
+fn other_os() -> &'static str {
+    if cfg!(windows) { "linux" } else { "windows" }
+}
+
+fn infos(project: &Project) -> Vec<&String> {
+    project
+        .diagnostics
+        .items
+        .iter()
+        .filter(|(l, _)| *l == Level::Info)
+        .map(|(_, m)| m)
+        .collect()
+}
+
+#[test]
+fn a_dependency_used_only_on_another_platform_is_not_prepared() {
+    // `foo` has no library directory on this machine; only `other_os` uses it.
+    let f = Fixture::new(&manifest(&format!(
+        "{FOO_DEP}[bin.app]\nsources = [\"main.c\"]\ndeps.{} = [\"foo\"]\n",
+        other_os()
+    )));
+    f.touch("main.c");
+    f.touch("vendor/foo/keep");
+    let project = f.load().unwrap();
+    let skipped: Vec<&String> = infos(&project)
+        .into_iter()
+        .filter(|m| m.contains("dependency foo"))
+        .collect();
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert!(
+        skipped[0].starts_with("dependency foo is not used on ")
+            && skipped[0].ends_with("; skipped"),
+        "{skipped:?}"
+    );
+    let foo = project
+        .configured
+        .units
+        .iter()
+        .position(|u| u.name == "foo")
+        .unwrap();
+    assert!(!project.prepared.contains_key(&foo));
+}
+
+#[test]
+fn a_dependency_nothing_references_is_not_prepared() {
+    let f = Fixture::new(&manifest(&format!(
+        "{FOO_DEP}[bin.app]\nsources = [\"main.c\"]\n"
+    )));
+    f.touch("main.c");
+    f.touch("vendor/foo/keep");
+    let project = f.load().unwrap();
+    assert!(project.prepared.is_empty());
+    assert!(
+        infos(&project)
+            .iter()
+            .any(|m| m.contains("dependency foo is not used on"))
+    );
+}
+
+#[test]
+fn a_dependency_reached_through_another_dependency_is_prepared() {
+    // `foo` is reached only through the header-only `h`, which `app` uses.
+    let f = Fixture::new(&manifest(&format!(
+        "{FOO_DEP}[dependency.h]\npath = \"vendor/h\"\nkind = \"header-only\"\ndeps = [\"foo\"]\n[bin.app]\nsources = [\"main.c\"]\ndeps = [\"h\"]\n"
+    )));
+    f.touch("main.c");
+    f.touch("vendor/foo/keep");
+    f.touch("vendor/h/h.h");
+    let e = f.error();
+    assert!(
+        e.contains("dependency.foo") && e.contains("library directory does not exist"),
+        "{e}"
+    );
+}
+
+#[test]
+fn an_unreached_sources_dependency_has_no_target() {
+    let f = Fixture::new(&manifest(
+        "[dependency.s]\npath = \"vendor/s\"\nkind = \"sources\"\nfiles = [\"*.c\"]\n[bin.app]\nsources = [\"main.c\"]\n",
+    ));
+    f.touch("main.c");
+    f.touch("vendor/s/s.c");
+    let project = f.load().unwrap();
+    assert!(project.targets.iter().all(|t| t.name != "s"));
+}
+
 // ---- real builds ----
 
 struct Logging(Mutex<Vec<CommandSpec>>);

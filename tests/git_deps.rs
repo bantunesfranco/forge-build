@@ -376,11 +376,7 @@ fn abbreviated_rev_is_locked_as_full_sha_without_scratch_clone() {
 fn removed_dependency_is_pruned_from_lock() {
     need_git!();
     let up = Upstream::new();
-    let two = format!(
-        "{}[dependency.other]\ngit = \"{}\"\nrev = \"v1\"\nkind = \"header-only\"\n",
-        manifest(&up.url(), "master"),
-        up.url()
-    );
+    let two = with_other(&up, "deps = [\"dep\", \"other\"]");
     let f = Fixture::new(&two);
     f.touch("main.c");
     f.load().unwrap();
@@ -392,6 +388,47 @@ fn removed_dependency_is_pruned_from_lock() {
     f.write("project.toml", &manifest(&up.url(), "master"));
     f.load().unwrap();
     assert_eq!(lock_of(&f).entries.keys().collect::<Vec<_>>(), ["dep"]);
+}
+
+/// The manifest with a second git dependency `other`; `app_deps` is the
+/// `deps` line of the bin.
+fn with_other(up: &Upstream, app_deps: &str) -> String {
+    format!(
+        concat!(
+            "[workspace]\nname = \"t\"\nversion = \"1\"\nc = \"17\"\n",
+            "[dependency.dep]\ngit = \"{url}\"\nrev = \"master\"\nkind = \"header-only\"\n",
+            "include.public = [\"include\"]\n",
+            "[dependency.other]\ngit = \"{url}\"\nrev = \"v1\"\nkind = \"header-only\"\n",
+            "[bin.app]\nsources = [\"main.c\"]\n{deps}\n",
+        ),
+        url = up.url(),
+        deps = app_deps
+    )
+}
+
+#[test]
+fn an_unused_git_dependency_is_not_fetched_but_keeps_its_lock_entry() {
+    need_git!();
+    let up = Upstream::new();
+    let f = Fixture::new(&with_other(&up, "deps = [\"dep\", \"other\"]"));
+    f.touch("main.c");
+    f.load().unwrap();
+    let locked = lock_of(&f).entries["other"].clone();
+    assert!(f.root.join("build/deps/other").exists());
+
+    // `other` is no longer used: no checkout is touched, the pin stays.
+    fs::remove_dir_all(f.root.join("build/deps/other")).unwrap();
+    f.write("project.toml", &with_other(&up, "deps = [\"dep\"]"));
+    let p = f.load().unwrap();
+    assert!(!f.root.join("build/deps/other").exists());
+    assert_eq!(lock_of(&f).entries["other"], locked);
+    assert!(
+        infos(&p)
+            .iter()
+            .any(|m| m.starts_with("dependency other is not used on ")),
+        "{:?}",
+        p.diagnostics
+    );
 }
 
 #[test]

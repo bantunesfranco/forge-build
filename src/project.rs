@@ -17,7 +17,7 @@ use crate::{
         model::{Configured, Invocation, UnitKind, effective, reachable},
         options::{cache_path, load_cache},
     },
-    deps::{Phase, Prepared, prepare_all},
+    deps::{Phase, Prepared, prepare_all, reached},
     executor::Executor,
     flags,
     headers::DepFormat,
@@ -85,11 +85,31 @@ impl Project {
         DepFormat::of(self.platform.compiler)
     }
 
-    /// Reads the manifest and configures everything for this machine.
+    /// Reads the manifest and configures everything for this machine, then
+    /// fetches and finds the dependencies that are used here (spec 11 step 7).
     pub fn load(
         manifest: &Path,
         inv: &Invocation,
         exec: &dyn Executor,
+    ) -> Result<Project, ConfigError> {
+        Self::load_inner(manifest, inv, exec, true)
+    }
+
+    /// Like `load`, but no dependency is fetched, found or built. For commands
+    /// that only need the platform, profile and build layout, such as `clean`.
+    pub fn load_unprepared(
+        manifest: &Path,
+        inv: &Invocation,
+        exec: &dyn Executor,
+    ) -> Result<Project, ConfigError> {
+        Self::load_inner(manifest, inv, exec, false)
+    }
+
+    fn load_inner(
+        manifest: &Path,
+        inv: &Invocation,
+        exec: &dyn Executor,
+        prepare: bool,
     ) -> Result<Project, ConfigError> {
         let manifest_dir = match manifest.parent() {
             Some(dir) if !dir.as_os_str().is_empty() => dir,
@@ -176,10 +196,32 @@ impl Project {
             prepared: BTreeMap::new(),
             diagnostics,
         };
-        prepare_all(&mut project, Phase::Configure, exec, 1)?;
-        project.check_dependency_languages(exec, c_checked, cxx_failure)?;
+        if prepare {
+            project.note_unused_dependencies();
+            prepare_all(&mut project, Phase::Configure, exec, 1)?;
+            project.check_dependency_languages(exec, c_checked, cxx_failure)?;
+        }
         project.rebuild_targets()?;
         Ok(project)
+    }
+
+    /// One info line for each dependency that no lib or bin reaches on this
+    /// platform: it is not prepared (see `deps::reached`).
+    fn note_unused_dependencies(&mut self) {
+        let used = reached(&self.configured);
+        let target = format!(
+            "{}-{}",
+            self.platform.arch.as_str(),
+            self.platform.os.as_str()
+        );
+        for (index, unit) in self.configured.units.iter().enumerate() {
+            if matches!(unit.kind, UnitKind::Dep(_)) && !used.contains(&index) {
+                self.diagnostics.info(format!(
+                    "dependency {} is not used on {target}; skipped",
+                    unit.name
+                ));
+            }
+        }
     }
 
     /// The language checks of `load` again for the files of `sources`
@@ -226,13 +268,16 @@ impl Project {
     /// arguments filled in.
     fn build_targets(&self) -> Result<Vec<BuildTarget>, ConfigError> {
         let c = &self.configured;
+        let used = reached(c);
         let mut targets: Vec<BuildTarget> = Vec::new();
         for (index, unit) in c.units.iter().enumerate() {
             let kind = match unit.kind {
                 UnitKind::Lib => BuildTargetKind::StaticLibrary,
                 UnitKind::Bin => BuildTargetKind::Binary,
                 UnitKind::InterfaceLib => BuildTargetKind::Interface,
-                UnitKind::Dep(DepKind::Sources) => BuildTargetKind::StaticLibrary,
+                UnitKind::Dep(DepKind::Sources) if used.contains(&index) => {
+                    BuildTargetKind::StaticLibrary
+                }
                 UnitKind::Dep(_) => continue,
             };
             targets.push(BuildTarget {

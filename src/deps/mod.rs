@@ -6,7 +6,10 @@ pub mod local;
 pub mod lockfile;
 pub mod system;
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 use crate::{
     config::{
@@ -14,7 +17,7 @@ use crate::{
         schema::{DepSource, Manifest},
         types::DepKind,
     },
-    configure::model::{IncludeDir, Settings, UnitKind},
+    configure::model::{Configured, IncludeDir, Settings, UnitKind, reachable},
     executor::Executor,
     project::Project,
 };
@@ -45,7 +48,25 @@ pub enum Phase {
     Build,
 }
 
-/// Prepares every dependency that is ready to be prepared, storing the
+/// The dependency units that some lib or bin reaches on this platform, through
+/// `deps` of any visibility and through other dependencies. Only these are
+/// prepared (spec 10): a dependency that only another platform uses may have
+/// no files here at all.
+pub fn reached(c: &Configured) -> BTreeSet<usize> {
+    c.units
+        .iter()
+        .enumerate()
+        .filter(|(_, u)| {
+            matches!(
+                u.kind,
+                UnitKind::Lib | UnitKind::InterfaceLib | UnitKind::Bin
+            )
+        })
+        .flat_map(|(index, _)| reachable(c, index))
+        .collect()
+}
+
+/// Prepares every reached dependency that is ready to be prepared, storing the
 /// results in `project.prepared` (by unit index) and finding the files of
 /// `sources` dependencies. Callers rebuild `project.targets` afterwards.
 ///
@@ -68,7 +89,9 @@ pub fn prepare_all(
     _exec: &dyn Executor,
     jobs: usize,
 ) -> Result<(), ConfigError> {
+    let reached = reached(&project.configured);
     let pending: Vec<usize> = (0..project.configured.units.len())
+        .filter(|unit| reached.contains(unit))
         .filter(|&unit| {
             let u = &project.configured.units[unit];
             let UnitKind::Dep(kind) = u.kind else {

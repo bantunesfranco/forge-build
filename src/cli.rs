@@ -89,6 +89,13 @@ fn print_diagnostics(diagnostics: &Diagnostics) {
     }
 }
 
+/// Whether a command needs its dependencies fetched and found (spec 11 step
+/// 7). `clean` only needs the build layout, so it works offline and without a
+/// system package installed.
+fn needs_dependencies(command: Option<&Commands>) -> bool {
+    !matches!(command, Some(Commands::Clean { .. }))
+}
+
 /// Loads the project for this invocation. `--opt` values are written to the
 /// option cache once configure accepted them, so later runs reuse them.
 fn load_project(
@@ -96,6 +103,7 @@ fn load_project(
     args: &Cli,
     exec: &dyn Executor,
 ) -> Result<Project, Box<dyn std::error::Error>> {
+    let prepare = needs_dependencies(args.command.as_ref());
     let options = args
         .opt
         .iter()
@@ -107,7 +115,11 @@ fn load_project(
         target: args.platform_target.clone(),
         toolchain: args.toolchain.clone(),
     };
-    let project = Project::load(manifest, &inv, exec)?;
+    let project = if prepare {
+        Project::load(manifest, &inv, exec)?
+    } else {
+        Project::load_unprepared(manifest, &inv, exec)?
+    };
     if !inv.options.is_empty() {
         let target = project
             .target_override
@@ -302,6 +314,43 @@ mod tests {
             e.contains("glm") && e.contains("not a git dependency"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn only_clean_skips_the_dependencies() {
+        for (args, want) in [
+            (&["clean"][..], false),
+            (&["clean", "--all"], false),
+            (&["build"], true),
+            (&["graph"], true),
+            (&["explain"], true),
+            (&[], true),
+        ] {
+            assert_eq!(
+                needs_dependencies(cli(args).command.as_ref()),
+                want,
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clean_loads_a_project_whose_dependency_is_missing() {
+        let (_t, root) = project_dir();
+        let manifest = concat!(
+            "[workspace]\nname = \"t\"\nversion = \"1\"\nc = \"17\"\n",
+            "[dependency.p]\npath = \"vendor/p\"\nkind = \"prebuilt\"\nlibs = [\"p\"]\n",
+            "[bin.app]\nsources = [\"a.c\"]\ndeps = [\"p\"]\n",
+        );
+        fs::write(root.join("project.toml"), manifest).unwrap();
+        fs::create_dir_all(root.join("vendor/p")).unwrap();
+        let path = root.join("project.toml");
+        let e = load_project(&path, &cli(&["build"]), &Clang)
+            .err()
+            .expect("the library file is missing")
+            .to_string();
+        assert!(e.contains("dependency.p"), "{e}");
+        load_project(&path, &cli(&["clean"]), &Clang).unwrap();
     }
 
     #[test]
