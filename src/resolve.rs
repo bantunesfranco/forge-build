@@ -15,7 +15,7 @@ use crate::{
     config::{
         ConfigError, Manifest,
         manifest::BuildProfile,
-        types::{Define, OptLevel},
+        types::{Define, OptLevel, check_flag},
     },
     executor::path_arg,
     lang::{Driver, Lang, Toolchain},
@@ -273,32 +273,6 @@ fn msvc_opt_flag(level: OptLevel) -> &'static str {
 }
 
 // ------------------------------------------------------------ validation
-
-/// Raw flags are passed to the compiler verbatim, one argument per entry, so
-/// they are checked when the manifest loads: no empty or whitespace-containing
-/// entries (there is no shell to split them), and nothing Forge controls itself.
-fn check_flag(field: &str, flag: &str) -> Result<(), ConfigError> {
-    if flag.is_empty() {
-        return Err(ConfigError::invalid(field, "empty entry"));
-    }
-    if flag.chars().any(char::is_whitespace) {
-        return Err(ConfigError::invalid(
-            field,
-            format!(
-                "`{flag}` contains whitespace; every entry is exactly one argument, so split it into separate entries"
-            ),
-        ));
-    }
-    if flag.starts_with("-M") || flag.starts_with("-o") || matches!(flag, "-c" | "-E" | "-S") {
-        return Err(ConfigError::invalid(
-            field,
-            format!(
-                "`{flag}` is controlled by Forge (output, dependency files, compile-only) and cannot be set here"
-            ),
-        ));
-    }
-    Ok(())
-}
 
 pub fn validate_flags(manifest: &Manifest) -> Result<(), ConfigError> {
     let flags = &manifest.build.flags;

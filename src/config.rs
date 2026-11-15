@@ -1,6 +1,7 @@
 pub mod flat;
 pub mod key;
 pub mod manifest;
+pub mod schema;
 pub mod types;
 pub mod vocab;
 
@@ -100,9 +101,81 @@ pub fn load(path: &PathBuf) -> Result<Config, ConfigError> {
     })
 }
 
+/// Reads and validates a spec 0.3 manifest. (`load` is the legacy loader and
+/// goes away with the old manifest types.)
+pub fn load_manifest(path: &Path) -> Result<schema::Manifest, ConfigError> {
+    let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
+        path: path.into(),
+        source,
+    })?;
+    let table = flat::parse_flat(&text)
+        .map_err(|e| ConfigError::invalid(format!("{}:{}", path.display(), e.line), e.message))?;
+    schema::parse_manifest(table)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    Warning,
+    Info,
+}
+
+/// Non-fatal messages collected while configuring; printed as `warning: ...`
+/// and `info: ...`.
+#[derive(Debug, Default)]
+pub struct Diagnostics {
+    pub items: Vec<(Level, String)>,
+}
+
+impl Diagnostics {
+    pub fn warn(&mut self, message: impl Into<String>) {
+        self.items.push((Level::Warning, message.into()));
+    }
+
+    pub fn info(&mut self, message: impl Into<String>) {
+        self.items.push((Level::Info, message.into()));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_manifest_reports_path_and_line_for_syntax_errors() {
+        let (_t, r) = tree();
+        std::fs::write(r.join("project.toml"), "[workspace]\nname = \n").unwrap();
+        let e = load_manifest(&r.join("project.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("project.toml:2"), "{e}");
+    }
+
+    #[test]
+    fn load_manifest_parses_a_valid_file() {
+        let (_t, r) = tree();
+        std::fs::write(
+            r.join("project.toml"),
+            "[workspace]\nname = \"a\"\nversion = \"1\"\n[bin.a]\nsources = [\"a.c\"]\n",
+        )
+        .unwrap();
+        let m = load_manifest(&r.join("project.toml")).unwrap();
+        assert_eq!(m.workspace.name, "a");
+        assert!(m.targets.contains_key("a"));
+    }
+
+    #[test]
+    fn diagnostics_collect_in_order() {
+        let mut d = Diagnostics::default();
+        d.warn("w");
+        d.info("i");
+        assert_eq!(
+            d.items,
+            [
+                (Level::Warning, "w".to_string()),
+                (Level::Info, "i".to_string())
+            ]
+        );
+    }
 
     fn tree() -> (tempfile::TempDir, PathBuf) {
         let t = tempfile::tempdir().unwrap();
