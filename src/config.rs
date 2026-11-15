@@ -1,6 +1,8 @@
 pub mod flat;
+pub mod key;
 pub mod manifest;
 pub mod types;
+pub mod vocab;
 
 use std::path::{Path, PathBuf};
 use toml::{self};
