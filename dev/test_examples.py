@@ -56,6 +56,11 @@ PROJECTS = {
             "Checksum: 0x",
         ],
     },
+    "features": {
+        "expected_output": [
+            "legacy: removed",
+        ],
+    },
 }
 
 
@@ -145,11 +150,15 @@ def build(
     project: Path,
     *,
     profile: str | None = None,
+    options: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     arguments = ["build", "-v"]
 
     if profile:
         arguments.extend(["--profile", profile])
+
+    for option in options:
+        arguments.extend(["--opt", option])
 
     return forge(project, *arguments)
 
@@ -315,6 +324,57 @@ def test_dependencies(temp_root: Path) -> None:
     print("[PASS] dependencies")
 
 
+def test_features(temp_root: Path) -> None:
+    """Options, a variant feature, lookups, remove.* and the option cache."""
+    print("[TEST] features")
+
+    source = require_project("features")
+    project = copy_project(source, temp_root)
+    expected = PROJECTS["features"]["expected_output"]
+
+    build(project)
+    default_output = run_program(
+        project,
+        "features",
+        "debug",
+        [*expected, "level: low", "scaled sqrt: 4.0", "asserts: on"],
+    )
+
+    build(project, options=("level=high",))
+    high_output = run_program(
+        project,
+        "features",
+        "debug",
+        [*expected, "level: high", "scaled sqrt: 16.0", "asserts: on"],
+    )
+
+    if high_output == default_output:
+        raise IntegrationTestFailure(
+            "--opt level=high did not change the program output"
+        )
+
+    if not (project / "build" / "options.toml").is_file():
+        raise IntegrationTestFailure("--opt did not write build/options.toml")
+
+    # The option cache applies to later runs, so release also gets `high`.
+    build(project, profile="release")
+    run_program(
+        project,
+        "features",
+        "release",
+        [*expected, "level: high", "scaled sqrt: 16.0", "asserts: off"],
+    )
+
+    explanation = forge(project, "explain", "features").stdout
+    if "LEVEL_SCALE=4" not in explanation or "FEATURES_LEGACY" in explanation:
+        raise IntegrationTestFailure(
+            "forge explain features did not show the merged configuration:\n"
+            f"{explanation}"
+        )
+
+    print("[PASS] features")
+
+
 def main() -> int:
     if not FORGE.is_file():
         print(
@@ -357,6 +417,7 @@ def main() -> int:
             test_cpp_profiles(temp_root)
             test_mixed_language(temp_root)
             test_dependencies(temp_root)
+            test_features(temp_root)
 
     except (IntegrationTestFailure, OSError) as error:
         print(f"\n[FAIL] {error}", file=sys.stderr)

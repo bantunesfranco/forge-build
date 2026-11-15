@@ -1,0 +1,31 @@
+# Options, a variant feature, lookups, `remove.*` and logical system libraries.
+# Try: forge --opt level=high build    (the value is cached in build/options.toml)
+
+[workspace]
+name           = "features"
+version        = "0.1.0"
+c              = "17"
+defines.public = ["FEATURES_EXAMPLE", "FEATURES_LEGACY"]
+
+[option.level]
+type    = "enum"
+values  = ["low", "high"]
+default = "low"
+doc     = "How much work the program pretends to do."
+
+# Same name as the option: only the sub-table of the selected value applies.
+[feature.level.low]
+defines = ["LEVEL_SCALE=1"]
+
+[feature.level.high]
+defines = ["LEVEL_SCALE=4"]
+
+[profile.release]
+asserts = false
+
+[bin.features]
+sources               = ["src/main.c"]
+features              = ["level"]
+defines               = ["LEVEL_NAME=\"${option.level}\""]
+remove.defines.public = ["FEATURES_LEGACY"]   # added by the workspace above
+system                = ["threads", "math"]

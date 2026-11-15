@@ -8,7 +8,7 @@ These scripts test Forge against real C and C++ toolchains. They are developer t
 - A built Forge binary
 - A C compiler (`clang` or `gcc`)
 - A C++ compiler (`clang++` or `g++`)
-- An archiver (`ar` or `llvm-ar`) if required by the examples
+- An archiver (`ar`, `llvm-ar` or `lib`) if required by the examples
 
 ## Building Forge
 
@@ -32,6 +32,7 @@ The suite invokes Forge as a real subprocess and tests the projects under `examp
 - **`cpp-profiles`** — builds and runs a C++ application with debug and release profiles, and checks graph and explain output.
 - **`mixed-language`** — builds and runs a C++ application containing C source files, using the configured C++ compiler.
 - **`dependencies`** — builds and runs an application against the sibling `c-library` source dependency.
+- **`features`** — builds and runs a project that uses an option, a variant feature, a `${option.*}` lookup, `remove.*` and logical system libraries. It runs the default build, `--opt level=high` (checking that the output changes and that `build/options.toml` is written), `--profile release` (which reuses the cached option) and `explain features`.
 
 Each example is copied into a temporary directory before testing, so generated files and build artifacts do not modify the original examples.
 
@@ -51,7 +52,7 @@ CC=clang CXX=clang++ \
 
 ## Platform support
 
-The integration suite currently targets Linux and macOS. Windows support can be added when Forge's Windows support is ready.
+The integration suite runs on Linux, macOS and Windows (with `cl`, `clang-cl`, `clang` or `gcc` on `PATH`).
 
 ## Scope
 

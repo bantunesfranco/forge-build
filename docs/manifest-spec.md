@@ -78,6 +78,11 @@ defines.windows         = ["C"]        # private, only on Windows
 defines.public.macos    = ["D"]        # public, only on macOS
 ```
 
+A dotted key inside a table body is read as one flat name: `defines.public.macos`
+is a single key, and `defines` may sit next to `defines.public` in the same
+table. The file is therefore only lexically TOML. Forge reads it with its own
+reader, and generic TOML tools, editors and linters may flag these tables.
+
 ### 4.1 Visibility
 
 | Value     | Meaning                                                  |

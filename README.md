@@ -13,58 +13,65 @@ plan without running anything.
 
 ## Features
 
-- A small `Forge.toml` manifest, validated at startup with errors that name the key and the file.
-- C and C++ in one project, each with its own compiler and standard (like Make's `CC`/`CXX`).
-- Build profiles (`debug`, `release`, your own) with inheritance and add/remove/set edits.
-- Header dependencies from the compiler itself (`-MMD -MF`), not from guessing.
+- A declarative `project.toml` manifest ([spec 0.3](docs/manifest-spec.md)): no conditionals or scripting, one key grammar for platforms, compilers and architectures.
+- Typed options (`--opt name=value`) and features that bundle defines, flags and libraries.
+- C and C++ in one project, static libraries and executables, and dependencies from a local path, git, CMake or the system.
+- `project.lock` pins git dependencies to a commit.
+- Header dependencies from the compiler itself, not from guessing.
 - Rebuild decisions from **file contents**, not timestamps.
 - Parallel compilation (`-j N`) that never links before its objects exist.
-- A persistent, versioned, atomically written build database, one per profile.
-- `explain`: the planner's decision and its reason for every target.
+- A persistent, versioned, atomically written build database, one per profile and target platform.
+- `explain`: the merged configuration of a target with the origin of every value, and the planner's decision and reason for every task.
 - Failures never look like successes: a failed task is never recorded as up to date.
 
 ## Quick start
 
-Requirements: a Rust toolchain, and `gcc` or `clang` (plus `ar` for libraries).
+Requirements: a Rust toolchain and a C/C++ compiler (`gcc`, `clang` or MSVC `cl`).
 
 ```text
 cargo install --path .
-cd examples/hello
+cd examples/cpp-profiles
 forge build
-./build/debug/bin/hello
+./build/debug/bin/cpp-profiles
 ```
 
 ```text
 $ forge build
 Compiling src/main.cpp
 Compiling src/greeting.cpp
-Linking build/debug/bin/hello
+Linking build/debug/bin/cpp-profiles
+Build successful
 
 $ forge build
 Build is up to date
-
-$ touch include/greeting.hpp && echo "// edit" >> include/greeting.hpp
-$ forge explain
-build/debug/obj/src/greeting.cpp.o: rebuild: include/greeting.hpp changed
-build/debug/obj/src/main.cpp.o: up to date
-build/debug/bin/hello: rebuild: build/debug/obj/hello/src/greeting.cpp.o was rebuilt
-
-2 of 3 tasks need to run.
+Build successful
 ```
+
+`forge explain` shows what a rebuild would do and why, without running anything.
+The `examples/` directory has more projects. `examples/features` uses an option, a
+variant feature, a `${option.*}` lookup, `remove.*` and logical system libraries.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
 | `forge build [NAME] [-j N] [-v]` | Build all targets, or the named target and its dependency closure. `-v` prints each command and why it runs. |
-| `forge explain [PATH\|NAME]` | Say what would rebuild, and why. A selector can be an output file, source file, or target name. |
+| `forge explain [NAME\|PATH]` | With a lib, bin or dependency name: its merged configuration and where every value came from, then why its archive or link task would rebuild. With a path: why that file is rebuilt. With nothing: one line per task. |
 | `forge graph [NAME] [--dot]` | Print all tasks or a target's dependency closure; `--dot` emits Graphviz (`... \| dot -Tpng -o graph.png`). |
 | `forge clean [--all]` | Remove the selected profile's build directory, or all of `build/`. |
+| `forge update [DEP]` | Resolve git dependencies again and rewrite `project.lock`. Builds nothing. |
 
-Global options: `-p, --profile NAME` (default: `build.default_profile`) and
-`-m, --manifest PATH` (a `Forge.toml`, or a directory containing one).
+Global options:
 
-Without `-m`, Forge looks for `Forge.toml` in the current directory and then in each
+| Option | Meaning |
+| --- | --- |
+| `-p, --profile NAME` | Build profile: `debug` (default), `release`, `relwithdebinfo` or one the manifest declares. |
+| `--opt NAME=VALUE` | Set an option declared in the manifest. Repeatable. The value is saved in `build/options.toml`, so later runs reuse it (command line, then cache, then the option's default). |
+| `--target ARCH-OS` | Build for another platform, for example `arm64-macos`. Output goes to `build/<arch>-<os>/<profile>`. See Cross builds below. |
+| `--toolchain FILE` | A file with a `[toolchain]` table naming `c`, `cxx` and `ar`. Precedence: this file, then `CC`/`CXX`/`AR` from the environment, then the user toolchain file, then the default compilers. |
+| `-m, --manifest PATH` | A `project.toml`, or a directory containing one. |
+
+Without `-m`, Forge looks for `project.toml` in the current directory and then in each
 parent; the nearest wins, and the search stops at a directory containing `.git`.
 The directory holding the manifest is the project root. Every relative path means
 the same thing wherever you run the command, and compilers run with the root as
@@ -72,123 +79,60 @@ their working directory.
 
 ## Configuration
 
-The package-oriented manifest form declares language standards separately
-from targets and supports recursive source globs. See the full [manifest
-specification](docs/manifest-spec.md) for keys, defaults, dependency behavior,
-and examples:
+The manifest is `project.toml`. The [manifest specification](docs/manifest-spec.md)
+is the reference for every key, the condition and lookup vocabulary, profiles,
+options, features and dependencies. A minimal project:
 
 ```toml
-[package]
+[workspace]
 name = "hello"
 version = "1.0.0"
-
-[lang]
-c = "c17"
-cxx = "c++20"
-
-[tools]
-cmake = ">=3.20"
-
-[profile.debug]
-opt = 0
-debug = true
+cxx  = "20"
 
 [bin.hello]
 sources = ["src/**/*.cpp"]
-include = { public = ["include"] }
+include = ["include"]
+defines.windows = ["NOMINMAX"]
 ```
 
-The new form uses `CC` and `CXX` from the environment (falling back to `cc`
-and `c++`). Named libraries and binaries form separate build targets. Binary
-targets are written to `build/<profile>/bin/<name>`, and static libraries to
-`build/<profile>/lib/lib<name>.a`.
+Any key can take a visibility and a condition suffix (`defines.public.macos`).
+Targets are `[lib.<name>]` (a static library, `build/<profile>/lib/`) and
+`[bin.<name>]` (an executable, `build/<profile>/bin/`). Unknown tables, keys and
+conditions are errors that name the key and the file.
 
-```toml
-[project]
-name = "example"
-version = "0.1.0"
+The dotted-key grammar is only lexically TOML: Forge has its own reader, and generic
+TOML tools or editors may flag `project.toml` files.
 
-[build]
-compiler = "gcc"            # shorthand for a project with one language
-standard = "c11"
-source_dirs = ["srcs"]      # .c .cc .cpp .cxx, searched recursively
-output = "example"          # placed in build/<profile>/
-default_profile = "debug"
+### Dependencies and `project.lock`
 
-[build.flags]               # the base layer, shared by every profile
-warnings = true             # -Wall -Wextra
-pedantic = true             # -Wpedantic
-error_on_warning = true     # -Werror
-defines = ["USE_FOO", "VERSION=3"]
-include_dirs = ["incs", "libtest/incs"]
-lib_dirs = ["libtest"]
-libs = ["test"]
+`[dependency.<name>]` has a `kind`: `header-only`, `sources`, `prebuilt` (from a
+`path` or a `git` checkout), `cmake` (built through CMake, with `expose.target`)
+or `system` (`find`, tried with `pkg-config` and then CMake's `find-package`).
+Git dependencies are checked out under `build/deps/` and removed by
+`forge clean --all`.
 
-[profile.debug]
-opt_level = 0
-debug_info = true
+`project.lock` sits next to `project.toml` and records the commit each git
+dependency resolved to. Commit it. Builds use the pinned commit; `forge update`
+(or `forge update <dep>`) resolves again and rewrites it.
 
-[profile.release]
-opt_level = 2
-defines = { add = ["NDEBUG", "VERSION=4"], remove = ["USE_FOO"] }
+A static CMake library does not report the system libraries it needs, so add them
+with `system` keys on the dependency.
 
-[profile.asan]
-inherits = ["debug"]
-compile_flags = { add = ["-fsanitize=address", "-fno-omit-frame-pointer"] }
-link_flags    = { add = ["-fsanitize=address"] }
-```
+### Cross builds
 
-### Compilers and standards
+With `--target`, `clang` and `clang-cl` are given `--target=<triple>` for compiling
+and linking, when the platform differs from the host's. `gcc`, Apple clang and MSVC
+get nothing added: name their cross compilers in a `--toolchain` file. `cmake`
+dependencies also get `CMAKE_SYSTEM_NAME` and `CMAKE_SYSTEM_PROCESSOR`, plus
+`CMAKE_<LANG>_COMPILER_TARGET` for clang.
 
-Each language has its own compiler, as in Make. The bare `compiler` and `standard`
-keys are a shorthand for a project with **one** language. With both C and C++
-sources, set all four:
+### Migrating from the old format
 
-```toml
-c_compiler   = "clang"
-c_standard   = "c17"
-cxx_compiler = "clang++"
-cxx_standard = "c++20"
-```
-
-A language only needs a toolchain if the sources contain it. The bare keys in a
-mixed project are rejected as ambiguous, and so is a standard that belongs to the
-wrong language (`c++20` for C sources). A link uses the C++ driver when any object
-is C++, so `libstdc++` gets linked, and the C compiler otherwise. Set `CC` and
-`CXX` in the environment or a user toolchain file to choose compilers; manifests
-only declare language standards.
-
-### Profiles
-
-Settings are layered, later layers winning:
-
-1. the base `[build.flags]`,
-2. each inherited profile, depth-first, in the order listed,
-3. the profile itself.
-
-A profile reached twice (diamond inheritance) is applied once. `inherits` cycles,
-unknown parents and an unknown `default_profile` are errors.
-
-List fields (`defines`, `compile_flags`, `link_flags`) accept a plain array, which
-appends, or a table with `add`, `remove` and `set`, applied in the order `set`,
-`remove`, `add`. Defines are identified by **macro name**, so `VERSION=4` replaces
-`VERSION=3` instead of producing two conflicting `-D` flags, and `NAME` differs from
-`NAME=`. Re-adding an existing flag moves it to the end.
-
-`opt_level` is `0`, `1`, `2`, `3` or the strings `"g"`, `"s"`, `"z"`, `"fast"`.
-
-### Validation
-
-Everything is checked when the manifest loads:
-
-- Unknown keys are errors, and so are wrongly typed values.
-- `source_dirs` and `output` must be relative and stay inside the project root.
-  `include_dirs` and `lib_dirs` may point elsewhere but must exist.
-- Source directories may not overlap, and `output` may not be a directory or live
-  inside a source directory.
-- Raw flags are single arguments: no empty entries, no whitespace, and nothing Forge
-  controls itself (`-c`, `-o`, `-E`, `-S`, `-M*`). There is no shell, so
-  `"-O2 -g"` is rejected, not split.
+Earlier versions read `Forge.toml` with `[project]`, `[build]`, `[package]`,
+`[lang]`, `[tools]`, `[dependencies.*]` and profile `inherits`. That format is no
+longer read, and any of those tables is reported as an unknown table. Write a
+`project.toml` as described in the specification. The make, meson, autotools,
+`steps` and `self` dependency backends and url/tar sources were removed as well.
 
 ## How it works
 
@@ -197,10 +141,13 @@ touches a process, so it is unit-tested without a compiler, and `explain` is exa
 the plan that `build` is about to run.
 
 ```text
-Forge.toml -> config (shape) -> project (paths, sources, toolchains)
+project.toml -> config (shape) -> configure (options, features, merge)
+                                   |
+                                   v
+                     project (paths, sources, toolchains, deps)
                                    |                |
                                    v                v
-                     graph (tasks, edges)    resolve (profile -> flags)
+                     graph (tasks, edges)    flags (settings -> arguments)
  PLAN TIME                         |
    snapshot (hash files) + saved records -> planner -> dirty tasks + reasons
  ----------------------------------------------------------------------------
@@ -234,9 +181,10 @@ produces identical bytes does not cascade into the things that use them.
 parsed and the header list is stored with the task, so editing a header rebuilds
 exactly the files that include it.
 
-**Libraries.** Each `-l` name is looked up in `lib_dirs`. A library found there is
-tracked as an implicit input of the link, so rebuilding it relinks the program.
-Libraries outside `lib_dirs` (`m`, `pthread`) are left to the linker.
+**Libraries.** Static libraries of the project and of its dependencies are inputs of
+the link, so rebuilding one relinks the program. Logical system libraries
+(`system = ["threads", "math"]`) are mapped to linker arguments for the platform
+and are left to the linker.
 
 **Correctness rules.** When state is missing or uncertain, rebuild.
 
@@ -260,23 +208,30 @@ build/<profile>/dep/<target>/<source>.o.d depfiles
 build/<profile>/bin/<target>             executable targets
 build/<profile>/lib/lib<target>.a        static library targets
 build/<profile>/forge.db                 records for this profile
+build/options.toml                       cached --opt values
+build/deps/<name>/                       fetched and built dependencies
 ```
 
-Profiles do not share anything, so switching between them never rebuilds.
+Object and library names follow the platform (`.obj` and `.lib` with MSVC). With
+`--target`, `<profile>` is `<arch>-<os>/<profile>`. Profiles do not share anything,
+so switching between them never rebuilds.
 
 ## Source map
 
 | Module | Role |
 | --- | --- |
-| `config` | Manifest shape (serde), plus `Define`, `ListEdit`, `OptLevel` |
+| `config` | Reads `project.toml` (flat-key reader), key grammar, vocabulary and the typed manifest |
+| `configure` | Options and their cache, features, lookups, layered merge with origins, per-unit model |
+| `platform` | Host and `--target` platform, compiler classification, toolchain files |
 | `project` | Path validation, source discovery, toolchain choice, build layout |
-| `profile`, `resolve` | Profile checks; layering a profile into compiler arguments |
+| `deps` | Dependency kinds (local, git, CMake, system) and `project.lock` |
+| `flags` | Turns abstract settings into compiler, linker and archiver arguments |
 | `graph` | Tasks, edges, topological order, text and DOT output |
 | `planner` | Pure dirty-or-clean decisions with typed reasons |
 | `database`, `fingerprint` | Records and hashing; command and compiler fingerprints |
 | `headers`, `depfile` | Depfile parsing and path normalization |
 | `build`, `executor` | The scheduler and the process boundary (a trait, so tests can fake it) |
-| `explain` | Renders the plan |
+| `explain` | Renders merged configuration and the plan |
 
 ## Development
 
@@ -284,18 +239,18 @@ Profiles do not share anything, so switching between them never rebuilds.
 cargo test                                   # unit and integration tests
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-git config core.hooksPath .githooks          # run the same checks before each commit
+cargo build --release && python3 dev/test_examples.py   # the example projects
 ```
 
 Unit tests live next to the code. Integration tests in `tests/` drive the real
-pipeline with real compilers (`gcc`/`g++`, `ar`, `make`) in temporary directories
+pipeline with real compilers (`gcc`/`g++`, `ar`) in temporary directories
 and skip themselves when a tool is missing. CI builds and tests on Linux and macOS.
 
 ## Platforms and limitations
 
-Linux and macOS with GCC or Clang. On Windows, use WSL. MSVC is not supported.
+Linux, macOS and Windows (MSVC `cl` or `clang-cl`). CI builds and tests on Linux and
+macOS.
 
-- **No compiler discovery.** The manifest must name the compiler.
 - **Environment variables** that change compilation (`CPATH`, `SDKROOT`, ...) are not
   part of the fingerprint.
 - **System headers** (omitted by `-MMD`) are covered only through the compiler's
@@ -305,34 +260,16 @@ Linux and macOS with GCC or Clang. On Windows, use WSL. MSVC is not supported.
 - **No early cutoff.** If a compile produces identical bytes, the link still runs.
 - **A small timing window:** a header edited within milliseconds after its compile
   starts can be recorded as clean.
-- **One set of flags for both languages.** C++-only flags reach C files, where GCC warns.
 - **Ctrl-C is not handled specially.** A partially written output is caught on the
   next build, because its hash will not match the record.
-- **No generated files, static library targets, or dependency fetching** yet.
+- **Static CMake libraries** do not report their system link dependencies; declare
+  them with `system` keys.
+- **Deferred features** are listed in section 15 of the [manifest specification](docs/manifest-spec.md).
 
 ## Roadmap
 
-1. Static library targets (`ar`)
-2. Lockfile pinning for fetched Git dependencies and more portable archive handling.
-3. Dependency task caching and build logs.
-4. Early cutoff.
-
-## Dependencies
-
-`[dependencies.<name>]` entries are resolved during `forge build`. A `find`
-list tries system finders in order (`pkg-config:<module>` and `cmake:<package>`);
-`prefer = "system"` falls back to `[source]`, `"vendored"` always builds the
-source, and `"system-only"` reports a missing requirement. Git sources are
-checked out at `rev`; tar sources are verified against `sha256`; local path
-sources are also supported. Fetched and installed files are kept under
-`build/deps/` and removed by `forge clean --all`.
-
-Build backends are `make`, `cmake`, `autotools`, `none`, `self`, and `steps`.
-Omitting `system` detects a nested Forge project (`Forge.toml`), CMake,
-Autotools, or Makefile projects, in that order. Use
-`[dependencies.<name>.expose]` for projects without an install target, or for
-header-only sources. Custom build commands in `steps` accept `{prefix}`, `{cc}`,
-`{cxx}`, and `{jobs}` substitutions and run in the source directory.
+1. Dependency task caching and build logs.
+2. Early cutoff.
 
 ## License
 
