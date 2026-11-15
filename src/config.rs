@@ -1,3 +1,4 @@
+pub mod flat;
 pub mod manifest;
 pub mod types;
 
@@ -120,7 +121,10 @@ mod tests {
         let (_t, r) = tree();
         std::fs::write(r.join("a/project.toml"), "").unwrap();
         std::fs::write(r.join("a/b/project.toml"), "").unwrap();
-        assert_eq!(find_from(&r.join("a/b/c")), Some(r.join("a/b/project.toml")));
+        assert_eq!(
+            find_from(&r.join("a/b/c")),
+            Some(r.join("a/b/project.toml"))
+        );
     }
 
     #[test]
