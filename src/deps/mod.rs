@@ -172,8 +172,9 @@ fn prepare_cmake(
 }
 
 /// Pins and checks out the git dependencies among `units`, then writes
-/// `project.lock` if it changed. Entries of dependencies that are no longer
-/// in the manifest are dropped.
+/// `project.lock` if it changed, also when a dependency failed. Entries of
+/// dependencies that are no longer in the manifest are dropped; those of
+/// dependencies that are merely unused here are kept.
 fn fetch_git(project: &mut Project, units: &[usize]) -> Result<(), ConfigError> {
     let git_names: Vec<&str> = project
         .configured
@@ -192,25 +193,41 @@ fn fetch_git(project: &mut Project, units: &[usize]) -> Result<(), ConfigError> 
     lock.entries
         .retain(|name, _| git_names.contains(&name.as_str()));
 
+    // A failing dependency must not lose the pins that were resolved before
+    // it: a moving ref would otherwise pin to another commit on the next run.
+    let mut failure = None;
     for &unit in units {
-        let u = &project.configured.units[unit];
-        let Some(DepSource::Git { url, rev }) = u.dep.as_ref().map(|d| d.source.clone()) else {
-            continue;
-        };
-        let name = u.name.clone();
-        let commit = pin(
-            &mut lock,
-            &project.root,
-            &name,
-            &url,
-            &rev,
-            false,
-            &mut project.diagnostics,
-        )?;
-        checkout(&project.root, &name, &url, &commit)
-            .map_err(|message| ConfigError::invalid(format!("dependency.{name}"), message))?;
+        if let Err(e) = fetch_one(project, &mut lock, unit) {
+            failure = Some(e);
+            break;
+        }
     }
-    save_if_changed(&path, &before, &lock)
+    let saved = save_if_changed(&path, &before, &lock);
+    match failure {
+        Some(e) => Err(e),
+        None => saved,
+    }
+}
+
+/// Pins and checks out one git dependency (other kinds are skipped).
+fn fetch_one(project: &mut Project, lock: &mut Lockfile, unit: usize) -> Result<(), ConfigError> {
+    let u = &project.configured.units[unit];
+    let Some(DepSource::Git { url, rev }) = u.dep.as_ref().map(|d| d.source.clone()) else {
+        return Ok(());
+    };
+    let name = u.name.clone();
+    let commit = pin(
+        lock,
+        &project.root,
+        &name,
+        &url,
+        &rev,
+        false,
+        &mut project.diagnostics,
+    )?;
+    checkout(&project.root, &name, &url, &commit)
+        .map_err(|message| ConfigError::invalid(format!("dependency.{name}"), message))?;
+    Ok(())
 }
 
 fn save_if_changed(path: &Path, before: &str, lock: &Lockfile) -> Result<(), ConfigError> {

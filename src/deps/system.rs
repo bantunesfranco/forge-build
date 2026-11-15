@@ -4,7 +4,6 @@
 use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    str::SplitWhitespace,
 };
 
 use crate::{
@@ -30,20 +29,69 @@ pub struct Found {
 /// be tested without the tools.
 pub type Runner<'a> = &'a dyn Fn(&str, &[String]) -> Result<String, String>;
 
-/// Link options other than `-l`/`-L` that go to the linker as they are.
+/// Link options other than `-l`/`-L` that go to the linker as they are. A bare
+/// `-static` is not one: it would make the whole bin static.
 fn is_link_option(token: &str) -> bool {
-    token.starts_with("-Wl,") || matches!(token, "-rdynamic" | "-static")
+    token.starts_with("-Wl,") || token == "-rdynamic"
 }
 
 /// The value of a flag written as `-X value` or `-Xvalue`, when `token` is
 /// that flag.
-fn flag_value(token: &str, prefix: &str, rest: &mut SplitWhitespace) -> Option<String> {
+fn flag_value(
+    token: &str,
+    prefix: &str,
+    rest: &mut impl Iterator<Item = String>,
+) -> Option<String> {
     let tail = token.strip_prefix(prefix)?;
     if tail.is_empty() {
-        rest.next().map(str::to_owned)
+        rest.next()
     } else {
         Some(tail.to_owned())
     }
+}
+
+/// Splits `text` into words like a shell: whitespace separates, single and
+/// double quotes group, and a backslash escapes a space, a quote or another
+/// backslash (how `pkg-config` writes a path with a space). Any other
+/// backslash stays, so a Windows path is not damaged.
+pub fn shell_words(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut quote: Option<char> = None;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match (ch, quote) {
+            ('\\', _)
+                if quote != Some('\'')
+                    && chars
+                        .peek()
+                        .is_some_and(|n| matches!(n, ' ' | '"' | '\'' | '\\')) =>
+            {
+                word.push(chars.next().unwrap_or(ch));
+                started = true;
+            }
+            (c, Some(q)) if c == q => quote = None,
+            (c @ ('"' | '\''), None) => {
+                quote = Some(c);
+                started = true;
+            }
+            (c, None) if c.is_whitespace() => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            (c, _) => {
+                word.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        words.push(word);
+    }
+    words
 }
 
 /// Sorts the tokens of a `pkg-config` or `cmake --find-package` answer.
@@ -52,8 +100,9 @@ fn flag_value(token: &str, prefix: &str, rest: &mut SplitWhitespace) -> Option<S
 /// library file and goes to the linker.
 pub fn split_flags(tokens: &str) -> Found {
     let mut found = Found::default();
-    let mut it = tokens.split_whitespace();
+    let mut it = shell_words(tokens).into_iter();
     while let Some(token) = it.next() {
+        let token = token.as_str();
         if token == "-isystem" {
             if let Some(dir) = it.next() {
                 found.include.push(PathBuf::from(dir));
@@ -72,8 +121,10 @@ pub fn split_flags(tokens: &str) -> Found {
         } else if token == "-framework" {
             if let Some(name) = it.next() {
                 found.ldflags.push(token.to_owned());
-                found.ldflags.push(name.to_owned());
+                found.ldflags.push(name);
             }
+        } else if token == "-static" {
+            // Not forwarded: see `is_link_option`.
         } else if token == "-pthread" {
             found.cflags.push(token.to_owned());
             found.ldflags.push(token.to_owned());
@@ -86,17 +137,31 @@ pub fn split_flags(tokens: &str) -> Found {
     found
 }
 
-fn pkg_config(name: &str, run: Runner) -> Result<Found, String> {
+/// Whether every library of `found` is a static archive in one of its library
+/// directories with no shared library next to it: only then does the link need
+/// the package's private dependencies (`Libs.private`).
+fn only_static_archives(found: &Found, exists: &dyn Fn(&Path) -> bool) -> bool {
+    let has = |file: String| found.lib_dirs.iter().any(|dir| exists(&dir.join(&file)));
+    !found.libs.is_empty()
+        && found.libs.iter().all(|lib| {
+            has(format!("lib{lib}.a"))
+                && !has(format!("lib{lib}.so"))
+                && !has(format!("lib{lib}.dylib"))
+                && !has(format!("lib{lib}.dll.a"))
+        })
+}
+
+fn pkg_config(name: &str, run: Runner, exists: &dyn Fn(&Path) -> bool) -> Result<Found, String> {
     run("pkg-config", &["--exists".into(), name.into()])?;
-    // Include private dependencies too: a system package may resolve to a
-    // static archive, whose transitive link libraries (e.g. GLFW's X11
-    // dependencies) are commonly listed in Libs.private.
-    let args = [
-        "--static".to_string(),
-        "--cflags".into(),
-        "--libs".into(),
-        name.into(),
-    ];
+    let mut args = vec!["--cflags".to_string(), "--libs".into(), name.into()];
+    let found = split_flags(&run("pkg-config", &args)?);
+    // A package that resolves to a static archive needs the libraries that the
+    // archive uses (e.g. GLFW's X11 dependencies, in Libs.private). A shared
+    // one does not: asking for them would over-link.
+    if !only_static_archives(&found, exists) {
+        return Ok(found);
+    }
+    args.insert(0, "--static".to_string());
     Ok(split_flags(&run("pkg-config", &args)?))
 }
 
@@ -121,8 +186,12 @@ fn cmake(name: &str, run: Runner) -> Result<Found, String> {
 }
 
 /// Finds a package on the host: `pkg-config` first, then CMake.
-pub fn find_package(name: &str, run: Runner) -> Result<Found, String> {
-    let pkg = match pkg_config(name, run) {
+pub fn find_package(
+    name: &str,
+    run: Runner,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Result<Found, String> {
+    let pkg = match pkg_config(name, run, exists) {
         Ok(found) => return Ok(found),
         Err(e) => e,
     };
@@ -239,7 +308,7 @@ pub fn prepare_system(project: &mut Project, unit: usize) -> Result<Prepared, Co
         ),
         None => return Err(ConfigError::invalid(field, "not a dependency")),
     };
-    let found = find_package(&find, &run_process)
+    let found = find_package(&find, &run_process, &|path| path.is_file())
         .map_err(|message| ConfigError::invalid(field, message))?;
     let msvc = matches!(
         project.platform.compiler,
@@ -304,6 +373,84 @@ mod tests {
     }
 
     #[test]
+    fn paths_with_spaces_and_quotes_stay_whole() {
+        assert_eq!(
+            shell_words(r"-I/Program\ Files/x  -DNAME='a b' -D'Q=1' "),
+            ["-I/Program Files/x", "-DNAME=a b", "-DQ=1"]
+        );
+        assert_eq!(
+            shell_words(r#""C:/Program Files/x/lib" -lz"#),
+            ["C:/Program Files/x/lib", "-lz"]
+        );
+        // Only a space, a quote or a backslash is escaped: a Windows path stays.
+        assert_eq!(
+            shell_words(r"-LC:\lib\foo C:\\x"),
+            [r"-LC:\lib\foo", r"C:\x"]
+        );
+        assert_eq!(shell_words(""), Vec::<String>::new());
+        assert_eq!(shell_words("''"), [""]);
+
+        let f = split_flags(r"-I/Program\ Files/inc -L'/opt/my lib' -lfoo -DX=1");
+        assert_eq!(f.include, [PathBuf::from("/Program Files/inc")]);
+        assert_eq!(f.lib_dirs, [PathBuf::from("/opt/my lib")]);
+        assert_eq!(f.defines, ["X=1".parse::<Define>().unwrap()]);
+    }
+
+    #[test]
+    fn a_bare_static_is_not_forwarded_to_the_linker() {
+        let f = split_flags("-lfoo -static -Wl,-Bstatic");
+        assert_eq!(f.ldflags, ["-Wl,-Bstatic"]);
+        assert!(f.cflags.is_empty());
+    }
+
+    #[test]
+    fn static_is_asked_for_only_when_the_package_is_a_static_archive() {
+        use std::{cell::RefCell, collections::BTreeSet};
+        let present: BTreeSet<PathBuf> = [
+            "/opt/a/lib/libglfw3.a",
+            "/opt/b/lib/libz.a",
+            "/opt/b/lib/libz.so",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+        let exists = |p: &Path| present.contains(p);
+        let calls = RefCell::new(Vec::<String>::new());
+        let run = |_: &str, args: &[String]| -> Result<String, String> {
+            calls.borrow_mut().push(args.join(" "));
+            Ok(if args.iter().any(|a| a == "glfw3") {
+                if args.contains(&"--static".to_string()) {
+                    "-L/opt/a/lib -lglfw3 -lX11"
+                } else {
+                    "-L/opt/a/lib -lglfw3"
+                }
+            } else {
+                "-L/opt/b/lib -lz"
+            }
+            .to_string())
+        };
+
+        let f = find_package("glfw3", &run, &exists).unwrap();
+        assert_eq!(f.libs, ["glfw3", "X11"]);
+        assert_eq!(
+            calls.borrow().last().unwrap(),
+            "--static --cflags --libs glfw3"
+        );
+
+        calls.borrow_mut().clear();
+        let f = find_package("zlib", &run, &exists).unwrap();
+        assert_eq!(f.libs, ["z"]);
+        assert!(
+            !calls.borrow().iter().any(|c| c.contains("--static")),
+            "{:?}",
+            calls.borrow()
+        );
+
+        // Without a library directory there is nothing to inspect.
+        assert!(!only_static_archives(&split_flags("-lz"), &exists));
+    }
+
+    #[test]
     fn falls_back_to_cmake() {
         let run = |program: &str, args: &[String]| -> Result<String, String> {
             if program == "pkg-config" {
@@ -316,7 +463,7 @@ mod tests {
                 Ok("-lb".into())
             }
         };
-        let f = find_package("Thing", &run).unwrap();
+        let f = find_package("Thing", &run, &|_| false).unwrap();
         assert_eq!(f.include, [PathBuf::from("/a")]);
         assert_eq!(f.libs, ["b"]);
     }
@@ -327,13 +474,13 @@ mod tests {
             assert_eq!(program, "pkg-config");
             Ok("-lz".into())
         };
-        assert_eq!(find_package("zlib", &run).unwrap().libs, ["z"]);
+        assert_eq!(find_package("zlib", &run, &|_| false).unwrap().libs, ["z"]);
     }
 
     #[test]
     fn not_found_names_both_finders() {
         let run = |_: &str, _: &[String]| -> Result<String, String> { Err("nope".into()) };
-        let e = find_package("OpenGL", &run).unwrap_err();
+        let e = find_package("OpenGL", &run, &|_| false).unwrap_err();
         assert!(
             e.contains("pkg-config") && e.contains("cmake") && e.contains("OpenGL"),
             "{e}"
@@ -349,7 +496,11 @@ mod tests {
                 Ok("Thing not found.\n".into())
             }
         };
-        assert!(find_package("Thing", &run).unwrap_err().contains("cmake"));
+        assert!(
+            find_package("Thing", &run, &|_| false)
+                .unwrap_err()
+                .contains("cmake")
+        );
     }
 
     #[test]

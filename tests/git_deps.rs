@@ -432,6 +432,37 @@ fn an_unused_git_dependency_is_not_fetched_but_keeps_its_lock_entry() {
 }
 
 #[test]
+fn a_relative_git_url_is_taken_from_the_manifest_directory() {
+    need_git!();
+    let up = Upstream::new();
+    let f = Fixture::new(&manifest("./upstream", "master"));
+    f.touch("main.c");
+    // The repository lives next to the manifest, whatever the cwd is.
+    git_in(&f.root, &["clone", "--quiet", &up.url(), "upstream"]);
+    f.load().unwrap();
+    assert_eq!(lock_of(&f).entries["dep"].git, "./upstream");
+    assert_eq!(checkout_head(&f), up.head());
+    // Again: the checkout is current, nothing is resolved.
+    let p = f.load().unwrap();
+    assert!(infos(&p).iter().all(|m| !m.starts_with("pinned")));
+}
+
+#[test]
+fn pins_survive_a_later_dependency_that_fails() {
+    need_git!();
+    let up = Upstream::new();
+    // `dep` comes before `other`, whose rev does not exist.
+    let text = with_other(&up, "deps = [\"dep\", \"other\"]").replace("\"v1\"", "\"nope\"");
+    let f = Fixture::new(&text);
+    f.touch("main.c");
+    let e = f.error();
+    assert!(e.contains("dependency.other") && e.contains("nope"), "{e}");
+    let lock = lock_of(&f);
+    assert_eq!(lock.entries.keys().collect::<Vec<_>>(), ["dep"]);
+    assert_eq!(lock.entries["dep"].commit, up.head());
+}
+
+#[test]
 fn checkout_is_offline_when_already_at_commit() {
     need_git!();
     let up = Upstream::new();

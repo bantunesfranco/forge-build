@@ -20,15 +20,32 @@ pub fn source_dir(root: &Path, name: &str) -> PathBuf {
     root.join(DEPS_DIR).join(name).join("source")
 }
 
+/// The `GIT_SSH_COMMAND` that keeps ssh from asking anything (a host-key or
+/// passphrase prompt reads the terminal, which `GIT_TERMINAL_PROMPT=0` does
+/// not cover), or `None` when the user chose their own ssh.
+fn default_ssh_command(is_set: impl Fn(&str) -> bool) -> Option<&'static str> {
+    (!is_set("GIT_SSH_COMMAND") && !is_set("GIT_SSH")).then_some("ssh -o BatchMode=yes")
+}
+
 /// Runs `git <args>` in `cwd` and returns its stdout. A failure carries the
 /// command line and git's stderr.
 fn git(args: &[&str], cwd: &Path) -> Result<String, String> {
-    let out = Command::new("git")
+    git_with(args, cwd, &[])
+}
+
+fn git_with(args: &[&str], cwd: &Path, env: &[(&str, String)]) -> Result<String, String> {
+    let mut command = Command::new("git");
+    command
         .args(["-c", "advice.detachedHead=false"])
         .args(args)
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
+        .envs(env.iter().map(|(k, v)| (*k, v)))
+        .stdin(Stdio::null());
+    if let Some(ssh) = default_ssh_command(|name| std::env::var_os(name).is_some()) {
+        command.env("GIT_SSH_COMMAND", ssh);
+    }
+    let out = command
         .output()
         .map_err(|e| format!("cannot run git: {e}"))?;
     if out.status.success() {
@@ -42,6 +59,17 @@ fn is_hex(s: &str, lengths: std::ops::RangeInclusive<usize>) -> bool {
     lengths.contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// `url` as git should be given it. A relative path (`./repo`, `../repo`)
+/// means a directory next to the manifest like a `path` dependency (spec
+/// 10.2), whichever directory git runs in; anything else is passed on as it is.
+fn locate(root: &Path, url: &str) -> String {
+    if url == "." || url == ".." || url.starts_with("./") || url.starts_with("../") {
+        path_arg(&root.join(url))
+    } else {
+        url.to_string()
+    }
+}
+
 /// The commit `rev` names in the repository at `url`. A 40-digit hash is
 /// returned as it is, without asking the network. Otherwise a tag (the commit
 /// an annotated tag points at), a branch or any other ref is looked up with
@@ -51,6 +79,8 @@ pub fn resolve_rev(root: &Path, name: &str, url: &str, rev: &str) -> Result<Stri
     if is_hex(rev, 40..=40) {
         return Ok(rev.to_string());
     }
+    let located = locate(root, url);
+    let url = located.as_str();
     let tag = format!("refs/tags/{rev}");
     let peeled = format!("{tag}^{{}}");
     let head = format!("refs/heads/{rev}");
@@ -83,6 +113,7 @@ pub fn resolve_rev(root: &Path, name: &str, url: &str, rev: &str) -> Result<Stri
 /// Expands an abbreviated hash. Only a clone knows the objects, so this clones
 /// into the dependency's checkout directory, where `checkout` finds it next.
 fn expand_abbreviation(root: &Path, name: &str, url: &str, rev: &str) -> Result<String, String> {
+    // `url` is already located.
     let dir = source_dir(root, name);
     ensure_clone(&dir, url)?;
     git(&["rev-parse", &format!("{rev}^{{commit}}")], &dir)
@@ -113,15 +144,24 @@ fn ensure_clone(dir: &Path, url: &str) -> Result<(), String> {
 }
 
 fn is_work_tree(dir: &Path) -> bool {
+    // Git looks for a repository in the parent directories when `.git` is
+    // unusable, which would find the project's own repository. The parent is a
+    // ceiling it may not enter.
+    let ceiling: Vec<(&str, String)> = dir
+        .parent()
+        .map(|parent| vec![("GIT_CEILING_DIRECTORIES", path_arg(parent))])
+        .unwrap_or_default();
     dir.join(".git").exists()
-        && git(&["rev-parse", "--is-inside-work-tree"], dir).is_ok_and(|out| out == "true")
+        && git_with(&["rev-parse", "--is-inside-work-tree"], dir, &ceiling)
+            .is_ok_and(|out| out == "true")
 }
 
 /// Whether `dir` is a work tree of `url` that is already at `commit`.
 fn is_at(dir: &Path, url: &str, commit: &str) -> bool {
     is_work_tree(dir)
         && git(&["rev-parse", "HEAD"], dir).is_ok_and(|head| head == commit)
-        && git(&["remote", "get-url", "origin"], dir).is_ok_and(|origin| origin == url)
+        // The configured value: `remote get-url` applies `url.*.insteadOf`.
+        && git(&["config", "--get", "remote.origin.url"], dir).is_ok_and(|origin| origin == url)
 }
 
 /// The commit a checkout is at.
@@ -133,6 +173,8 @@ pub fn head_commit(dir: &Path) -> Result<String, String> {
 /// that directory. A checkout that is already at `commit` is left alone and
 /// nothing is fetched, so a locked build works offline.
 pub fn checkout(root: &Path, name: &str, url: &str, commit: &str) -> Result<PathBuf, String> {
+    let located = locate(root, url);
+    let url = located.as_str();
     let dir = source_dir(root, name);
     if is_at(&dir, url, commit) {
         return Ok(dir);
@@ -182,4 +224,89 @@ pub fn pin(
         },
     );
     Ok(commit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn have_git() -> bool {
+        Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    #[test]
+    fn a_relative_url_is_taken_from_the_manifest_directory() {
+        let root = Path::new("/work/app");
+        assert_eq!(locate(root, "../lib"), path_arg(&root.join("../lib")));
+        assert_eq!(locate(root, "./lib"), path_arg(&root.join("./lib")));
+        for url in [
+            "https://example.com/x.git",
+            "git@example.com:x/y.git",
+            "/abs/repo",
+            "file:///abs/repo",
+            "C:/repos/x",
+        ] {
+            assert_eq!(locate(root, url), url);
+        }
+    }
+
+    #[test]
+    fn ssh_never_asks_a_question_unless_the_user_chose_their_ssh() {
+        assert_eq!(default_ssh_command(|_| false), Some("ssh -o BatchMode=yes"));
+        assert_eq!(default_ssh_command(|n| n == "GIT_SSH_COMMAND"), None);
+        assert_eq!(default_ssh_command(|n| n == "GIT_SSH"), None);
+    }
+
+    #[test]
+    fn insteadof_does_not_hide_a_checkout_that_is_current() {
+        if !have_git() {
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| git(args, &dir).unwrap();
+        run(&["init", "-q", "."]);
+        run(&["config", "user.email", "forge@example.com"]);
+        run(&["config", "user.name", "Forge Test"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "one"]);
+        let head = run(&["rev-parse", "HEAD"]);
+        let url = "https://example.com/dep.git";
+        run(&["remote", "add", "origin", url]);
+        assert!(is_at(&dir, url, &head));
+
+        // `get-url` would now answer with the rewritten URL.
+        run(&[
+            "config",
+            "url.ssh://git@example.com/.insteadOf",
+            "https://example.com/",
+        ]);
+        assert_ne!(run(&["remote", "get-url", "origin"]), url);
+        assert!(is_at(&dir, url, &head));
+        assert!(!is_at(&dir, "https://example.com/other.git", &head));
+    }
+
+    #[test]
+    fn a_broken_dot_git_does_not_lead_to_the_surrounding_repository() {
+        if !have_git() {
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let outer = t.path().join("project");
+        let inner = outer.join("build/deps/dep/source");
+        std::fs::create_dir_all(&inner).unwrap();
+        git(&["init", "-q", "."], &outer).unwrap();
+        // The outer repository is found from inside, as `git` itself would.
+        assert_eq!(
+            git(&["rev-parse", "--is-inside-work-tree"], &inner).unwrap(),
+            "true"
+        );
+        // A `.git` that git cannot use.
+        std::fs::create_dir(inner.join(".git")).unwrap();
+        assert!(!is_work_tree(&inner));
+    }
 }
