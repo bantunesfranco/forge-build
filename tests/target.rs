@@ -224,3 +224,28 @@ fn only_one_axis_is_rejected() {
         assert!(e.contains("<arch>-<os>"), "{bad}: {e}");
     }
 }
+
+#[test]
+fn option_cache_belongs_to_the_build_directory() {
+    let f = Fixture::new(concat!(
+        "[workspace]\nname = \"t\"\nversion = \"0.1.0\"\nc = \"17\"\n",
+        "[option.mode]\ntype = \"string\"\ndefault = \"fallback\"\n",
+        "[bin.app]\nsources = [\"main.c\"]\n",
+    ));
+    f.touch("main.c");
+    let t = foreign();
+    let mode = |inv: &Invocation| {
+        let p = f.load_with(inv, &common::VersionStub).unwrap();
+        p.configured.options["mode"].value.to_string()
+    };
+    f.write("build/options.toml", "mode = \"host\"\n");
+    assert_eq!(mode(&f.invocation()), "host");
+    // A host selection is not a selection for another platform.
+    assert_eq!(mode(&with_target(&f, t.target)), "fallback");
+    f.write(
+        &format!("build/{}/options.toml", t.target),
+        "mode = \"cross\"\n",
+    );
+    assert_eq!(mode(&with_target(&f, t.target)), "cross");
+    assert_eq!(mode(&f.invocation()), "host");
+}

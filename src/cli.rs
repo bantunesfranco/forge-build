@@ -11,7 +11,7 @@ use crate::{
     config::{self, ConfigError, Diagnostics, Level, find_manifest},
     configure::{
         model::Invocation,
-        options::{CACHE_FILE, load_cache, parse_cli_opt, save_cache},
+        options::{cache_path, load_cache, parse_cli_opt, save_cache},
     },
     deps::{self, Phase, prepare_all},
     executor::{Executor, ProcessExecutor},
@@ -30,7 +30,7 @@ struct Cli {
     #[arg(short, long, global = true)]
     profile: Option<String>,
 
-    /// Set an option declared in the manifest; repeatable. Saved in build/options.toml.
+    /// Set an option declared in the manifest; repeatable. Saved in the build directory's options.toml.
     #[arg(long = "opt", value_name = "NAME=VALUE", global = true, action = ArgAction::Append)]
     opt: Vec<String>,
 
@@ -109,7 +109,10 @@ fn load_project(
     };
     let project = Project::load(manifest, &inv, exec)?;
     if !inv.options.is_empty() {
-        let path = project.root.join(CACHE_FILE);
+        let target = project
+            .target_override
+            .then_some((project.platform.os, project.platform.arch));
+        let path = cache_path(&project.root, target);
         let mut cache = load_cache(&path)?;
         cache.extend(inv.options.iter().cloned());
         // An entry for an option the manifest does not declare is dropped.
@@ -254,7 +257,7 @@ mod tests {
         let p = load_project(&manifest, &cli(&["--opt", "level=high"]), &Clang).unwrap();
         assert_eq!(level(&p).value.to_string(), "high");
         assert_eq!(level(&p).source, OptionSource::Cli);
-        let cache = fs::read_to_string(root.join(CACHE_FILE)).unwrap();
+        let cache = fs::read_to_string(cache_path(&root, None)).unwrap();
         assert!(cache.contains("level = \"high\""), "{cache}");
 
         // no `--opt` this time: the cached value is used
@@ -265,7 +268,7 @@ mod tests {
         // a new value replaces the cached one
         let p = load_project(&manifest, &cli(&["--opt", "level=low"]), &Clang).unwrap();
         assert_eq!(level(&p).value.to_string(), "low");
-        let cache = fs::read_to_string(root.join(CACHE_FILE)).unwrap();
+        let cache = fs::read_to_string(cache_path(&root, None)).unwrap();
         assert!(
             cache.contains("level = \"low\"") && !cache.contains("high"),
             "{cache}"
@@ -284,7 +287,7 @@ mod tests {
         .expect("medium is not a value")
         .to_string();
         assert!(e.contains("level"), "{e}");
-        assert!(!root.join(CACHE_FILE).exists());
+        assert!(!cache_path(&root, None).exists());
     }
 
     #[test]

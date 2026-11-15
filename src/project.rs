@@ -15,7 +15,7 @@ use crate::{
     configure::{
         configure,
         model::{Configured, Invocation, UnitKind, effective, reachable},
-        options::{CACHE_FILE, load_cache},
+        options::{cache_path, load_cache},
     },
     deps::{Phase, Prepared, prepare_all},
     executor::Executor,
@@ -123,7 +123,10 @@ impl Project {
         let mut platform = Platform { os, arch, compiler };
         check_platform(&platform)?;
 
-        let cache = load_cache(&root.join(CACHE_FILE))?;
+        let cache = load_cache(&cache_path(
+            &root,
+            inv.target.is_some().then_some((os, arch)),
+        ))?;
         let mut configured = configure(&m, &root, inv, platform, &cache)?;
 
         // A C source needs the C program to agree with the platform compiler.

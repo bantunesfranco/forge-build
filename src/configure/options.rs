@@ -1,11 +1,15 @@
 //! Typed option resolution (spec 7.1): CLI > cache > conditional default.
 
-use std::{collections::BTreeMap, fmt, io, path::Path};
+use std::{
+    collections::BTreeMap,
+    fmt, io,
+    path::{Path, PathBuf},
+};
 
 use crate::config::{
     ConfigError, Diagnostics,
     schema::{OptionDecl, OptionType},
-    vocab::Platform,
+    vocab::{Arch, Os, Platform},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,7 +43,17 @@ pub struct ResolvedOption {
     pub source: OptionSource,
 }
 
-pub const CACHE_FILE: &str = "build/options.toml";
+/// The option cache of one build directory: `build/options.toml` for a host
+/// build, `build/<arch>-<os>/options.toml` when `--target` names a platform
+/// (the same directory the profile directories live in). A value chosen for
+/// one platform is never a user selection on another.
+pub fn cache_path(root: &Path, target: Option<(Os, Arch)>) -> PathBuf {
+    let mut path = root.join("build");
+    if let Some((os, arch)) = target {
+        path.push(format!("{}-{}", arch.as_str(), os.as_str()));
+    }
+    path.join("options.toml")
+}
 
 /// Splits `name=value` at the first `=`.
 pub fn parse_cli_opt(s: &str) -> Result<(String, String), String> {
@@ -138,7 +152,7 @@ pub fn resolve_options(
     }
     for name in cache.keys().filter(|n| !decls.contains_key(*n)) {
         diags.warn(format!(
-            "{CACHE_FILE} has an entry for undeclared option `{name}`; ignoring it"
+            "the option cache (options.toml) has an entry for undeclared option `{name}`; ignoring it"
         ));
     }
 
@@ -159,7 +173,7 @@ pub fn resolve_options(
             let value = parse_raw(name, decl, raw).map_err(|m| {
                 ConfigError::invalid(
                     format!("option.{name}"),
-                    format!("invalid value in {CACHE_FILE}: {m}"),
+                    format!("invalid value in the option cache (options.toml): {m}"),
                 )
             })?;
             ResolvedOption {
@@ -450,10 +464,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(
-            e.contains("build/options.toml") && e.contains("avx512"),
-            "{e}"
-        );
+        assert!(e.contains("options.toml") && e.contains("avx512"), "{e}");
         // A CLI value overrides the bad cached one.
         let ok = run(
             &decls(),
@@ -499,6 +510,22 @@ mod tests {
         assert_eq!(parse_cli_opt("a=").unwrap(), ("a".into(), String::new()));
         assert!(parse_cli_opt("a").is_err());
         assert!(parse_cli_opt("=b").is_err());
+    }
+
+    #[test]
+    fn cache_path_follows_the_build_directory() {
+        let root = Path::new("proj");
+        assert_eq!(
+            cache_path(root, None),
+            Path::new("proj").join("build").join("options.toml")
+        );
+        assert_eq!(
+            cache_path(root, Some((Os::Macos, Arch::Arm64))),
+            Path::new("proj")
+                .join("build")
+                .join("arm64-macos")
+                .join("options.toml")
+        );
     }
 
     #[test]

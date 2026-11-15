@@ -81,7 +81,11 @@ fn guard_mismatch(
     let origin = format!("feature.{name}.{value}");
     let how = match opt.source {
         OptionSource::Cli => format!("selected with `--opt {name}={value}`"),
-        OptionSource::Cache => format!("selected in build/options.toml (`{name}` = `{value}`)"),
+        OptionSource::Cache => {
+            format!(
+                "selected in the option cache, options.toml in the build directory (`{name}` = `{value}`)"
+            )
+        }
         OptionSource::Default => format!(
             "the default of option `{name}`; add `default.{}` to the option to pick a value for this architecture",
             p.arch.as_str()
@@ -210,7 +214,7 @@ defines.public.macos = ["GL_SILENCE_DEPRECATION"]
             .unwrap_err()
             .to_string();
         assert!(
-            e.contains("selected in build/options.toml") && e.contains("feature.simd.avx2"),
+            e.contains("selected in the option cache") && e.contains("feature.simd.avx2"),
             "{e}"
         );
     }

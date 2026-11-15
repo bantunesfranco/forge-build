@@ -66,7 +66,7 @@ Global options:
 | Option | Meaning |
 | --- | --- |
 | `-p, --profile NAME` | Build profile: `debug` (default), `release`, `relwithdebinfo` or one the manifest declares. |
-| `--opt NAME=VALUE` | Set an option declared in the manifest. Repeatable. The value is saved in `build/options.toml`, so later runs reuse it (command line, then cache, then the option's default). |
+| `--opt NAME=VALUE` | Set an option declared in the manifest. Repeatable. The value is saved in `options.toml` in the build directory (`build/options.toml`, or `build/<arch>-<os>/options.toml` with `--target`), so later runs of the same build reuse it (command line, then cache, then the option's default). |
 | `--target ARCH-OS` | Build for another platform, for example `arm64-macos`. Output goes to `build/<arch>-<os>/<profile>`. See Cross builds below. |
 | `--toolchain FILE` | A file with a `[toolchain]` table naming `c`, `cxx` and `ar`. Precedence: this file, then `CC`/`CXX`/`AR` from the environment, then the user toolchain file, then the default compilers. |
 | `-m, --manifest PATH` | A `project.toml`, or a directory containing one. |
@@ -208,7 +208,8 @@ build/<profile>/dep/<target>/<source>.o.d depfiles
 build/<profile>/bin/<target>             executable targets
 build/<profile>/lib/lib<target>.a        static library targets
 build/<profile>/forge.db                 records for this profile
-build/options.toml                       cached --opt values
+build/options.toml                       cached --opt values (host builds)
+build/<arch>-<os>/options.toml           cached --opt values (--target builds)
 build/deps/<name>/                       fetched and built dependencies
 ```
 
