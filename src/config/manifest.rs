@@ -301,7 +301,7 @@ impl Manifest {
             let lang = self.lang.as_ref();
             self.build.c_standard = lang.and_then(|l| l.c.clone());
             self.build.cxx_standard = lang.and_then(|l| l.cxx.clone());
-            let toolchain = load_user_toolchain()?;
+            let toolchain = crate::platform::load_user_toolchain()?;
             self.build.c_compiler = Some(
                 std::env::var("CC")
                     .ok()
@@ -528,47 +528,5 @@ fn apply_target_root(target: &mut Target) {
         for pattern in &mut layer.sources {
             if !PathBuf::from(&*pattern).is_absolute() { *pattern = root.join(&*pattern).to_string_lossy().into_owned(); }
         }
-    }
-}
-
-#[derive(Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct UserToolchainFile {
-    toolchain: UserToolchain,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct UserToolchain {
-    c: Option<String>,
-    cxx: Option<String>,
-}
-
-fn load_user_toolchain() -> Result<UserToolchain, String> {
-    let path = if let Some(path) = std::env::var_os("FORGE_TOOLCHAIN") {
-        Some(PathBuf::from(path))
-    } else if cfg!(windows) {
-        std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .map(|p| p.join("forge/toolchain.toml"))
-    } else if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
-        Some(PathBuf::from(path).join("forge/toolchain.toml"))
-    } else {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|p| p.join(".config/forge/toolchain.toml"))
-    };
-    let Some(path) = path else {
-        return Ok(UserToolchain::default());
-    };
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => toml::from_str::<UserToolchainFile>(&contents)
-            .map(|file| file.toolchain)
-            .map_err(|e| format!("invalid user toolchain file {}: {e}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(UserToolchain::default()),
-        Err(e) => Err(format!(
-            "cannot read user toolchain file {}: {e}",
-            path.display()
-        )),
     }
 }

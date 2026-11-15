@@ -13,6 +13,7 @@ pub mod graph;
 pub mod headers;
 pub mod lang;
 pub mod planner;
+pub mod platform;
 pub mod profile;
 pub mod project;
 pub mod resolve;
