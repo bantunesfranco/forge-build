@@ -5,7 +5,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use crate::depfile::parse_depfile;
+use crate::{config::vocab::Compiler, depfile::parse_depfile};
 
 /// Normalizes a path from a depfile:
 /// * `./` and `x/../` segments are removed lexically,
@@ -42,12 +42,43 @@ fn clean(p: &Path) -> PathBuf {
     out
 }
 
+/// What a compiler writes for `-MMD` style header tracking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepFormat {
+    /// A Makefile rule (gcc, clang, clang-cl with `/clang:-MMD`).
+    Makefile,
+    /// The JSON of MSVC's `/sourceDependencies`.
+    MsvcJson,
+}
+
+impl DepFormat {
+    /// The format the compiler's command line asks for.
+    pub fn of(compiler: Compiler) -> DepFormat {
+        match compiler {
+            Compiler::Msvc => DepFormat::MsvcJson,
+            _ => DepFormat::Makefile,
+        }
+    }
+
+    /// The extension of the depfile after the object's name.
+    pub fn extension(self) -> &'static str {
+        match self {
+            DepFormat::Makefile => "d",
+            DepFormat::MsvcJson => "json",
+        }
+    }
+}
+
 /// Every file the compiler listed for one translation unit (the source itself
 /// and the headers it included), normalized and de-duplicated, in order.
-pub fn read_headers(root: &Path, depfile: &Path) -> Result<Vec<PathBuf>, String> {
+pub fn read_headers(
+    root: &Path,
+    depfile: &Path,
+    format: DepFormat,
+) -> Result<Vec<PathBuf>, String> {
     let bytes = fs::read(depfile).map_err(|e| format!("cannot read {}: {e}", depfile.display()))?;
     let mut out: Vec<PathBuf> = Vec::new();
-    let paths = if bytes.iter().copied().find(|b| !b.is_ascii_whitespace()) == Some(b'{') {
+    let paths = if format == DepFormat::MsvcJson {
         let json: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", depfile.display()))?;
         let data = json.get("Data").unwrap_or(&json);
@@ -162,7 +193,7 @@ mod tests {
             "build/o/main.cpp.o: ./src/main.cpp include/hello.hpp \\\n src/../include/hello.hpp\n",
         )
         .unwrap();
-        let got = read_headers(Path::new("/proj"), &dep).unwrap();
+        let got = read_headers(Path::new("/proj"), &dep, DepFormat::Makefile).unwrap();
         assert_eq!(
             got,
             vec![
@@ -175,6 +206,53 @@ mod tests {
     #[test]
     fn missing_depfile_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(read_headers(dir.path(), &dir.path().join("nope.d")).is_err());
+        let missing = dir.path().join("nope.d");
+        assert!(read_headers(dir.path(), &missing, DepFormat::Makefile).is_err());
+        assert!(read_headers(dir.path(), &missing, DepFormat::MsvcJson).is_err());
+    }
+
+    #[test]
+    fn format_follows_the_compiler_not_the_msvc_family() {
+        assert_eq!(DepFormat::of(Compiler::Msvc), DepFormat::MsvcJson);
+        for c in [
+            Compiler::ClangCl,
+            Compiler::Clang,
+            Compiler::Gcc,
+            Compiler::AppleClang,
+        ] {
+            assert_eq!(DepFormat::of(c), DepFormat::Makefile, "{c:?}");
+        }
+        assert_eq!(DepFormat::Makefile.extension(), "d");
+        assert_eq!(DepFormat::MsvcJson.extension(), "json");
+    }
+
+    #[test]
+    fn each_format_reads_its_own_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Path::new("/proj");
+
+        let make = dir.path().join("a.obj.d");
+        fs::write(
+            &make,
+            "a.obj: src/a.c include/a.h
+",
+        )
+        .unwrap();
+        let got = read_headers(root, &make, DepFormat::Makefile).unwrap();
+        assert_eq!(
+            got,
+            vec![PathBuf::from("src/a.c"), PathBuf::from("include/a.h")]
+        );
+
+        let json = dir.path().join("a.obj.json");
+        fs::write(
+            &json,
+            r#"{"Version":"1.2","Data":{"Source":"src/a.c","Includes":["include/a.h"]}}"#,
+        )
+        .unwrap();
+        let got = read_headers(root, &json, DepFormat::MsvcJson).unwrap();
+        assert_eq!(got, read_headers(root, &make, DepFormat::Makefile).unwrap());
+        // The wrong format is an error, not a silent guess.
+        assert!(read_headers(root, &json, DepFormat::Makefile).is_err());
     }
 }

@@ -8,11 +8,12 @@ use std::{
 };
 
 use crate::{
+    config::vocab::Compiler,
     database::{self, Database, FileState, Snapshot, TaskRecord},
     executor::{CommandSpec, Executor, Outcome, path_arg},
     fingerprint, flags,
     graph::{Graph, Task, TaskId, TaskKind},
-    headers,
+    headers::{self, DepFormat},
     lang::Lang,
     planner::{self, DirtyReason},
     project::Project,
@@ -53,6 +54,8 @@ pub enum BuildError {
 pub fn command_for(task: &Task, project: &Project) -> CommandSpec {
     let cwd = project.root.clone();
     let msvc = project.uses_msvc();
+    let compiler = project.platform.compiler;
+    let lto = project.configured.profile_scalars.lto;
     let target = &project.targets[task.target];
     let program = |lang: Lang| match lang {
         Lang::C => project.toolchains.c.clone(),
@@ -66,7 +69,8 @@ pub fn command_for(task: &Task, project: &Project) -> CommandSpec {
             let mut args = Vec::new();
             if msvc {
                 args.push("/nologo".to_string());
-                if project.configured.profile_scalars.lto {
+                // llvm-lib reads bitcode objects without being told to.
+                if lto && compiler == Compiler::Msvc {
                     args.push("/LTCG".to_string());
                 }
                 args.push(format!("/OUT:{out}"));
@@ -89,15 +93,15 @@ pub fn command_for(task: &Task, project: &Project) -> CommandSpec {
             let depfile = path_arg(&task.outputs[1]);
             let source = path_arg(&task.inputs[0]);
             if msvc {
-                args.extend([
-                    "/nologo".to_string(),
-                    "/FS".to_string(),
-                    "/c".to_string(),
-                    "/sourceDependencies".to_string(),
-                    depfile,
-                    format!("/Fo{out}"),
-                    source,
-                ]);
+                args.extend(["/nologo".to_string(), "/FS".to_string(), "/c".to_string()]);
+                if compiler == Compiler::ClangCl {
+                    // clang-cl ignores /sourceDependencies; the GNU options
+                    // are passed through to the clang driver.
+                    args.extend(["/clang:-MMD".to_string(), format!("/clang:-MF{depfile}")]);
+                } else {
+                    args.extend(["/sourceDependencies".to_string(), depfile]);
+                }
+                args.extend([format!("/Fo{out}"), source]);
             } else {
                 args.extend([
                     "-MMD".to_string(),
@@ -120,6 +124,10 @@ pub fn command_for(task: &Task, project: &Project) -> CommandSpec {
             if msvc {
                 // clang-cl picks its target before the linker options start.
                 args.extend(flags::target_arg(&project.configured));
+                // Thin-LTO bitcode needs lld; link.exe cannot read it.
+                if lto && compiler == Compiler::ClangCl {
+                    args.push("-fuse-ld=lld".to_string());
+                }
                 args.push("/nologo".to_string());
                 args.push("/link".to_string());
                 args.extend(target.link.iter().cloned());
@@ -159,11 +167,12 @@ fn make_record(
     launched_at: SystemTime,
     inputs_at_launch: &Snapshot,
     produced: &HashSet<&PathBuf>,
+    format: DepFormat,
 ) -> Result<TaskRecord, String> {
     let mut inputs = inputs_at_launch.clone();
 
     if task.kind == TaskKind::Compile {
-        for header in headers::read_headers(root, &root.join(&task.outputs[1]))? {
+        for header in headers::read_headers(root, &root.join(&task.outputs[1]), format)? {
             inputs.entry(header.clone()).or_insert_with(|| {
                 database::file_state(&root.join(&header)).unwrap_or(FileState::Missing)
             });
@@ -322,7 +331,15 @@ pub fn build(
 
                     // only successes are recorded; an untrustworthy one is forgotten
                     let (at, inputs) = launched.remove(&id).expect("launched task has a snapshot");
-                    match make_record(root, task, hashes[id], at, &inputs, &produced) {
+                    match make_record(
+                        root,
+                        task,
+                        hashes[id],
+                        at,
+                        &inputs,
+                        &produced,
+                        project.depfile_format(),
+                    ) {
                         Ok(rec) => {
                             db.tasks.insert(task.outputs[0].clone(), rec);
                         }

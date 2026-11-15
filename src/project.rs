@@ -20,6 +20,7 @@ use crate::{
     deps::{Phase, Prepared, prepare_all},
     executor::Executor,
     flags,
+    headers::DepFormat,
     lang::Lang,
     platform::{
         Toolchains, check_combination, detect_compiler, host_os_arch, load_toolchains, parse_target,
@@ -77,6 +78,11 @@ pub struct BuildTarget {
 impl Project {
     pub fn uses_msvc(&self) -> bool {
         matches!(self.platform.compiler, Compiler::Msvc | Compiler::ClangCl)
+    }
+
+    /// What the compiler writes for header tracking.
+    pub fn depfile_format(&self) -> DepFormat {
+        DepFormat::of(self.platform.compiler)
     }
 
     /// Reads the manifest and configures everything for this machine.
@@ -361,11 +367,8 @@ impl Project {
 
     pub fn target_depfile_path(&self, target: &str, src: &Path) -> PathBuf {
         let mut name = self.output_stem(target, src).into_os_string();
-        name.push(if self.uses_msvc() {
-            ".obj.json"
-        } else {
-            ".o.d"
-        });
+        name.push(if self.uses_msvc() { ".obj." } else { ".o." });
+        name.push(self.depfile_format().extension());
         self.build_dir().join("dep").join(target).join(name)
     }
 

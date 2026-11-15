@@ -306,7 +306,10 @@ pub fn link_args(
     args.extend(eff.link_flags.iter().cloned());
     if c.profile_scalars.lto {
         if msvc {
-            args.push("/LTCG".to_string());
+            // clang-cl links bitcode with lld, which needs no flag.
+            if compiler == Compiler::Msvc {
+                args.push("/LTCG".to_string());
+            }
         } else {
             args.extend(owned(lto_args(compiler)));
             // clang's LTO on Windows cannot use the MSVC linker.
@@ -342,8 +345,14 @@ pub fn archiver(
     if let Some(ar) = ar_override {
         return Ok(ar.to_string());
     }
-    Ok(if msvc_like(compiler) {
+    Ok(if compiler == Compiler::ClangCl && lto {
+        // lib.exe cannot read the bitcode objects of thin LTO.
+        "llvm-lib"
+    } else if msvc_like(compiler) {
         "lib.exe"
+    } else if compiler == Compiler::Clang && os == Os::Windows {
+        // Windows has no `ar`.
+        "llvm-ar"
     } else if compiler == Compiler::Clang && os != Os::Macos && lto {
         // Thin-LTO bitcode objects need an archiver that understands them.
         "llvm-ar"
@@ -762,6 +771,28 @@ defines = [\"NDEBUG\"]
             "lib.exe"
         );
         assert_eq!(
+            archiver(Compiler::ClangCl, Os::Windows, true, None).unwrap(),
+            "llvm-lib"
+        );
+        for lto in [false, true] {
+            assert_eq!(
+                archiver(Compiler::Clang, Os::Windows, lto, None).unwrap(),
+                "llvm-ar"
+            );
+            assert_eq!(
+                archiver(Compiler::Gcc, Os::Windows, lto, None).unwrap(),
+                "ar"
+            );
+        }
+        assert_eq!(
+            archiver(Compiler::Clang, Os::Windows, true, Some("my-ar")).unwrap(),
+            "my-ar"
+        );
+        assert_eq!(
+            archiver(Compiler::ClangCl, Os::Windows, true, Some("my-lib")).unwrap(),
+            "my-lib"
+        );
+        assert_eq!(
             archiver(Compiler::Clang, Os::Linux, true, Some("my-ar")).unwrap(),
             "my-ar"
         );
@@ -940,6 +971,21 @@ system = [\"opengl\"]
         assert!(!link(linux(Compiler::Clang), "release").contains(&lld));
         assert!(!link(windows(Compiler::Clang), "debug").contains(&lld));
         assert!(!link(windows(Compiler::Gcc), "release").contains(&lld));
+    }
+
+    #[test]
+    fn clang_cl_lto_link_has_no_ltcg() {
+        let src = "[workspace]
+c = \"11\"
+[bin.m]
+sources = [\"m.c\"]
+";
+        let link = |compiler| {
+            let c = build(src, &["m.c"], windows(compiler), Some("release"));
+            link_args(&c, idx(&c, "m"), &artifact_of(&c), &[])
+        };
+        assert_eq!(link(Compiler::ClangCl), Vec::<String>::new());
+        assert_eq!(link(Compiler::Msvc), strs(&["/LTCG"]));
     }
 
     #[test]
