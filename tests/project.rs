@@ -242,24 +242,27 @@ fn only_languages_present_need_a_standard() {
 }
 
 #[test]
-fn system_dependencies_are_not_supported_yet() {
+fn missing_system_dependency_names_both_finders() {
     let f = Fixture::new(
         "[workspace]
 name = \"t\"
 version = \"1\"
 c = \"17\"
-[dependency.glad]
+[dependency.ghost]
 kind = \"system\"
-find = \"glad\"
+find = \"forge-surely-missing-package\"
 [bin.app]
 sources = [\"main.c\"]
-deps = [\"glad\"]
+deps = [\"ghost\"]
 ",
     );
     f.touch("main.c");
     let e = f.error();
     assert!(
-        e.contains("dependency.glad") && e.contains("`system`") && e.contains("not supported yet"),
+        e.contains("dependency.ghost")
+            && e.contains("pkg-config")
+            && e.contains("cmake")
+            && e.contains("forge-surely-missing-package"),
         "{e}"
     );
 }

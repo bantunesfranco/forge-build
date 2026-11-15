@@ -4,6 +4,7 @@ pub mod cmake;
 pub mod git;
 pub mod local;
 pub mod lockfile;
+pub mod system;
 
 use std::path::{Path, PathBuf};
 
@@ -22,6 +23,7 @@ use cmake::build_cmake;
 use git::{checkout, pin};
 use local::prepare_local;
 use lockfile::{LOCK_FILE, Lockfile};
+use system::prepare_system;
 
 /// What an external dependency adds to its public interface once it is ready.
 #[derive(Debug, Default, Clone)]
@@ -52,6 +54,9 @@ pub enum Phase {
 /// under `build/deps/<name>/source` and then prepared like a `path`
 /// dependency. The lockfile is written once every git dependency succeeded.
 ///
+/// A `system` dependency is found by `pkg-config` or CMake in whichever phase
+/// comes first (both need its flags) and added to its public settings.
+///
 /// The local kinds need the same work in both phases and are done after the
 /// first call, so the second call only looks. A `cmake` dependency is only
 /// marked `not_built` in `Phase::Configure` (its own `include` keys still
@@ -80,15 +85,19 @@ pub fn prepare_all(
                 }
                 _ => project.prepared.contains_key(&unit),
             };
-            local && !done
+            (local || kind == DepKind::System) && !done
         })
         .collect();
 
     fetch_git(project, &pending)?;
 
     for unit in pending {
-        if project.configured.units[unit].kind == UnitKind::Dep(DepKind::Cmake) {
+        let kind = project.configured.units[unit].kind;
+        if kind == UnitKind::Dep(DepKind::Cmake) {
             let prepared = prepare_cmake(project, phase, unit, jobs)?;
+            project.prepared.insert(unit, prepared);
+        } else if kind == UnitKind::Dep(DepKind::System) {
+            let prepared = prepare_system(project, unit)?;
             project.prepared.insert(unit, prepared);
         } else if let Some(prepared) = prepare_local(&mut project.configured, &project.root, unit)?
         {

@@ -138,7 +138,6 @@ impl Project {
             return Err(e);
         }
 
-        check_dependencies_are_supported(&configured)?;
         check_standards(&configured)?;
 
         let lto = configured.profile_scalars.lto;
@@ -397,24 +396,6 @@ fn any_source(c: &Configured, lang: Lang) -> bool {
         .filter(|u| matches!(u.kind, UnitKind::Lib | UnitKind::Bin))
         .flat_map(|u| &u.sources)
         .any(|s| Lang::from_path(s) == Some(lang))
-}
-
-/// The local kinds and `cmake` (from a `path` or a `git` checkout) are prepared
-/// by `deps::prepare_all`; `system` belongs to a later task.
-fn check_dependencies_are_supported(c: &Configured) -> Result<(), ConfigError> {
-    for unit in &c.units {
-        let UnitKind::Dep(kind) = unit.kind else {
-            continue;
-        };
-        let field = format!("dependency.{}", unit.name);
-        if kind == DepKind::System {
-            return Err(ConfigError::invalid(
-                field,
-                format!("kind `{}` is not supported yet", kind.as_str()),
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// A language that appears in the sources needs its standard.
