@@ -11,17 +11,33 @@ use crate::{config::ConfigError, lang::Lang};
 /// Results are relative to `root` and always use `/`, so object paths and
 /// command hashes are the same on every OS. They are sorted and deduplicated.
 /// No match is not an error here: the caller names the unit in its message.
+///
+/// The walk skips the project's build root (`<root>/build`) and hidden
+/// directories (`.git`, `.cache`, ...) below `base`, so a glob such as
+/// `**/*.cpp` never picks up dependency checkouts or CMake scratch files.
 pub fn discover_globs(
     root: &Path,
     base: &Path,
     patterns: &[String],
 ) -> Result<Vec<PathBuf>, ConfigError> {
-    let patterns: Vec<String> = patterns.iter().map(|p| p.replace('\\', "/")).collect();
+    let patterns: Vec<String> = patterns
+        .iter()
+        .map(|p| {
+            let p = p.replace('\\', "/");
+            p.strip_prefix("./").unwrap_or(&p).to_string()
+        })
+        .collect();
     let mut found = Vec::new();
     if !base.is_dir() {
         return Ok(found);
     }
-    for entry in WalkDir::new(base) {
+    let build_root = root.join("build");
+    let walk = WalkDir::new(base).into_iter().filter_entry(|e| {
+        e.depth() == 0
+            || !e.file_type().is_dir()
+            || (e.path() != build_root && !e.file_name().to_string_lossy().starts_with('.'))
+    });
+    for entry in walk {
         let entry = entry.map_err(|e| ConfigError::Io {
             path: e.path().unwrap_or(base).to_path_buf(),
             source: e.into(),
@@ -54,6 +70,10 @@ fn glob_match(pattern: &str, path: &str) -> bool {
     fn go(p: &[u8], s: &[u8]) -> bool {
         if p.is_empty() {
             return s.is_empty();
+        }
+        // A trailing `**` matches everything below, like `**/*`.
+        if p == b"**" {
+            return true;
         }
         if p.starts_with(b"**/") {
             return go(&p[3..], s)
@@ -99,6 +119,51 @@ mod tests {
             .collect();
         assert_eq!(got, want);
         assert!(got.iter().all(|p| !p.to_string_lossy().contains('\\')));
+    }
+
+    #[test]
+    fn walk_skips_the_build_root_and_hidden_directories() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path().canonicalize().unwrap();
+        for f in [
+            "src/a.cpp",
+            "build/deps/glm/source/t.cpp",
+            "build/debug/obj/x.cpp",
+            ".git/hooks/h.cpp",
+            "src/.cache/c.cpp",
+            "other/build/b.cpp",
+        ] {
+            touch(&r, f);
+        }
+        let got = discover_globs(&r, &r, &["**/*.cpp".to_string()]).unwrap();
+        let want: Vec<PathBuf> = ["other/build/b.cpp", "src/a.cpp"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_base_inside_the_build_root_is_still_walked() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path().canonicalize().unwrap();
+        touch(&r, "build/deps/glm/source/src/g.cpp");
+        touch(&r, "build/deps/glm/source/.github/x.cpp");
+        let base = r.join("build/deps/glm/source");
+        let got = discover_globs(&r, &base, &["**/*.cpp".to_string()]).unwrap();
+        assert_eq!(got, [PathBuf::from("build/deps/glm/source/src/g.cpp")]);
+    }
+
+    #[test]
+    fn leading_dot_slash_and_trailing_double_star_work() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path().canonicalize().unwrap();
+        touch(&r, "src/a.cpp");
+        touch(&r, "src/sub/b.cpp");
+        let got = discover_globs(&r, &r, &["./src/*.cpp".to_string()]).unwrap();
+        assert_eq!(got, [PathBuf::from("src/a.cpp")]);
+        let got = discover_globs(&r, &r, &["src/**".to_string()]).unwrap();
+        assert_eq!(got.len(), 2);
     }
 
     #[test]
