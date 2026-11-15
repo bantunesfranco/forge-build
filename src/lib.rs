@@ -4,6 +4,7 @@ pub mod config;
 pub mod configure;
 pub mod database;
 pub mod depfile;
+pub mod deps;
 pub mod discover;
 pub mod executor;
 pub mod explain;

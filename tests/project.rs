@@ -242,17 +242,46 @@ fn only_languages_present_need_a_standard() {
 }
 
 #[test]
-fn dependencies_other_than_local_header_only_are_not_supported_yet() {
-    let f = Fixture::new(
-        "[workspace]\nname = \"t\"\nversion = \"1\"\nc = \"17\"\n[dependency.glad]\npath = \"vendor/glad\"\nkind = \"sources\"\nfiles = [\"src/glad.c\"]\n[bin.app]\nsources = [\"main.c\"]\ndeps = [\"glad\"]\n",
-    );
-    f.touch("main.c");
-    f.touch("vendor/glad/src/glad.c");
-    let e = f.error();
-    assert!(
-        e.contains("dependency.glad") && e.contains("`sources`") && e.contains("not supported yet"),
-        "{e}"
-    );
+fn git_cmake_and_system_dependencies_are_not_supported_yet() {
+    for (dep, what) in [
+        (
+            "git = \"https://example.com/glad\"
+rev = \"1\"
+kind = \"cmake\"
+expose = { target = \"glad\" }",
+            "`cmake`",
+        ),
+        (
+            "git = \"https://example.com/glad\"
+rev = \"1\"
+kind = \"header-only\"",
+            "git source",
+        ),
+        (
+            "kind = \"system\"
+find = \"glad\"",
+            "`system`",
+        ),
+    ] {
+        let f = Fixture::new(&format!(
+            "[workspace]
+name = \"t\"
+version = \"1\"
+c = \"17\"
+[dependency.glad]
+{dep}
+[bin.app]
+sources = [\"main.c\"]
+deps = [\"glad\"]
+"
+        ));
+        f.touch("main.c");
+        let e = f.error();
+        assert!(
+            e.contains("dependency.glad") && e.contains(what) && e.contains("not supported yet"),
+            "{e}"
+        );
+    }
 }
 
 #[test]
@@ -303,6 +332,38 @@ fn mixed_c_and_cxx_families_must_agree() {
     );
     f.touch("src/a.c");
     f.touch("src/b.cpp");
+    let e = f
+        .load_with(&f.invocation(), &GccAndClang)
+        .err()
+        .expect("should fail")
+        .to_string();
+    assert!(
+        e.contains("`gcc`") && e.contains("`clang++`") && e.contains("one compiler family"),
+        "{e}"
+    );
+}
+
+#[test]
+fn c_sources_of_a_dependency_need_the_same_compiler_family() {
+    let f = Fixture::with_toolchain(
+        "[workspace]
+name = \"t\"
+version = \"1\"
+c = \"17\"
+cxx = \"20\"
+[dependency.glad]
+path = \"vendor/glad\"
+kind = \"sources\"
+files = [\"src/glad.c\"]
+[bin.app]
+sources = [\"main.cpp\"]
+deps = [\"glad\"]
+",
+        "gcc",
+        "clang++",
+    );
+    f.touch("main.cpp");
+    f.touch("vendor/glad/src/glad.c");
     let e = f
         .load_with(&f.invocation(), &GccAndClang)
         .err()

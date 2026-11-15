@@ -43,7 +43,7 @@ pub fn discover_globs(
 }
 
 /// `path` relative to `root` with `/` separators; unchanged when outside `root`.
-fn slash_relative(root: &Path, path: &Path) -> PathBuf {
+pub fn slash_relative(root: &Path, path: &Path) -> PathBuf {
     match path.strip_prefix(root) {
         Ok(rel) => PathBuf::from(rel.to_string_lossy().replace('\\', "/")),
         Err(_) => path.to_path_buf(),

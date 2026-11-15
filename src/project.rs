@@ -1,7 +1,10 @@
 //! `Project::load`: the whole configure pipeline (spec 11) up to the build
 //! targets, each with its own compile and link arguments.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Component, Path, PathBuf},
+};
 
 use crate::{
     config::{
@@ -11,9 +14,10 @@ use crate::{
     },
     configure::{
         configure,
-        model::{Configured, Invocation, UnitKind, effective},
+        model::{Configured, Invocation, UnitKind, effective, reachable},
         options::{CACHE_FILE, load_cache},
     },
+    deps::{Phase, Prepared, prepare_all},
     executor::Executor,
     flags,
     lang::Lang,
@@ -33,6 +37,8 @@ pub struct Project {
     pub archiver: String,
     pub configured: Configured,
     pub targets: Vec<BuildTarget>,
+    /// What the external dependencies add, by unit index.
+    pub prepared: BTreeMap<usize, Prepared>,
     /// Warnings and infos found while configuring.
     pub diagnostics: Diagnostics,
 }
@@ -110,20 +116,14 @@ impl Project {
         let mut configured = configure(&m, &root, inv, platform, &cache)?;
 
         // A C source needs the C program to agree with the platform compiler.
+        // (`sources` dependencies are checked once their files are found.)
+        let mut c_checked = c_known;
         if any_source(&configured, Lang::C) && !c_known {
+            c_checked = true;
             let c = detect_compiler(exec, &toolchains.c, &root)?;
             if c != compiler {
                 if any_source(&configured, Lang::Cxx) {
-                    return Err(ConfigError::invalid(
-                        "compiler",
-                        format!(
-                            "C compiler `{}` is {} but C++ compiler `{}` is {}; use one compiler family",
-                            toolchains.c,
-                            c.as_str(),
-                            toolchains.cxx,
-                            compiler.as_str()
-                        ),
-                    ));
+                    return Err(family_mismatch(&toolchains, c, compiler));
                 }
                 // Only C is built, so the C compiler is the one that counts.
                 platform.compiler = c;
@@ -160,13 +160,57 @@ impl Project {
             archiver,
             configured,
             targets: Vec::new(),
+            prepared: BTreeMap::new(),
             diagnostics,
         };
-        project.targets = project.build_targets()?;
+        prepare_all(&mut project, Phase::Configure, exec, 1)?;
+        project.check_dependency_languages(exec, c_checked, cxx_failure)?;
+        project.rebuild_targets()?;
         Ok(project)
     }
 
-    /// One target per lib and bin, in unit order, with arguments filled in.
+    /// The language checks of `load` again for the files of `sources`
+    /// dependencies, which are only known once they are prepared. A C file
+    /// needs a C program of the platform compiler's family; a C++ file needs
+    /// a C++ program that runs. There is no reconfiguring here: a mismatch
+    /// found only in dependency sources is an error.
+    fn check_dependency_languages(
+        &self,
+        exec: &dyn Executor,
+        c_checked: bool,
+        cxx_failure: Option<ConfigError>,
+    ) -> Result<(), ConfigError> {
+        let has = |lang| {
+            self.configured
+                .units
+                .iter()
+                .filter(|u| u.kind == UnitKind::Dep(DepKind::Sources))
+                .flat_map(|u| &u.sources)
+                .any(|s| Lang::from_path(s) == Some(lang))
+        };
+        if has(Lang::C) && !c_checked {
+            let c = detect_compiler(exec, &self.toolchains.c, &self.root)?;
+            if c != self.platform.compiler {
+                return Err(family_mismatch(&self.toolchains, c, self.platform.compiler));
+            }
+        }
+        if has(Lang::Cxx)
+            && let Some(e) = cxx_failure
+        {
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Builds `targets` again from the configured units and what the
+    /// dependencies prepared.
+    pub fn rebuild_targets(&mut self) -> Result<(), ConfigError> {
+        self.targets = self.build_targets()?;
+        Ok(())
+    }
+
+    /// One target per lib, bin and `sources` dependency, in unit order, with
+    /// arguments filled in.
     fn build_targets(&self) -> Result<Vec<BuildTarget>, ConfigError> {
         let c = &self.configured;
         let mut targets: Vec<BuildTarget> = Vec::new();
@@ -175,6 +219,7 @@ impl Project {
                 UnitKind::Lib => BuildTargetKind::StaticLibrary,
                 UnitKind::Bin => BuildTargetKind::Binary,
                 UnitKind::InterfaceLib => BuildTargetKind::Interface,
+                UnitKind::Dep(DepKind::Sources) => BuildTargetKind::StaticLibrary,
                 UnitKind::Dep(_) => continue,
             };
             targets.push(BuildTarget {
@@ -221,19 +266,39 @@ impl Project {
             } else {
                 Vec::new()
             };
-            let link = if target.kind == BuildTargetKind::Binary {
-                flags::link_args(c, target.unit, &artifact, &[])
+            let external = if target.kind == BuildTargetKind::Binary {
+                self.external_libs(target.unit)
             } else {
                 Vec::new()
             };
-            filled.push((compile_c, compile_cxx, link));
+            let link = if target.kind == BuildTargetKind::Binary {
+                flags::link_args(c, target.unit, &artifact, &external)
+            } else {
+                Vec::new()
+            };
+            filled.push((compile_c, compile_cxx, link, external));
         }
-        for (target, (compile_c, compile_cxx, link)) in targets.iter_mut().zip(filled) {
+        for (target, (compile_c, compile_cxx, link, external)) in targets.iter_mut().zip(filled) {
             target.compile_c = compile_c;
             target.compile_cxx = compile_cxx;
             target.link = link;
+            target.link_inputs = external;
         }
         Ok(targets)
+    }
+
+    /// The library files of every prebuilt dependency that `unit` reaches,
+    /// consumers first and each once. They are linked, not built here.
+    fn external_libs(&self, unit: usize) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = Vec::new();
+        for dep in reachable(&self.configured, unit) {
+            for file in self.prepared.get(&dep).map_or(&[][..], |p| &p.lib_files) {
+                if !files.contains(file) {
+                    files.push(file.clone());
+                }
+            }
+        }
+        files
     }
 
     // ---- build layout (relative to `root`): one place defines it ----
@@ -242,14 +307,39 @@ impl Project {
         PathBuf::from("build").join(&self.profile)
     }
 
+    /// The part of an object or depfile name that comes from the source path.
+    /// A source inside the project keeps its root-relative path. One that is
+    /// absolute or climbs out of the root (a `path` dependency such as
+    /// `../c-library`) is named relative to its unit's base directory, so no
+    /// build file lands outside `build/`.
+    fn output_stem(&self, target: &str, src: &Path) -> PathBuf {
+        let normal = |c: Component| matches!(c, Component::Normal(_));
+        if src.components().all(normal) {
+            return src.to_path_buf();
+        }
+        let base = self
+            .configured
+            .units
+            .iter()
+            .find(|u| u.name == target)
+            .map(|u| u.base_dir.as_path());
+        if let Some(base) = base
+            && let Ok(rel) = self.root.join(src).strip_prefix(base)
+            && rel.components().all(normal)
+        {
+            return rel.to_path_buf();
+        }
+        src.components().filter(|c| normal(*c)).collect()
+    }
+
     pub fn target_object_path(&self, target: &str, src: &Path) -> PathBuf {
-        let mut name = src.as_os_str().to_owned();
+        let mut name = self.output_stem(target, src).into_os_string();
         name.push(if self.uses_msvc() { ".obj" } else { ".o" });
         self.build_dir().join("obj").join(target).join(name)
     }
 
     pub fn target_depfile_path(&self, target: &str, src: &Path) -> PathBuf {
-        let mut name = src.as_os_str().to_owned();
+        let mut name = self.output_stem(target, src).into_os_string();
         name.push(if self.uses_msvc() {
             ".obj.json"
         } else {
@@ -283,6 +373,19 @@ impl Project {
     }
 }
 
+fn family_mismatch(toolchains: &Toolchains, c: Compiler, platform: Compiler) -> ConfigError {
+    ConfigError::invalid(
+        "compiler",
+        format!(
+            "C compiler `{}` is {} but C++ compiler `{}` is {}; use one compiler family",
+            toolchains.c,
+            c.as_str(),
+            toolchains.cxx,
+            platform.as_str()
+        ),
+    )
+}
+
 fn check_platform(platform: &Platform) -> Result<(), ConfigError> {
     check_combination(platform).map_err(|m| ConfigError::invalid("compiler", m))
 }
@@ -296,8 +399,8 @@ fn any_source(c: &Configured, lang: Lang) -> bool {
         .any(|s| Lang::from_path(s) == Some(lang))
 }
 
-/// Dependencies are prepared by later tasks; only a local `header-only` one
-/// needs nothing beyond its include directories.
+/// The local kinds are prepared by `deps::prepare_all`; the others belong to
+/// later tasks.
 fn check_dependencies_are_supported(c: &Configured) -> Result<(), ConfigError> {
     use crate::config::schema::DepSource;
     for unit in &c.units {
@@ -309,7 +412,10 @@ fn check_dependencies_are_supported(c: &Configured) -> Result<(), ConfigError> {
             .as_ref()
             .is_some_and(|d| matches!(d.source, DepSource::Path(_)));
         let field = format!("dependency.{}", unit.name);
-        if kind != DepKind::HeaderOnly {
+        if !matches!(
+            kind,
+            DepKind::HeaderOnly | DepKind::Sources | DepKind::Prebuilt
+        ) {
             return Err(ConfigError::invalid(
                 field,
                 format!("kind `{}` is not supported yet", kind.as_str()),
@@ -318,7 +424,10 @@ fn check_dependencies_are_supported(c: &Configured) -> Result<(), ConfigError> {
         if !local {
             return Err(ConfigError::invalid(
                 field,
-                "kind `header-only` from a git source is not supported yet",
+                format!(
+                    "kind `{}` from a git source is not supported yet",
+                    kind.as_str()
+                ),
             ));
         }
     }

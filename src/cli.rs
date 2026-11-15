@@ -13,6 +13,7 @@ use crate::{
         model::Invocation,
         options::{CACHE_FILE, load_cache, parse_cli_opt, save_cache},
     },
+    deps::{Phase, prepare_all},
     executor::{Executor, ProcessExecutor},
     explain::explain,
     graph::Graph,
@@ -104,7 +105,7 @@ fn load_project(
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Cli = Cli::parse();
     let manifest: PathBuf = find_manifest(args.manifest.as_deref())?;
-    let project: Project = load_project(&manifest, args.profile, &args.opt, &ProcessExecutor)?;
+    let mut project: Project = load_project(&manifest, args.profile, &args.opt, &ProcessExecutor)?;
     print_diagnostics(&project.diagnostics);
 
     match args.command {
@@ -117,6 +118,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 jobs: jobs.map_or_else(|| BuildOptions::default().jobs, |j| j.get()),
                 verbose,
             };
+
+            // Whatever needs the network or a build system happens now; the
+            // local kinds were prepared when the project was loaded.
+            prepare_all(&mut project, Phase::Build, &ProcessExecutor, opts.jobs)?;
+            project.rebuild_targets()?;
 
             let mut graph: Graph = Graph::from_project(&project)?;
             if let Some(name) = target.as_deref() {
