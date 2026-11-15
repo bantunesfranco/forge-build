@@ -812,6 +812,26 @@ output = \"Tool.exe\"
     }
 
     #[test]
+    fn typos_under_another_platforms_condition_fail_on_every_platform() {
+        for (line, wanted) in [
+            ("defines.linux = [\"${bogus}\"]", "bogus"),
+            ("deps.macos = [\"nosuchdep\"]", "nosuchdep"),
+            ("features.linux = [\"nofeature\"]", "nofeature"),
+        ] {
+            let src = format!(
+                "[lib.a]
+sources = [\"a.c\"]
+{line}
+"
+            );
+            for platform in [WINDOWS, LINUX, MACOS] {
+                let e = err(&src, &["a.c"], platform);
+                assert!(e.contains("lib.a") && e.contains(wanted), "{line}: {e}");
+            }
+        }
+    }
+
+    #[test]
     fn lib_without_sources_or_include_is_error() {
         let e = err("[lib.x]\ndefines = [\"A\"]\n", &[], LINUX);
         assert!(e.contains("lib.x") && e.contains("needs `sources`"), "{e}");

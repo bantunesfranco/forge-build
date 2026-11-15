@@ -7,6 +7,7 @@ pub mod merge;
 pub mod model;
 pub mod options;
 pub mod system_libs;
+pub mod validate;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
@@ -161,6 +162,34 @@ fn push_unique<T: PartialEq>(into: &mut Vec<T>, item: T) {
     }
 }
 
+fn unknown_system_message(name: &str) -> String {
+    format!(
+        "unknown system library `{name}` (logical names: {}); use `system.<os>` for a literal library name",
+        LOGICAL.join(", ")
+    )
+}
+
+fn unknown_feature_message(name: &str, declared: &[&str]) -> String {
+    let declared = if declared.is_empty() {
+        "none".to_string()
+    } else {
+        declared.join(", ")
+    };
+    format!("unknown feature `{name}` (declared features: {declared})")
+}
+
+fn exe_dependency_message(dep: &str) -> String {
+    format!("cannot depend on an executable `{dep}`")
+}
+
+fn logical_dependency_message(dep: &str) -> String {
+    format!("`{dep}` is a system library; move it to `system` (`deps` names libs and dependencies)")
+}
+
+fn unknown_dependency_message(dep: &str) -> String {
+    format!("unknown dependency `{dep}` (not a lib or dependency in this manifest)")
+}
+
 /// True for `system.windows`, `system.public.windows`, ...; false for the
 /// unconditional `system`, `system.public` and `system.private`.
 fn has_condition(raw_key: &str) -> bool {
@@ -252,15 +281,8 @@ impl PathCx<'_> {
                 push_unique(&mut out.system, SystemLib::Lib(name.to_string()));
                 continue;
             }
-            let libs = resolve_logical(name, self.os).ok_or_else(|| {
-                invalid(
-                    s,
-                    format!(
-                        "unknown system library `{name}` (logical names: {}); use `system.<os>` for a literal library name",
-                        LOGICAL.join(", ")
-                    ),
-                )
-            })?;
+            let libs = resolve_logical(name, self.os)
+                .ok_or_else(|| invalid(s, unknown_system_message(name)))?;
             for lib in libs {
                 push_unique(&mut out.system, lib);
             }
@@ -354,14 +376,7 @@ impl<'a> Cx<'a> {
                     let declared: Vec<&str> = self.features.keys().map(String::as_str).collect();
                     return Err(ConfigError::invalid(
                         &s.origin,
-                        format!(
-                            "unknown feature `{name}` (declared features: {})",
-                            if declared.is_empty() {
-                                "none".to_string()
-                            } else {
-                                declared.join(", ")
-                            }
-                        ),
+                        unknown_feature_message(name, &declared),
                     ));
                 }
                 Some(None) => {}
@@ -423,6 +438,7 @@ pub fn configure(
     check_requires(m)?;
     check_standard("c", &m.workspace.c, C_STANDARDS)?;
     check_standard("cxx", &m.workspace.cxx, CXX_STANDARDS)?;
+    validate::validate(m)?;
 
     let options = resolve_options(&m.options, &inv.options, cache, &platform, &mut diags)?;
     let option_values: BTreeMap<String, String> = options
@@ -795,15 +811,7 @@ fn dependency_unit(
         }
     }
 
-    diagnose_dependency(
-        name,
-        decl,
-        &merged,
-        &active,
-        &cx.platform,
-        alias.is_some(),
-        diags,
-    );
+    diagnose_dependency(name, decl, &active, &cx.platform, alias.is_some(), diags);
 
     let owned = |list: &[Sourced]| -> Result<Vec<String>, ConfigError> {
         Ok(strings(list)?.into_iter().map(str::to_string).collect())
@@ -863,7 +871,6 @@ fn warn_abi(name: &str, origin: &str, private: &Settings, diags: &mut Diagnostic
 fn diagnose_dependency(
     name: &str,
     decl: &DependencyDecl,
-    merged: &Merged,
     active: &[&ActiveFeature],
     platform: &Platform,
     has_alias: bool,
@@ -985,26 +992,19 @@ fn check_deps(units: &[Unit]) -> Result<Vec<usize>, ConfigError> {
         for (dep, _) in &u.deps {
             match index.get(dep.as_str()) {
                 Some(&i) if units[i].kind == UnitKind::Bin => {
-                    return Err(ConfigError::invalid(
-                        &origin,
-                        format!("cannot depend on an executable `{dep}`"),
-                    ));
+                    return Err(ConfigError::invalid(&origin, exe_dependency_message(dep)));
                 }
                 Some(&i) => out.push(i),
                 None if LOGICAL.contains(&dep.as_str()) => {
                     return Err(ConfigError::invalid(
                         &origin,
-                        format!(
-                            "`{dep}` is a system library; move it to `system` (`deps` names libs and dependencies)"
-                        ),
+                        logical_dependency_message(dep),
                     ));
                 }
                 None => {
                     return Err(ConfigError::invalid(
                         &origin,
-                        format!(
-                            "unknown dependency `{dep}` (not a lib or dependency in this manifest)"
-                        ),
+                        unknown_dependency_message(dep),
                     ));
                 }
             }

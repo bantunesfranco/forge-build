@@ -328,7 +328,8 @@ fn explain_shows_option_sources() {
     // the feature of the variant that is no longer selected has gone
     assert!(!t.contains("GLM_FORCE_AVX2"), "{t}");
 
-    f.write("build/options.toml", "simd = \"none\"\n");
+    // A `--target` build keeps its cache in the target's directory.
+    f.write("build/x86_64-windows/options.toml", "simd = \"none\"\n");
     let t = explain_config(&config_project(&f), "engine").unwrap();
     assert!(t.contains("simd = none (cache)"), "{t}");
     // dependencies have no option block
