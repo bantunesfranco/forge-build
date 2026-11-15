@@ -1,26 +1,23 @@
-edition = "2026"
-
-[package]
-name = "dependencies"
+[workspace]
+name    = "dependencies"
 version = "0.1.0"
-
-[lang]
-c = "c17"
+c       = "17"
 
 [profile.debug]
-opt_level = 0
+opt        = "none"
 debug_info = true
 
 [profile.release]
-opt_level = 2
+opt        = "speed"
 debug_info = false
 
-[dependencies.math_utils]
-path = "../c-library"
-resolve = ["source"]
-build = { type = "sources", files = ["src/math_utils.c"] }
-expose = { include = ["include"], lib_dirs = ["lib"], libs = ["math_utils", "m"] }
+[dependency.math_utils]
+path           = "../c-library"
+kind           = "sources"
+files          = ["src/math_utils.c"]
+include.public = ["include"]
+system.public  = ["math"]
 
 [bin.dependencies]
 sources = ["src/main.c"]
-deps = ["math_utils"]
+deps    = ["math_utils"]

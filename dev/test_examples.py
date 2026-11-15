@@ -356,9 +356,7 @@ def main() -> int:
             test_c_library(temp_root)
             test_cpp_profiles(temp_root)
             test_mixed_language(temp_root)
-            # The `dependencies` example still uses the removed format and is
-            # skipped until it is migrated to project.toml.
-            # test_dependencies(temp_root)
+            test_dependencies(temp_root)
 
     except (IntegrationTestFailure, OSError) as error:
         print(f"\n[FAIL] {error}", file=sys.stderr)
