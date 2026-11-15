@@ -12,7 +12,7 @@ use serde_json::Value;
 use crate::{
     config::{
         schema::DepSource,
-        vocab::{Compiler, Os},
+        vocab::{Compiler, Os, Platform},
     },
     configure::model::{Configured, IncludeDir},
     deps::{Prepared, git},
@@ -46,13 +46,15 @@ pub struct CmakeTarget {
 /// per-config flag variables replace CMake's own defaults (spec 8.1), so the
 /// profile alone decides the optimization of a dependency. `compilers` is
 /// `None` for MSVC, which CMake finds itself; `msvc_runtime` is only given
-/// for MSVC-like compilers. `options` come last so they win.
+/// for MSVC-like compilers. `platform_args` (see `platform_args`) follow the
+/// compilers; `options` come last so they win.
 #[allow(clippy::too_many_arguments)]
 pub fn configure_args(
     src: &Path,
     build: &Path,
     build_type: &str,
     compilers: Option<(&str, &str)>,
+    platform_args: &[String],
     flags_c: &[String],
     flags_cxx: &[String],
     msvc_runtime: Option<&str>,
@@ -69,6 +71,7 @@ pub fn configure_args(
         args.push(format!("-DCMAKE_C_COMPILER={c}"));
         args.push(format!("-DCMAKE_CXX_COMPILER={cxx}"));
     }
+    args.extend(platform_args.iter().cloned());
     let config = build_type.to_ascii_uppercase();
     args.push(format!("-DCMAKE_C_FLAGS_{config}={}", flags_c.join(" ")));
     args.push(format!(
@@ -80,6 +83,30 @@ pub fn configure_args(
         args.push(format!("-DCMAKE_MSVC_RUNTIME_LIBRARY={runtime}"));
     }
     args.extend(options.iter().map(|(k, v)| format!("-D{k}={v}")));
+    args
+}
+
+/// What tells CMake it is cross-compiling: the target system, and for clang
+/// the triple of both compilers. Empty unless `--target` names a platform
+/// other than the host's (`cross_triple` is set only then).
+fn platform_args(platform: Platform, cross_triple: Option<&str>) -> Vec<String> {
+    let Some(triple) = cross_triple else {
+        return Vec::new();
+    };
+    let system = match platform.os {
+        Os::Windows => "Windows",
+        Os::Linux => "Linux",
+        Os::Macos => "Darwin",
+        Os::Bsd => "FreeBSD",
+    };
+    let mut args = vec![
+        format!("-DCMAKE_SYSTEM_NAME={system}"),
+        format!("-DCMAKE_SYSTEM_PROCESSOR={}", platform.arch.as_str()),
+    ];
+    if matches!(platform.compiler, Compiler::Clang | Compiler::ClangCl) {
+        args.push(format!("-DCMAKE_C_COMPILER_TARGET={triple}"));
+        args.push(format!("-DCMAKE_CXX_COMPILER_TARGET={triple}"));
+    }
     args
 }
 
@@ -340,6 +367,7 @@ pub fn build_cmake(
         &build,
         build_type,
         compilers,
+        &platform_args(c.platform, c.cross_triple.as_deref()),
         &profile_args(c, Lang::C),
         &profile_args(c, Lang::Cxx),
         runtime,
@@ -446,6 +474,7 @@ mod tests {
             Path::new("/b"),
             "RelWithDebInfo",
             Some(("cc", "c++")),
+            &[],
             &s(&["-O2", "-g"]),
             &s(&["-O2", "-g", "-flto"]),
             None,
@@ -473,6 +502,7 @@ mod tests {
             Path::new("/b"),
             "Debug",
             None,
+            &[],
             &s(&["/Od"]),
             &s(&["/Od"]),
             Some("MultiThreadedDebugDLL"),
@@ -487,6 +517,56 @@ mod tests {
                 .iter()
                 .any(|a| a.contains("CMP0091") || a.contains("MSVC_RUNTIME"))
         );
+    }
+
+    #[test]
+    fn cross_builds_tell_cmake_the_target_system() {
+        use crate::config::vocab::Arch;
+        let p = |os, arch, compiler| Platform { os, arch, compiler };
+        let triple = Some("arm64-apple-macos");
+
+        // Not cross-compiling: nothing.
+        assert!(platform_args(p(Os::Linux, Arch::X86_64, Compiler::Clang), None).is_empty());
+
+        let clang = platform_args(p(Os::Macos, Arch::Arm64, Compiler::Clang), triple);
+        assert_eq!(
+            clang,
+            s(&[
+                "-DCMAKE_SYSTEM_NAME=Darwin",
+                "-DCMAKE_SYSTEM_PROCESSOR=arm64",
+                "-DCMAKE_C_COMPILER_TARGET=arm64-apple-macos",
+                "-DCMAKE_CXX_COMPILER_TARGET=arm64-apple-macos",
+            ])
+        );
+        // gcc names its cross compiler in the toolchain file: no triple.
+        let gcc = platform_args(p(Os::Linux, Arch::Arm, Compiler::Gcc), Some("armv7-x"));
+        assert_eq!(
+            gcc,
+            s(&["-DCMAKE_SYSTEM_NAME=Linux", "-DCMAKE_SYSTEM_PROCESSOR=arm"])
+        );
+        let win = platform_args(p(Os::Windows, Arch::X86, Compiler::ClangCl), Some("i686-x"));
+        assert_eq!(win[0], "-DCMAKE_SYSTEM_NAME=Windows");
+        assert_eq!(win[1], "-DCMAKE_SYSTEM_PROCESSOR=x86");
+        let bsd = platform_args(p(Os::Bsd, Arch::X86_64, Compiler::Gcc), Some("x"));
+        assert_eq!(bsd[0], "-DCMAKE_SYSTEM_NAME=FreeBSD");
+
+        // They sit between the compilers and the flags, before the options.
+        let mut options = BTreeMap::new();
+        options.insert("X".to_string(), "1".to_string());
+        let args = configure_args(
+            Path::new("/src"),
+            Path::new("/b"),
+            "Debug",
+            Some(("cc", "c++")),
+            &clang,
+            &[],
+            &[],
+            None,
+            &options,
+        );
+        let at = |what: &str| args.iter().position(|a| a == what).unwrap();
+        assert!(at("-DCMAKE_CXX_COMPILER=c++") < at("-DCMAKE_SYSTEM_NAME=Darwin"));
+        assert!(at("-DCMAKE_CXX_COMPILER_TARGET=arm64-apple-macos") < at("-DX=1"));
     }
 
     #[test]

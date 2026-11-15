@@ -123,6 +123,9 @@ pub struct Unit {
 #[derive(Debug)]
 pub struct Configured {
     pub platform: Platform,
+    /// The LLVM triple of the target platform, set only when `--target` names
+    /// a platform other than the host's.
+    pub cross_triple: Option<String>,
     pub profile: String,
     pub profile_scalars: ProfileScalars,
     /// The profile's `defines` and `flags` (both visibilities); these apply to

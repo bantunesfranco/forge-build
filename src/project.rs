@@ -21,7 +21,9 @@ use crate::{
     executor::Executor,
     flags,
     lang::Lang,
-    platform::{Toolchains, check_combination, detect_compiler, host_os_arch, load_toolchains},
+    platform::{
+        Toolchains, check_combination, detect_compiler, host_os_arch, load_toolchains, parse_target,
+    },
 };
 
 /// A validated, configured project: one build target per lib and bin, each
@@ -95,8 +97,11 @@ impl Project {
             })?;
         let m = config::load(manifest)?;
 
-        // The platform. `--target` belongs to a later task; the host is the target.
-        let (os, arch) = host_os_arch()?;
+        // The platform: `--target` names it, otherwise the host is the target.
+        let (os, arch) = match inv.target.as_deref() {
+            Some(t) => parse_target(t).map_err(|m| ConfigError::invalid("--target", m))?,
+            None => host_os_arch()?,
+        };
         let toolchains = load_toolchains(inv.toolchain.as_deref())?;
 
         // Configure needs the compiler to evaluate conditions, and sources are
@@ -302,8 +307,25 @@ impl Project {
 
     // ---- build layout (relative to `root`): one place defines it ----
 
+    /// Everything forge builds lives below this directory.
+    pub fn build_root(&self) -> PathBuf {
+        PathBuf::from("build")
+    }
+
+    /// `build/<profile>`, or `build/<arch>-<os>/<profile>` when `--target`
+    /// was given, so builds for different platforms never mix.
     pub fn build_dir(&self) -> PathBuf {
-        PathBuf::from("build").join(&self.profile)
+        let root = self.build_root();
+        if self.target_override {
+            let target = format!(
+                "{}-{}",
+                self.platform.arch.as_str(),
+                self.platform.os.as_str()
+            );
+            root.join(target).join(&self.profile)
+        } else {
+            root.join(&self.profile)
+        }
     }
 
     /// The part of an object or depfile name that comes from the source path.

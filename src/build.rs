@@ -10,7 +10,7 @@ use std::{
 use crate::{
     database::{self, Database, FileState, Snapshot, TaskRecord},
     executor::{CommandSpec, Executor, Outcome, path_arg},
-    fingerprint,
+    fingerprint, flags,
     graph::{Graph, Task, TaskId, TaskKind},
     headers,
     lang::Lang,
@@ -118,6 +118,8 @@ pub fn command_for(task: &Task, project: &Project) -> CommandSpec {
         TaskKind::Link => {
             let mut args: Vec<String> = objects().collect();
             if msvc {
+                // clang-cl picks its target before the linker options start.
+                args.extend(flags::target_arg(&project.configured));
                 args.push("/nologo".to_string());
                 args.push("/link".to_string());
                 args.extend(target.link.iter().cloned());

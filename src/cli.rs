@@ -34,6 +34,16 @@ struct Cli {
     #[arg(long = "opt", value_name = "NAME=VALUE", global = true, action = ArgAction::Append)]
     opt: Vec<String>,
 
+    /// Build for this platform instead of the host (`<arch>-<os>`, e.g. arm64-macos).
+    /// Output goes to build/<arch>-<os>/<profile>.
+    // Named apart from the positional `target` of build, graph and explain.
+    #[arg(long = "target", value_name = "ARCH-OS", global = true)]
+    platform_target: Option<String>,
+
+    /// A toolchain file naming the compilers (`[toolchain]` with c, cxx, ar)
+    #[arg(long, value_name = "FILE", global = true)]
+    toolchain: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -82,18 +92,19 @@ fn print_diagnostics(diagnostics: &Diagnostics) {
 /// option cache once configure accepted them, so later runs reuse them.
 fn load_project(
     manifest: &Path,
-    profile: Option<String>,
-    opts: &[String],
+    args: &Cli,
     exec: &dyn Executor,
 ) -> Result<Project, Box<dyn std::error::Error>> {
-    let options = opts
+    let options = args
+        .opt
         .iter()
         .map(|o| parse_cli_opt(o).map_err(|m| ConfigError::invalid("--opt", m)))
         .collect::<Result<Vec<_>, _>>()?;
     let inv = Invocation {
-        profile,
+        profile: args.profile.clone(),
         options,
-        ..Invocation::default()
+        target: args.platform_target.clone(),
+        toolchain: args.toolchain.clone(),
     };
     let project = Project::load(manifest, &inv, exec)?;
     if !inv.options.is_empty() {
@@ -113,7 +124,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(Commands::Update { dep }) = &args.command {
         return update(&manifest, dep.as_deref());
     }
-    let mut project: Project = load_project(&manifest, args.profile, &args.opt, &ProcessExecutor)?;
+    let mut project: Project = load_project(&manifest, &args, &ProcessExecutor)?;
     print_diagnostics(&project.diagnostics);
 
     match args.command {
@@ -150,14 +161,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", graph.render(dot));
         }
         Some(Commands::Clean { all }) => {
-            let mut dir: PathBuf = project.build_dir();
-            if all {
-                if let Some(parent) = dir.parent() {
-                    dir = parent.to_path_buf();
-                } else {
-                    return Err("Could not find the root build directory".into());
-                }
-            }
+            // `--all` removes every profile and every target.
+            let dir: PathBuf = if all {
+                project.build_root()
+            } else {
+                project.build_dir()
+            };
 
             let abs = project.root.join(&dir);
 
@@ -238,6 +247,10 @@ mod tests {
         "[bin.app]\nsources = [\"a.c\"]\n",
     );
 
+    fn cli(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("forge").chain(args.iter().copied())).unwrap()
+    }
+
     fn project_dir() -> (tempfile::TempDir, PathBuf) {
         let t = tempfile::tempdir().unwrap();
         let root = t.path().canonicalize().unwrap();
@@ -252,19 +265,19 @@ mod tests {
         let manifest = root.join("project.toml");
         let level = |p: &Project| p.configured.options["level"].clone();
 
-        let p = load_project(&manifest, None, &["level=high".into()], &Clang).unwrap();
+        let p = load_project(&manifest, &cli(&["--opt", "level=high"]), &Clang).unwrap();
         assert_eq!(level(&p).value.to_string(), "high");
         assert_eq!(level(&p).source, OptionSource::Cli);
         let cache = fs::read_to_string(root.join(CACHE_FILE)).unwrap();
         assert!(cache.contains("level = \"high\""), "{cache}");
 
         // no `--opt` this time: the cached value is used
-        let p = load_project(&manifest, None, &[], &Clang).unwrap();
+        let p = load_project(&manifest, &cli(&[]), &Clang).unwrap();
         assert_eq!(level(&p).value.to_string(), "high");
         assert_eq!(level(&p).source, OptionSource::Cache);
 
         // a new value replaces the cached one
-        let p = load_project(&manifest, None, &["level=low".into()], &Clang).unwrap();
+        let p = load_project(&manifest, &cli(&["--opt", "level=low"]), &Clang).unwrap();
         assert_eq!(level(&p).value.to_string(), "low");
         let cache = fs::read_to_string(root.join(CACHE_FILE)).unwrap();
         assert!(
@@ -278,8 +291,7 @@ mod tests {
         let (_t, root) = project_dir();
         let e = load_project(
             &root.join("project.toml"),
-            None,
-            &["level=medium".into()],
+            &cli(&["--opt", "level=medium"]),
             &Clang,
         )
         .err()
@@ -306,10 +318,72 @@ mod tests {
     #[test]
     fn a_malformed_opt_is_an_error() {
         let (_t, root) = project_dir();
-        let e = load_project(&root.join("project.toml"), None, &["level".into()], &Clang)
-            .err()
-            .expect("no value")
-            .to_string();
+        let e = load_project(
+            &root.join("project.toml"),
+            &cli(&["--opt", "level"]),
+            &Clang,
+        )
+        .err()
+        .expect("no value")
+        .to_string();
         assert!(e.contains("--opt"), "{e}");
+    }
+
+    #[test]
+    fn target_and_toolchain_are_global_flags() {
+        // `--target` coexists with the positional target of `build`, before
+        // or after the subcommand.
+        let a = cli(&["--target", "arm64-macos", "build", "app"]);
+        assert_eq!(a.platform_target.as_deref(), Some("arm64-macos"));
+        let Some(Commands::Build { target, .. }) = a.command else {
+            panic!("expected build");
+        };
+        assert_eq!(target.as_deref(), Some("app"));
+
+        let a = cli(&[
+            "build",
+            "app",
+            "--target",
+            "x86_64-linux",
+            "--toolchain",
+            "t.toml",
+        ]);
+        assert_eq!(a.platform_target.as_deref(), Some("x86_64-linux"));
+        assert_eq!(a.toolchain, Some(PathBuf::from("t.toml")));
+        assert!(cli(&["graph"]).platform_target.is_none());
+    }
+
+    #[test]
+    fn only_one_axis_is_rejected() {
+        let (_t, root) = project_dir();
+        let e = load_project(
+            &root.join("project.toml"),
+            &cli(&["--target", "arm64"]),
+            &Clang,
+        )
+        .err()
+        .expect("one axis is not a target")
+        .to_string();
+        assert!(e.contains("<arch>-<os>"), "{e}");
+    }
+
+    #[test]
+    fn target_and_toolchain_reach_the_project() {
+        let (_t, root) = project_dir();
+        fs::write(
+            root.join("tc.toml"),
+            "[toolchain]\nc = \"my-cc\"\ncxx = \"my-c++\"\n",
+        )
+        .unwrap();
+        let a = cli(&[
+            "--target",
+            "arm64-macos",
+            "--toolchain",
+            root.join("tc.toml").to_str().unwrap(),
+        ]);
+        let p = load_project(&root.join("project.toml"), &a, &Clang).unwrap();
+        assert_eq!(p.toolchains.c, "my-cc");
+        assert_eq!(p.build_dir(), PathBuf::from("build/arm64-macos/debug"));
+        assert_eq!(p.build_root(), PathBuf::from("build"));
     }
 }

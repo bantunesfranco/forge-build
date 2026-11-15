@@ -151,6 +151,18 @@ fn profile_defines(c: &Configured) -> Vec<Define> {
     defines
 }
 
+/// `--target=<triple>` for the compilers that choose their target by flag
+/// (clang, clang-cl), when the build is for a platform other than the host's.
+/// gcc, Apple clang and MSVC get their cross compilers from the toolchain file.
+pub fn target_arg(c: &Configured) -> Option<String> {
+    match c.platform.compiler {
+        Compiler::Clang | Compiler::ClangCl => {
+            c.cross_triple.as_ref().map(|t| format!("--target={t}"))
+        }
+        _ => None,
+    }
+}
+
 /// Compile arguments for a lib, a bin, or a `sources` dependency, in the one
 /// fixed order that keeps command hashes stable.
 pub fn compile_args(c: &Configured, unit: usize, lang: Lang) -> Result<Vec<String>, ConfigError> {
@@ -170,6 +182,7 @@ pub fn compile_args(c: &Configured, unit: usize, lang: Lang) -> Result<Vec<Strin
     let eff = effective(c, unit);
     let scalars = &c.profile_scalars;
     let mut args: Vec<String> = Vec::new();
+    args.extend(target_arg(c));
 
     let (key, std) = match lang {
         Lang::C => ("c", c.c_std.as_deref()),
@@ -260,6 +273,11 @@ pub fn link_args(
     let eff = effective(c, unit);
     let u = &c.units[unit];
     let mut args: Vec<String> = Vec::new();
+    // clang-cl's link line is all linker options (after `/link`), where the
+    // triple does not belong: `build::command_for` puts it before `/link`.
+    if !msvc {
+        args.extend(target_arg(c));
+    }
 
     for lib in &eff.link_units {
         args.push(path_arg(&artifact(*lib)));
@@ -343,6 +361,7 @@ pub fn profile_args(c: &Configured, _lang: Lang) -> Vec<String> {
     let msvc = msvc_like(compiler);
     let scalars = &c.profile_scalars;
     let mut args: Vec<String> = Vec::new();
+    args.extend(target_arg(c));
     args.extend(owned(opt_args(msvc, scalars.opt)));
     if scalars.debug_info {
         args.push(debug_arg(msvc).to_string());
@@ -965,6 +984,51 @@ system = [\"opengl\"]
             link_args(&c5, idx(&c5, "m"), &artifact_of(&c5), &[]),
             strs(&["-framework", "OpenGL"])
         );
+    }
+
+    #[test]
+    fn cross_triple_only_for_clang_and_clang_cl() {
+        let src = "[workspace]\nc = \"11\"\n[bin.m]\nsources = [\"m.c\"]\n";
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().canonicalize().unwrap();
+        std::fs::write(root.join("m.c"), "").unwrap();
+        let m = parse_manifest(parse_flat(src).unwrap()).unwrap();
+        let cross = |platform: Platform| {
+            let mut c = configure(
+                &m,
+                &root,
+                &Invocation::default(),
+                platform,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            c.cross_triple = Some("TRIPLE".to_string());
+            c
+        };
+        let want = "--target=TRIPLE".to_string();
+        for (platform, expect) in [
+            (linux(Compiler::Clang), true),
+            (windows(Compiler::ClangCl), true),
+            (linux(Compiler::Gcc), false),
+            (plat(Os::Macos, Compiler::AppleClang), false),
+            (windows(Compiler::Msvc), false),
+        ] {
+            let c = cross(platform);
+            let m = idx(&c, "m");
+            let compile = compile_args(&c, m, Lang::C).unwrap();
+            let link = link_args(&c, m, &artifact_of(&c), &[]);
+            let profile = profile_args(&c, Lang::C);
+            assert_eq!(compile.contains(&want), expect, "{platform:?}: {compile:?}");
+            assert_eq!(profile.contains(&want), expect, "{platform:?}: {profile:?}");
+            // clang-cl's link line is linker options: the triple goes before `/link`.
+            let in_link = expect && platform.compiler == Compiler::Clang;
+            assert_eq!(link.contains(&want), in_link, "{platform:?}: {link:?}");
+            assert_eq!(target_arg(&c).is_some(), expect);
+        }
+        // Not cross-compiling: nothing, even for clang.
+        let mut c = cross(linux(Compiler::Clang));
+        c.cross_triple = None;
+        assert!(target_arg(&c).is_none());
     }
 
     #[test]

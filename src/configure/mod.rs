@@ -20,6 +20,7 @@ use crate::config::{
     vocab::{Os, Platform},
 };
 use crate::discover::discover_globs;
+use crate::platform::{host_os_arch, llvm_triple};
 use features::{ActiveFeature, select_features};
 use lookup::{Alias, LookupCtx, uses_platform_lookup};
 use merge::{Layer, Merged, Sourced, merge};
@@ -589,8 +590,13 @@ pub fn configure(
     }
 
     let link_order = check_deps(&units)?;
+    // A build for a platform other than the host's has to say so to the compiler.
+    let cross_triple = (inv.target.is_some()
+        && host_os_arch().is_ok_and(|host| host != (platform.os, platform.arch)))
+    .then(|| llvm_triple(platform.os, platform.arch));
     Ok(Configured {
         platform,
+        cross_triple,
         profile,
         profile_scalars,
         profile_settings,
