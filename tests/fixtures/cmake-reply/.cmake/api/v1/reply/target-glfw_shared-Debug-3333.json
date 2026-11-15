@@ -1,0 +1,7 @@
+{
+  "name": "glfw_shared",
+  "id": "glfw_shared::@a",
+  "type": "SHARED_LIBRARY",
+  "artifacts": [ { "path": "src/glfw3.dll" }, { "path": "src/glfw3dll.lib" }, { "path": "src/glfw3.pdb" } ],
+  "dependencies": [ { "id": "glfw_util::@a" } ]
+}

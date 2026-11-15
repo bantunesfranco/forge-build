@@ -17,7 +17,7 @@ use crate::{
     configure::model::{Configured, IncludeDir},
     deps::{Prepared, git},
     executor::path_arg,
-    flags::{cmake_build_type, profile_args},
+    flags::{archiver, cmake_build_type, profile_args},
     lang::Lang,
     platform::Toolchains,
 };
@@ -28,6 +28,7 @@ const HASH_FILE: &str = "forge-configure.hash";
 const QUERY: &str = ".cmake/api/v1/query/codemodel-v2";
 const REPLY_DIR: &str = ".cmake/api/v1/reply";
 const STATIC: &str = "STATIC_LIBRARY";
+const INTERFACE: &str = "INTERFACE_LIBRARY";
 
 /// One target of the CMake build, as the File API reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,14 +47,16 @@ pub struct CmakeTarget {
 /// per-config flag variables replace CMake's own defaults (spec 8.1), so the
 /// profile alone decides the optimization of a dependency. `compilers` is
 /// `None` for MSVC, which CMake finds itself; `msvc_runtime` is only given
-/// for MSVC-like compilers. `platform_args` (see `platform_args`) follow the
-/// compilers; `options` come last so they win.
+/// for MSVC-like compilers. `tool_args` (generator and archiver, see
+/// `generator_args` and `archiver_args`) and `platform_args` (see
+/// `platform_args`) follow the compilers; `options` come last so they win.
 #[allow(clippy::too_many_arguments)]
 pub fn configure_args(
     src: &Path,
     build: &Path,
     build_type: &str,
     compilers: Option<(&str, &str)>,
+    tool_args: &[String],
     platform_args: &[String],
     flags_c: &[String],
     flags_cxx: &[String],
@@ -71,6 +74,7 @@ pub fn configure_args(
         args.push(format!("-DCMAKE_C_COMPILER={c}"));
         args.push(format!("-DCMAKE_CXX_COMPILER={cxx}"));
     }
+    args.extend(tool_args.iter().cloned());
     args.extend(platform_args.iter().cloned());
     let config = build_type.to_ascii_uppercase();
     args.push(format!("-DCMAKE_C_FLAGS_{config}={}", flags_c.join(" ")));
@@ -84,6 +88,112 @@ pub fn configure_args(
     }
     args.extend(options.iter().map(|(k, v)| format!("-D{k}={v}")));
     args
+}
+
+/// What decides the CMake generator, read from the machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeneratorEnv {
+    /// `CMAKE_GENERATOR` is set (and not empty): CMake obeys it by itself.
+    pub env_set: bool,
+    /// `ninja --version` runs.
+    pub ninja: bool,
+    /// forge runs on Windows.
+    pub windows_host: bool,
+}
+
+impl GeneratorEnv {
+    fn probe() -> GeneratorEnv {
+        GeneratorEnv {
+            env_set: std::env::var_os("CMAKE_GENERATOR").is_some_and(|v| !v.is_empty()),
+            ninja: Command::new("ninja")
+                .arg("--version")
+                .stdin(Stdio::null())
+                .output()
+                .is_ok_and(|o| o.status.success()),
+            windows_host: cfg!(windows),
+        }
+    }
+}
+
+/// The `-G`/`-T` arguments that make CMake build `dep` with the compiler forge
+/// selected. CMake's default on Windows is a Visual Studio generator, which
+/// takes the compiler from its toolset and ignores `CMAKE_C_COMPILER`, so the
+/// generator is chosen here: `CMAKE_GENERATOR` wins, then Ninja, then what the
+/// compiler needs on Windows. Elsewhere CMake's default (Makefiles) follows
+/// `CMAKE_C_COMPILER`.
+pub fn generator_args(
+    dep: &str,
+    compiler: Compiler,
+    env: GeneratorEnv,
+) -> Result<Vec<String>, String> {
+    let args = |v: &[&str]| v.iter().map(|a| a.to_string()).collect();
+    if env.env_set {
+        return Ok(Vec::new());
+    }
+    if env.ninja {
+        return Ok(args(&["-G", "Ninja"]));
+    }
+    if !env.windows_host {
+        return Ok(Vec::new());
+    }
+    match compiler {
+        Compiler::ClangCl => Ok(args(&["-T", "ClangCL"])),
+        Compiler::Gcc => Ok(args(&["-G", "MinGW Makefiles"])),
+        Compiler::Clang => Err(format!(
+            "building cmake dependency {dep} with clang on Windows needs Ninja (install it or set CMAKE_GENERATOR)"
+        )),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Tells CMake which archiver forge uses when it is an LLVM one: thin-LTO
+/// bitcode objects need `llvm-ar` (and its ranlib) or `llvm-lib`, which CMake
+/// would not pick by itself. CMake reads a bare program name as a path below
+/// its working directory, so `find` resolves the program to a full path.
+pub fn archiver_args(
+    archiver: &str,
+    find: &dyn Fn(&str) -> Option<PathBuf>,
+) -> Result<Vec<String>, String> {
+    let name = Path::new(archiver)
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or(archiver);
+    let locate = |program: &str| {
+        find(program).ok_or_else(|| {
+            format!(
+                "cannot find `{program}`, which CMake must archive with (install the LLVM tools)"
+            )
+        })
+    };
+    let mut args = Vec::new();
+    match name {
+        "llvm-ar" => {
+            args.push(format!("-DCMAKE_AR={}", slashed(&locate(archiver)?)));
+            args.push(format!(
+                "-DCMAKE_RANLIB={}",
+                slashed(&locate("llvm-ranlib")?)
+            ));
+        }
+        "llvm-lib" => args.push(format!("-DCMAKE_AR={}", slashed(&locate(archiver)?))),
+        _ => {}
+    }
+    Ok(args)
+}
+
+/// The file that running `program` would start: a path as given, or the first
+/// match on `PATH` (with `.exe` on Windows).
+fn find_program(program: &str) -> Option<PathBuf> {
+    let path = Path::new(program);
+    if path.components().count() > 1 {
+        return std::path::absolute(path).ok().filter(|p| p.is_file());
+    }
+    let suffixes: &[&str] = if cfg!(windows) { &[".exe", ""] } else { &[""] };
+    std::env::split_paths(&std::env::var_os("PATH")?).find_map(|dir| {
+        suffixes
+            .iter()
+            .map(|suffix| dir.join(format!("{program}{suffix}")))
+            .find(|candidate| candidate.is_file())
+    })
 }
 
 /// What tells CMake it is cross-compiling: the target system, and for clang
@@ -208,10 +318,23 @@ fn read_reply_for(build: &Path, config: Option<&str>) -> Result<Vec<CmakeTarget>
     Ok(targets)
 }
 
+/// Why a target of this `kind` cannot be linked into a bin, or `None` when it
+/// can (static libraries, and interface libraries which add includes only).
+fn not_linkable(name: &str, kind: &str) -> Option<String> {
+    (kind != STATIC && kind != INTERFACE).then(|| {
+        format!(
+            "target `{name}` is a {kind}, not a static library; set BUILD_SHARED_LIBS=OFF or expose a static target"
+        )
+    })
+}
+
 /// The library files and include directories of the targets `names`: each
 /// target's artifacts, then those of the static libraries it depends on
 /// (transitively), every file once, exposed targets first. Paths are as the
-/// reply wrote them.
+/// reply wrote them. An exposed target must be a static (or interface)
+/// library, and so must every library it pulls in: forge links static
+/// archives only, so a shared library is an error. Other kinds of dependency
+/// (custom targets, code generators) are build-order only and skipped.
 pub fn exposed(
     targets: &[CmakeTarget],
     names: &[String],
@@ -233,6 +356,9 @@ pub fn exposed(
                 available.into_iter().collect::<Vec<_>>().join(", ")
             ));
         };
+        if let Some(message) = not_linkable(&target.name, &target.kind) {
+            return Err(message);
+        }
         for include in &target.includes {
             if !includes.contains(include) {
                 includes.push(include.clone());
@@ -249,13 +375,18 @@ pub fn exposed(
                     libs.push(artifact.clone());
                 }
             }
-            stack.extend(
-                t.deps
-                    .iter()
-                    .rev()
-                    .filter_map(|d| find(d))
-                    .filter(|d| d.kind == STATIC),
-            );
+            let mut next = Vec::new();
+            for dep in t.deps.iter().filter_map(|d| find(d)) {
+                match dep.kind.as_str() {
+                    STATIC | INTERFACE => next.push(dep),
+                    "SHARED_LIBRARY" | "MODULE_LIBRARY" => {
+                        let why = not_linkable(&dep.name, &dep.kind).unwrap_or_default();
+                        return Err(format!("{why} (`{}` depends on it)", t.name));
+                    }
+                    _ => {}
+                }
+            }
+            stack.extend(next.into_iter().rev());
         }
     }
     Ok((libs, includes))
@@ -342,6 +473,25 @@ fn cmake_runtime(compiler: Compiler, os: Os, build_type: &str) -> Option<&'stati
     }
 }
 
+/// Forgets what an earlier configure cached in `build`, so every cache
+/// variable is back to its default: a removed `options` entry must not stay in
+/// effect, and a new generator must not meet the old one's cache.
+fn reset_configuration(build: &Path) -> std::io::Result<()> {
+    for (path, dir) in [("CMakeCache.txt", false), ("CMakeFiles", true)] {
+        let path = build.join(path);
+        let result = if dir {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match result {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Configures (when something changed) and builds the dependency in
 /// `<root>/<build_dir>/deps/<name>/cmake`, then reads what it exposes back
 /// from the File API. Library files are relative to the project root.
@@ -362,11 +512,21 @@ pub fn build_cmake(
     let build_type = cmake_build_type(&c.profile, &c.profile_scalars);
     let compilers = (compiler != Compiler::Msvc).then_some((&*toolchains.c, &*toolchains.cxx));
     let runtime = cmake_runtime(compiler, c.platform.os, build_type);
+    let env = GeneratorEnv::probe();
+    let mut tool_args = generator_args(&u.name, compiler, env)?;
+    let ar = archiver(
+        compiler,
+        c.platform.os,
+        c.profile_scalars.lto,
+        toolchains.ar.as_deref(),
+    )?;
+    tool_args.extend(archiver_args(&ar, &find_program)?);
     let args = configure_args(
         &u.base_dir,
         &build,
         build_type,
         compilers,
+        &tool_args,
         &platform_args(c.platform, c.cross_triple.as_deref()),
         &profile_args(c, Lang::C),
         &profile_args(c, Lang::Cxx),
@@ -375,7 +535,9 @@ pub fn build_cmake(
     );
 
     let identity = source_identity(c, unit)?;
-    let stamp = blake3::hash(format!("{}\0{identity}", args.join("\0")).as_bytes())
+    // CMake obeys `CMAKE_GENERATOR` itself, so its value belongs to the stamp.
+    let generator = std::env::var("CMAKE_GENERATOR").unwrap_or_default();
+    let stamp = blake3::hash(format!("{}\0{identity}\0{generator}", args.join("\0")).as_bytes())
         .to_hex()
         .to_string();
     let stamp_file = build.join(HASH_FILE);
@@ -393,6 +555,7 @@ pub fn build_cmake(
             .map_err(|e| io("create", &query, e))?;
         // A failed configure must not leave a stamp that vouches for it.
         let _ = std::fs::remove_file(&stamp_file);
+        reset_configuration(&build).map_err(|e| io("reset", &build, e))?;
         run_cmake(&args)?;
         std::fs::write(&stamp_file, &stamp).map_err(|e| io("write", &stamp_file, e))?;
     }
@@ -475,6 +638,7 @@ mod tests {
             "RelWithDebInfo",
             Some(("cc", "c++")),
             &[],
+            &[],
             &s(&["-O2", "-g"]),
             &s(&["-O2", "-g", "-flto"]),
             None,
@@ -502,6 +666,7 @@ mod tests {
             Path::new("/b"),
             "Debug",
             None,
+            &[],
             &[],
             &s(&["/Od"]),
             &s(&["/Od"]),
@@ -558,6 +723,7 @@ mod tests {
             Path::new("/b"),
             "Debug",
             Some(("cc", "c++")),
+            &[],
             &clang,
             &[],
             &[],
@@ -573,7 +739,7 @@ mod tests {
     fn reads_file_api_reply() {
         let t = read_reply(&fixture()).unwrap();
         let names: Vec<&str> = t.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["glfw", "glfw_util"]);
+        assert_eq!(names, ["glfw", "glfw_util", "glfw_shared"]);
         assert_eq!(t[0].kind, "STATIC_LIBRARY");
         assert_eq!(t[0].artifacts, [PathBuf::from("src/libglfw3.a")]);
         assert_eq!(t[0].deps, ["glfw_util"]);
@@ -601,11 +767,12 @@ mod tests {
         );
         assert_eq!(includes.first(), Some(&PathBuf::from("/work/glfw/include")));
 
-        // Only static libraries are followed, and each file once.
+        // Only static libraries are followed, and each file once. Custom
+        // targets and code generators are build-order only.
         let targets = [
-            target("app", "STATIC_LIBRARY", &["a.a"], &["gen", "dyn", "b"]),
+            target("app", "STATIC_LIBRARY", &["a.a"], &["gen", "tool", "b"]),
             target("gen", "UTILITY", &[], &[]),
-            target("dyn", "SHARED_LIBRARY", &["dyn.so"], &[]),
+            target("tool", "EXECUTABLE", &["tool.exe"], &[]),
             target("b", "STATIC_LIBRARY", &["b.a"], &["c"]),
             target("c", "STATIC_LIBRARY", &["c.a"], &["b"]),
         ];
@@ -618,6 +785,41 @@ mod tests {
                 PathBuf::from("c.a")
             ]
         );
+    }
+
+    #[test]
+    fn a_shared_library_cannot_be_exposed_or_followed() {
+        let hint = "set BUILD_SHARED_LIBS=OFF or expose a static target";
+        // Through the real File API reply: `glfw_shared` is a SHARED_LIBRARY.
+        let t = read_reply(&fixture()).unwrap();
+        let e = exposed(&t, &s(&["glfw_shared"])).unwrap_err();
+        assert!(
+            e.contains("`glfw_shared`") && e.contains("SHARED_LIBRARY") && e.contains(hint),
+            "{e}"
+        );
+
+        // A shared library that a static one needs would be linked as a DLL.
+        let targets = [
+            target("app", "STATIC_LIBRARY", &["a.a"], &["dyn"]),
+            target("dyn", "SHARED_LIBRARY", &["dyn.dll", "dyn.lib"], &[]),
+        ];
+        let e = exposed(&targets, &s(&["app"])).unwrap_err();
+        assert!(
+            e.contains("`dyn`") && e.contains("SHARED_LIBRARY") && e.contains(hint),
+            "{e}"
+        );
+
+        // So is anything else that is not a library.
+        let targets = [target("run", "EXECUTABLE", &["run.exe"], &[])];
+        let e = exposed(&targets, &s(&["run"])).unwrap_err();
+        assert!(e.contains("EXECUTABLE") && e.contains(hint), "{e}");
+
+        // An interface library adds includes only.
+        let mut iface = target("hdr", "INTERFACE_LIBRARY", &[], &[]);
+        iface.includes = vec![PathBuf::from("/x/include")];
+        let (libs, includes) = exposed(&[iface], &s(&["hdr"])).unwrap();
+        assert!(libs.is_empty());
+        assert_eq!(includes, [PathBuf::from("/x/include")]);
     }
 
     #[test]
@@ -640,7 +842,7 @@ mod tests {
             [PathBuf::from("src/release/libglfw3.a")]
         );
         // An unknown name falls back to the first configuration.
-        assert_eq!(read_reply_for(&fixture(), Some("Nope")).unwrap().len(), 2);
+        assert_eq!(read_reply_for(&fixture(), Some("Nope")).unwrap().len(), 3);
     }
 
     #[test]
@@ -693,5 +895,143 @@ mod tests {
                 "{compiler:?} {os:?} {build_type}"
             );
         }
+    }
+
+    fn env(env_set: bool, ninja: bool, windows_host: bool) -> GeneratorEnv {
+        GeneratorEnv {
+            env_set,
+            ninja,
+            windows_host,
+        }
+    }
+
+    #[test]
+    fn generator_is_chosen_for_the_compiler() {
+        use Compiler::*;
+        let g = |compiler, env| generator_args("dep", compiler, env);
+
+        // CMAKE_GENERATOR wins over everything.
+        assert_eq!(g(Gcc, env(true, true, true)), Ok(vec![]));
+        // Ninja when it runs, on every host and for every compiler.
+        for compiler in [Msvc, ClangCl, Gcc, Clang, AppleClang] {
+            for windows_host in [true, false] {
+                assert_eq!(
+                    g(compiler, env(false, true, windows_host)),
+                    Ok(s(&["-G", "Ninja"])),
+                    "{compiler:?} windows={windows_host}"
+                );
+            }
+        }
+        // No Ninja on Windows: what each compiler can use.
+        assert_eq!(g(Msvc, env(false, false, true)), Ok(vec![]));
+        assert_eq!(
+            g(ClangCl, env(false, false, true)),
+            Ok(s(&["-T", "ClangCL"]))
+        );
+        assert_eq!(
+            g(Gcc, env(false, false, true)),
+            Ok(s(&["-G", "MinGW Makefiles"]))
+        );
+        let e = g(Clang, env(false, false, true)).unwrap_err();
+        assert_eq!(
+            e,
+            "building cmake dependency dep with clang on Windows needs Ninja (install it or set CMAKE_GENERATOR)"
+        );
+        // Elsewhere CMake's default Makefiles follow CMAKE_C_COMPILER.
+        for compiler in [Gcc, Clang, AppleClang] {
+            assert_eq!(g(compiler, env(false, false, false)), Ok(vec![]));
+        }
+    }
+
+    /// A finder that "installs" the LLVM tools under /opt/llvm/bin.
+    fn llvm_tools(program: &str) -> Option<PathBuf> {
+        matches!(program, "llvm-ar" | "llvm-ranlib" | "llvm-lib")
+            .then(|| PathBuf::from("/opt/llvm/bin").join(program))
+    }
+
+    #[test]
+    fn llvm_archivers_are_passed_to_cmake_as_full_paths() {
+        assert_eq!(
+            archiver_args("llvm-ar", &llvm_tools).unwrap(),
+            s(&[
+                "-DCMAKE_AR=/opt/llvm/bin/llvm-ar",
+                "-DCMAKE_RANLIB=/opt/llvm/bin/llvm-ranlib"
+            ])
+        );
+        assert_eq!(
+            archiver_args("llvm-lib", &llvm_tools).unwrap(),
+            s(&["-DCMAKE_AR=/opt/llvm/bin/llvm-lib"])
+        );
+        assert!(archiver_args("ar", &llvm_tools).unwrap().is_empty());
+        assert!(archiver_args("lib.exe", &llvm_tools).unwrap().is_empty());
+        let e = archiver_args("llvm-ar", &|_| None).unwrap_err();
+        assert!(e.contains("cannot find `llvm-ar`"), "{e}");
+    }
+
+    #[test]
+    fn archiver_follows_forges_choice_for_the_platform() {
+        use crate::flags::archiver;
+        let args = |compiler, os, lto| {
+            let ar = archiver(compiler, os, lto, None).unwrap();
+            archiver_args(&ar, &llvm_tools).unwrap()
+        };
+        // Release has lto: clang on Linux archives with llvm-ar, so CMake must.
+        let linux = args(Compiler::Clang, Os::Linux, true);
+        assert_eq!(linux.len(), 2, "{linux:?}");
+        assert!(linux[1].starts_with("-DCMAKE_RANLIB=") && linux[1].ends_with("llvm-ranlib"));
+        assert!(args(Compiler::Clang, Os::Linux, false).is_empty());
+        assert_eq!(
+            args(Compiler::ClangCl, Os::Windows, true),
+            s(&["-DCMAKE_AR=/opt/llvm/bin/llvm-lib"])
+        );
+        assert!(args(Compiler::Msvc, Os::Windows, true).is_empty());
+    }
+
+    #[test]
+    fn find_program_takes_a_path_as_given() {
+        let t = tempfile::tempdir().unwrap();
+        let tool = t.path().join("tool");
+        std::fs::write(&tool, "").unwrap();
+        assert_eq!(find_program(&path_arg(&tool)), Some(tool));
+        assert_eq!(find_program(&path_arg(&t.path().join("none"))), None);
+    }
+
+    #[test]
+    fn tool_args_sit_after_the_compilers_and_before_the_flags() {
+        let args = configure_args(
+            Path::new("/src"),
+            Path::new("/b"),
+            "Debug",
+            Some(("cc", "c++")),
+            &s(&["-G", "Ninja", "-DCMAKE_AR=llvm-ar"]),
+            &[],
+            &s(&["-g"]),
+            &s(&["-g"]),
+            None,
+            &BTreeMap::new(),
+        );
+        let at = |what: &str| args.iter().position(|a| a == what).unwrap();
+        assert!(at("-DCMAKE_CXX_COMPILER=c++") < at("-G"));
+        assert_eq!(args[at("-G") + 1], "Ninja");
+        assert!(at("-DCMAKE_AR=llvm-ar") < at("-DCMAKE_C_FLAGS_DEBUG=-g"));
+    }
+
+    #[test]
+    fn reset_removes_the_cache_and_cmake_files_only() {
+        let t = tempfile::tempdir().unwrap();
+        let build = t.path();
+        std::fs::create_dir_all(build.join("CMakeFiles/sub")).unwrap();
+        std::fs::write(build.join("CMakeFiles/sub/x"), "").unwrap();
+        std::fs::write(build.join("CMakeCache.txt"), "A:STRING=1").unwrap();
+        std::fs::create_dir_all(build.join(QUERY).parent().unwrap()).unwrap();
+        std::fs::write(build.join(QUERY), "").unwrap();
+        std::fs::write(build.join("keep.txt"), "").unwrap();
+
+        reset_configuration(build).unwrap();
+        assert!(!build.join("CMakeCache.txt").exists());
+        assert!(!build.join("CMakeFiles").exists());
+        assert!(build.join(QUERY).exists() && build.join("keep.txt").exists());
+        // Nothing to reset is fine.
+        reset_configuration(build).unwrap();
     }
 }

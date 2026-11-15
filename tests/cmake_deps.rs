@@ -7,6 +7,7 @@ use std::{fs, path::Path, process::Command, time::Duration};
 use common::{Fixture, compile_args_of, exe, jobs};
 use forge_build::{
     build::build,
+    configure::model::Invocation,
     deps::{Phase, prepare_all},
     executor::ProcessExecutor,
     graph::Graph,
@@ -206,4 +207,106 @@ fn cmake_dependency_without_expose_is_an_error() {
     f.touch("vendor/m/CMakeLists.txt");
     let e = f.error();
     assert!(e.contains("dependency.m") && e.contains("expose"), "{e}");
+}
+
+/// Runs the built `app` and returns its exit code.
+fn run_app(f: &Fixture, profile: &str) -> Option<i32> {
+    Command::new(f.root.join(format!("build/{profile}/bin/{}", exe("app"))))
+        .status()
+        .unwrap()
+        .code()
+}
+
+fn build_all(f: &Fixture) {
+    let p = load_and_prepare(f);
+    let g = Graph::from_project(&p).unwrap();
+    build(&p, &g, &ProcessExecutor, jobs(2)).unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
+fn a_removed_option_returns_to_the_project_default() {
+    if !usable("cmake") {
+        eprintln!("skipped: cmake is not installed");
+        return;
+    }
+    let (Some(cc), Some(cxx)) = (real_cc(), real_cxx()) else {
+        eprintln!("skipped: no C and C++ compiler can be run");
+        return;
+    };
+    let f = project_dir(&cc, &cxx);
+    build_all(&f);
+    assert_eq!(run_app(&f, "debug"), Some(7));
+
+    // Without the entry CMake must use the default of its CMakeLists (0), not
+    // the value that the cache remembers.
+    f.write(
+        "project.toml",
+        &MANIFEST.replace("options = { M_RESULT = 7 }\n", ""),
+    );
+    build_all(&f);
+    assert_eq!(run_app(&f, "debug"), Some(0));
+}
+
+#[test]
+fn a_shared_library_target_is_an_error_with_a_hint() {
+    if !usable("cmake") {
+        eprintln!("skipped: cmake is not installed");
+        return;
+    }
+    let (Some(cc), Some(cxx)) = (real_cc(), real_cxx()) else {
+        eprintln!("skipped: no C and C++ compiler can be run");
+        return;
+    };
+    let f = project_dir(&cc, &cxx);
+    f.write(
+        "project.toml",
+        &MANIFEST.replace("M_RESULT = 7", "M_RESULT = 7, BUILD_SHARED_LIBS = true"),
+    );
+    f.write(
+        "vendor/m/CMakeLists.txt",
+        concat!(
+            "cmake_minimum_required(VERSION 3.10)\n",
+            "project(m C)\n",
+            "set(M_RESULT 0 CACHE STRING \"\")\n",
+            "add_library(m m.c)\n",
+            "target_compile_definitions(m PRIVATE M_RESULT=${M_RESULT})\n",
+            "target_include_directories(m PUBLIC include)\n",
+        ),
+    );
+    let mut p = f.load_with(&f.invocation(), &ProcessExecutor).unwrap();
+    let e = prepare_all(&mut p, Phase::Build, &ProcessExecutor, 2)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("dependency.m")
+            && e.contains("`m`")
+            && e.contains("SHARED_LIBRARY")
+            && e.contains("set BUILD_SHARED_LIBS=OFF or expose a static target"),
+        "{e}"
+    );
+}
+
+#[test]
+fn release_profile_builds_and_links_a_cmake_dependency() {
+    if !usable("cmake") {
+        eprintln!("skipped: cmake is not installed");
+        return;
+    }
+    let (Some(cc), Some(cxx)) = (real_cc(), real_cxx()) else {
+        eprintln!("skipped: no C and C++ compiler can be run");
+        return;
+    };
+    let f = project_dir(&cc, &cxx);
+    let inv = Invocation {
+        profile: Some("release".to_string()),
+        ..f.invocation()
+    };
+    let mut p = f
+        .load_with(&inv, &ProcessExecutor)
+        .unwrap_or_else(|e| panic!("{e}"));
+    prepare_all(&mut p, Phase::Build, &ProcessExecutor, 2).unwrap_or_else(|e| panic!("{e}"));
+    p.rebuild_targets().unwrap();
+    let g = Graph::from_project(&p).unwrap();
+    build(&p, &g, &ProcessExecutor, jobs(2)).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(run_app(&f, "release"), Some(7));
 }
