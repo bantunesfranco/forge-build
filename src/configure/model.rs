@@ -653,6 +653,94 @@ kind = \"header-only\"
     }
 
     #[test]
+    fn target_root_applies_to_its_own_paths_only() {
+        let src = "[workspace]
+include.public = [\"include\"]
+sources = [\"common/*.cpp\"]
+[lib.engine]
+root = \"engine\"
+sources = [\"srcs/*.cpp\"]
+include.public = [\"inc\"]
+";
+        let c = cfg(
+            src,
+            &["engine/srcs/a.cpp", "common/w.cpp", "engine/common/no.cpp"],
+            LINUX,
+        );
+        let e = unit(&c, "engine");
+        let includes: Vec<_> = e.public.include.iter().map(|i| i.path.clone()).collect();
+        assert_eq!(
+            includes,
+            [PathBuf::from("include"), PathBuf::from("engine/inc")]
+        );
+        assert_eq!(
+            e.sources,
+            [
+                PathBuf::from("common/w.cpp"),
+                PathBuf::from("engine/srcs/a.cpp")
+            ]
+        );
+    }
+
+    #[test]
+    fn feature_and_profile_paths_follow_the_manifest_dir_but_a_dependencys_own_base() {
+        let src = "[workspace]
+features = [\"f\"]
+[feature.f]
+include.public = [\"fi\"]
+[profile.debug]
+include = [\"pi\"]
+[lib.engine]
+root = \"engine\"
+sources = [\"a.cpp\"]
+[dependency.d]
+path = \"vendor/d\"
+kind = \"header-only\"
+root = \"sub\"
+features = [\"f\"]
+include.public = [\"di\"]
+";
+        let c = cfg(src, &["engine/a.cpp", "vendor/d/sub/"], LINUX);
+        let paths =
+            |s: &Settings| -> Vec<PathBuf> { s.include.iter().map(|i| i.path.clone()).collect() };
+        let e = unit(&c, "engine");
+        assert_eq!(paths(&e.public), [PathBuf::from("fi")]);
+        assert_eq!(paths(&e.private), [PathBuf::from("pi")]);
+        // The workspace's `features` list does not reach the dependency, which lists its own.
+        let d = unit(&c, "d");
+        assert_eq!(
+            paths(&d.public),
+            [
+                PathBuf::from("vendor/d/sub/di"),
+                PathBuf::from("vendor/d/sub/fi")
+            ]
+        );
+    }
+
+    #[test]
+    fn inherited_include_does_not_make_a_lib_header_only() {
+        let src = "[workspace]
+include = [\"inc\"]
+[lib.hdr]
+defines = [\"X\"]
+";
+        let e = err(src, &[], LINUX);
+        assert!(
+            e.contains("lib.hdr") && e.contains("needs `sources`"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn include_under_any_condition_makes_a_lib_header_only() {
+        let src = "[lib.hdr]
+include.public.windows = [\"inc\"]
+";
+        let c = cfg(src, &[], LINUX);
+        assert_eq!(unit(&c, "hdr").kind, UnitKind::InterfaceLib);
+    }
+
+    #[test]
     fn lib_without_sources_or_include_is_error() {
         let e = err("[lib.x]\ndefines = [\"A\"]\n", &[], LINUX);
         assert!(e.contains("lib.x") && e.contains("needs `sources`"), "{e}");

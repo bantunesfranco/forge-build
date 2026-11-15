@@ -196,19 +196,35 @@ pub(crate) fn root_relative(root: &Path, full: &Path) -> PathBuf {
     }
 }
 
-/// Where relative paths of one unit are anchored.
+/// Where relative paths of one unit are anchored. A path is relative to the
+/// directory of the table that wrote it (spec 6.2): a target's `root` applies
+/// to its own table only, and workspace, profile and feature paths of a lib or
+/// bin stay relative to the manifest directory.
 struct PathCx<'a> {
     root: &'a Path,
-    /// `None` for a `system` dependency, which has no directory.
-    base: Option<&'a Path>,
+    /// The table of the unit itself, e.g. `lib.engine`.
+    own_origin: &'a str,
+    /// The base of the unit's own table. `None` for a `system` dependency,
+    /// which has no directory.
+    own_base: Option<&'a Path>,
+    /// The base of every other table that reaches the unit.
+    other_base: Option<&'a Path>,
     system_includes: bool,
     os: Os,
 }
 
 impl PathCx<'_> {
-    fn include(&self, p: &str) -> IncludeDir {
+    fn base_of(&self, s: &Sourced) -> Option<&Path> {
+        if s.origin == self.own_origin {
+            self.own_base
+        } else {
+            self.other_base
+        }
+    }
+
+    fn include(&self, s: &Sourced, p: &str) -> IncludeDir {
         let given = Path::new(p);
-        let path = match self.base {
+        let path = match self.base_of(s) {
             _ if given.is_absolute() => given.to_path_buf(),
             Some(base) => root_relative(self.root, &base.join(given)),
             None => PathBuf::from(p.replace('\\', "/")),
@@ -228,7 +244,7 @@ impl PathCx<'_> {
             ..Settings::default()
         };
         for s in m.list("include", vis) {
-            push_unique(&mut out.include, self.include(want_str(s)?));
+            push_unique(&mut out.include, self.include(s, want_str(s)?));
         }
         for s in m.list("system", vis) {
             let name = want_str(s)?;
@@ -514,20 +530,36 @@ pub fn configure(
         };
         let paths = PathCx {
             root,
-            base: Some(&base),
+            own_origin: origin,
+            own_base: Some(&base),
+            other_base: Some(root),
             system_includes: false,
             os: platform.os,
         };
         let private = paths.settings(&merged, Visibility::Private)?;
         let public = paths.settings(&merged, Visibility::Public)?;
 
-        let patterns: Vec<String> = strings(merged.list("sources", Visibility::Private))?
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        let has_include = !merged.list("include", Visibility::Private).is_empty()
-            || !merged.list("include", Visibility::Public).is_empty();
-        let kind = match (decl.kind, patterns.is_empty()) {
+        // `sources` of the target's own table are relative to its `root`, those
+        // of the workspace to the manifest directory.
+        let mut own_patterns = Vec::new();
+        let mut outer_patterns = Vec::new();
+        for s in merged.list("sources", Visibility::Private) {
+            let pattern = want_str(s)?.to_string();
+            if s.origin == *origin {
+                own_patterns.push(pattern);
+            } else {
+                outer_patterns.push(pattern);
+            }
+        }
+        let no_sources = own_patterns.is_empty() && outer_patterns.is_empty();
+        // Only the lib's own `include` keys make it an interface lib, not
+        // includes it inherits from the workspace, a profile or a feature.
+        let has_include = decl
+            .settings
+            .entries
+            .iter()
+            .any(|e| e.key.name == "include" && !e.key.remove);
+        let kind = match (decl.kind, no_sources) {
             (TargetKind::Bin, true) => {
                 return Err(ConfigError::invalid(origin, "a bin needs `sources`"));
             }
@@ -541,17 +573,25 @@ pub fn configure(
                 ));
             }
         };
-        let sources = if patterns.is_empty() {
+        let sources = if no_sources {
             Vec::new()
         } else {
-            let found = discover_globs(root, &base, &patterns)?;
+            let mut found = discover_globs(root, &base, &own_patterns)?;
+            found.extend(discover_globs(root, root, &outer_patterns)?);
+            found.sort();
+            found.dedup();
             if found.is_empty() {
+                let (patterns, from) = if own_patterns.is_empty() {
+                    (&outer_patterns, root)
+                } else {
+                    (&own_patterns, base.as_path())
+                };
                 return Err(ConfigError::invalid(
                     origin,
                     format!(
                         "`sources` matched no C/C++ files: {} (relative to {})",
                         patterns.join(", "),
-                        root_relative(root, &base).display()
+                        root_relative(root, from).display()
                     ),
                 ));
             }
@@ -666,9 +706,12 @@ fn dependency_unit(
         Some(r) => dir.join(r),
         None => dir.clone(),
     });
+    // Everything that reaches a dependency is relative to its own directory.
     let paths = PathCx {
         root,
-        base: base.as_deref(),
+        own_origin: origin,
+        own_base: base.as_deref(),
+        other_base: base.as_deref(),
         system_includes: decl.system_headers,
         os: cx.platform.os,
     };
