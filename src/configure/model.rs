@@ -741,6 +741,77 @@ include.public.windows = [\"inc\"]
     }
 
     #[test]
+    fn output_must_be_a_single_file_name() {
+        for bad in ["", "a/b", "a\\\\b", "..", ".", "../../x", "/abs"] {
+            let src = format!(
+                "[bin.m]
+sources = [\"a.c\"]
+output = \"{bad}\"
+"
+            );
+            let e = err(&src, &["a.c"], LINUX);
+            assert!(e.contains("bin.m") && e.contains("`output`"), "{bad}: {e}");
+        }
+        let c = cfg(
+            "[bin.m]
+sources = [\"a.c\"]
+output = \"my.tool\"
+",
+            &["a.c"],
+            LINUX,
+        );
+        assert_eq!(unit(&c, "m").output, "my.tool");
+    }
+
+    #[test]
+    fn duplicate_outputs_of_the_same_kind_are_rejected() {
+        let src = "[bin.a]
+sources = [\"a.c\"]
+output = \"tool\"
+[bin.b]
+sources = [\"a.c\"]
+output = \"tool\"
+";
+        let e = err(src, &["a.c"], LINUX);
+        assert!(
+            e.contains("tool") && e.contains("bin.a") && e.contains("bin.b"),
+            "{e}"
+        );
+        let src = "[lib.a]
+sources = [\"a.c\"]
+output = \"x\"
+[lib.b]
+sources = [\"a.c\"]
+output = \"x\"
+";
+        let e = err(src, &["a.c"], LINUX);
+        assert!(e.contains("lib.a") && e.contains("lib.b"), "{e}");
+        // A lib and a bin land in different directories; an interface lib has no file.
+        let src = "[lib.a]
+sources = [\"a.c\"]
+output = \"x\"
+[bin.b]
+sources = [\"a.c\"]
+output = \"x\"
+[lib.h]
+include = [\"i\"]
+output = \"x\"
+";
+        cfg(src, &["a.c"], LINUX);
+        // `tool` and `Tool.exe` are the same file on Windows only.
+        let src = "[bin.a]
+sources = [\"a.c\"]
+output = \"tool\"
+[bin.b]
+sources = [\"a.c\"]
+output = \"Tool.exe\"
+";
+        cfg(src, &["a.c"], LINUX);
+        let e = err(src, &["a.c"], WINDOWS);
+        assert!(e.contains("bin.a") && e.contains("bin.b"), "{e}");
+    }
+
+    #[test]
     fn lib_without_sources_or_include_is_error() {
         let e = err("[lib.x]\ndefines = [\"A\"]\n", &[], LINUX);
         assert!(e.contains("lib.x") && e.contains("needs `sources`"), "{e}");

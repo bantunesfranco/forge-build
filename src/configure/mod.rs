@@ -613,7 +613,10 @@ pub fn configure(
             warnings: scalar_enum(&merged, "warnings")?,
             warnings_as_errors: scalar_bool(&merged, "warnings_as_errors")?.unwrap_or(false),
             opt,
-            output: scalar_string(&merged, "output")?.unwrap_or_else(|| name.clone()),
+            output: match scalar_string(&merged, "output")? {
+                Some(output) => check_output(origin, output)?,
+                None => name.clone(),
+            },
             subsystem: scalar_enum(&merged, "subsystem")?,
             dep: None,
             merged,
@@ -623,6 +626,8 @@ pub fn configure(
         }
         units.push(unit);
     }
+
+    check_duplicate_outputs(&units, platform.os)?;
 
     for (name, decl) in &m.dependencies {
         let unit = dependency_unit(&cx, root, name, decl, &mut diags)?;
@@ -650,6 +655,55 @@ pub fn configure(
         link_order,
         diagnostics: diags,
     })
+}
+
+/// `output` names an artifact: one file name, never a path (spec 6.1).
+fn check_output(origin: &str, output: String) -> Result<String, ConfigError> {
+    let bad = |what: &str| {
+        Err(ConfigError::invalid(
+            origin,
+            format!("`output` {what} (found `{output}`)"),
+        ))
+    };
+    if output.is_empty() {
+        return bad("must not be empty");
+    }
+    if output == "." || output == ".." || output.contains(['/', '\\']) {
+        return bad("must be a file name, not a path (no separators, `.` or `..`)");
+    }
+    Ok(output)
+}
+
+/// Two libs, or two bins, that write the same artifact would overwrite each other.
+fn check_duplicate_outputs(units: &[Unit], os: Os) -> Result<(), ConfigError> {
+    let mut seen: HashMap<(bool, String), &Unit> = HashMap::new();
+    for u in units {
+        let is_bin = match u.kind {
+            UnitKind::Bin => true,
+            UnitKind::Lib => false,
+            UnitKind::InterfaceLib | UnitKind::Dep(_) => continue,
+        };
+        // Windows file names ignore case, and a bin gets `.exe` appended.
+        let mut file = u.output.clone();
+        if os == Os::Windows {
+            file = file.to_ascii_lowercase();
+            if is_bin {
+                file = file.strip_suffix(".exe").unwrap_or(&file).to_string();
+            }
+        }
+        if let Some(other) = seen.insert((is_bin, file), u) {
+            return Err(ConfigError::invalid(
+                unit_origin(u),
+                format!(
+                    "`output` `{}` is also the output of `{}`; two {} would overwrite each other",
+                    u.output,
+                    unit_origin(other),
+                    if is_bin { "executables" } else { "libraries" }
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn unit_deps(merged: &Merged) -> Result<Vec<(String, Visibility)>, ConfigError> {
