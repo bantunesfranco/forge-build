@@ -291,6 +291,10 @@ pub fn link_args(
             args.push("/LTCG".to_string());
         } else {
             args.extend(owned(lto_args(compiler)));
+            // clang's LTO on Windows cannot use the MSVC linker.
+            if compiler == Compiler::Clang && c.platform.os == Os::Windows {
+                args.push("-fuse-ld=lld".to_string());
+            }
         }
     }
     if msvc && c.profile_scalars.debug_info {
@@ -899,6 +903,24 @@ system = [\"opengl\"]
             args,
             strs(&["out/a.a", "out/b.a", "opengl32.lib", "LFLAG", "/DEBUG"])
         );
+    }
+
+    #[test]
+    fn clang_lto_on_windows_uses_lld() {
+        let src = "[workspace]\nc = \"11\"\n[bin.m]\nsources = [\"m.c\"]\n";
+        let link = |platform, profile| {
+            let c = build(src, &["m.c"], platform, Some(profile));
+            link_args(&c, idx(&c, "m"), &artifact_of(&c), &[])
+        };
+        let lld = "-fuse-ld=lld".to_string();
+        assert_eq!(
+            link(windows(Compiler::Clang), "release"),
+            strs(&["-flto=thin", "-fuse-ld=lld"])
+        );
+        // not on linux, not without lto, not for other compilers
+        assert!(!link(linux(Compiler::Clang), "release").contains(&lld));
+        assert!(!link(windows(Compiler::Clang), "debug").contains(&lld));
+        assert!(!link(windows(Compiler::Gcc), "release").contains(&lld));
     }
 
     #[test]
