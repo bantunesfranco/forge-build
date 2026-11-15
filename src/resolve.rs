@@ -17,6 +17,7 @@ use crate::{
         manifest::BuildProfile,
         types::{Define, OptLevel},
     },
+    executor::path_arg,
     lang::{Driver, Lang, Toolchain},
     project::Project,
 };
@@ -152,7 +153,7 @@ fn arg_path(root: &Path, p: &Path) -> String {
     if rel.as_os_str().is_empty() {
         ".".into()
     } else {
-        rel.display().to_string()
+        path_arg(rel)
     }
 }
 
@@ -162,6 +163,11 @@ pub fn resolve(project: &Project, profile: &str) -> Result<Resolved, ConfigError
     let msvc = project.uses_msvc();
 
     let mut common = Vec::new();
+    if msvc {
+        // Match CMake's default MSVC runtime selection for dependency builds:
+        // Debug uses the debug DLL runtime, other profiles use the release DLL.
+        common.push(if profile == "debug" { "/MDd" } else { "/MD" }.to_owned());
+    }
     if flags.warnings == Some(true) {
         if msvc {
             common.push("/W4".to_string());

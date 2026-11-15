@@ -188,17 +188,17 @@ impl FromStr for OptLevel {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
-            "0" => OptLevel::O0,
+            "0" | "none" => OptLevel::O0,
             "1" => OptLevel::O1,
-            "2" => OptLevel::O2,
-            "3" => OptLevel::O3,
+            "2" | "speed" => OptLevel::O2,
+            "3" | "max" => OptLevel::O3,
             "g" => OptLevel::Og,
-            "s" => OptLevel::Os,
+            "s" | "size" => OptLevel::Os,
             "z" => OptLevel::Oz,
             "fast" => OptLevel::Ofast,
             other => {
                 return Err(format!(
-                    "invalid opt_level `{other}`; expected 0, 1, 2, 3, \"g\", \"s\", \"z\", or \"fast\""
+                    "invalid opt_level `{other}`; expected none, size, speed, max, 0, 1, 2, 3, or legacy optimization names"
                 ));
             }
         })

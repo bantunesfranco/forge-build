@@ -25,7 +25,7 @@ pub enum ConfigError {
     },
     #[error("{field}: {message}")]
     Invalid { field: String, message: String },
-    #[error("could not find Forge.toml in {} or any parent directory", start.display())]
+    #[error("could not find project.toml in {} or any parent directory", start.display())]
     NotFound { start: PathBuf },
 }
 
@@ -38,7 +38,7 @@ impl ConfigError {
     }
 }
 
-const MANIFEST_NAME: &str = "Forge.toml";
+const MANIFEST_NAME: &str = "project.toml";
 
 pub fn find_manifest(explicit: Option<&Path>) -> Result<PathBuf, ConfigError> {
     if let Some(p) = explicit {
@@ -111,22 +111,22 @@ mod tests {
     #[test]
     fn finds_manifest_in_parent() {
         let (_t, r) = tree();
-        std::fs::write(r.join("a/Forge.toml"), "").unwrap();
-        assert_eq!(find_from(&r.join("a/b/c")), Some(r.join("a/Forge.toml")));
+        std::fs::write(r.join("a/project.toml"), "").unwrap();
+        assert_eq!(find_from(&r.join("a/b/c")), Some(r.join("a/project.toml")));
     }
 
     #[test]
     fn nearest_manifest_wins() {
         let (_t, r) = tree();
-        std::fs::write(r.join("a/Forge.toml"), "").unwrap();
-        std::fs::write(r.join("a/b/Forge.toml"), "").unwrap();
-        assert_eq!(find_from(&r.join("a/b/c")), Some(r.join("a/b/Forge.toml")));
+        std::fs::write(r.join("a/project.toml"), "").unwrap();
+        std::fs::write(r.join("a/b/project.toml"), "").unwrap();
+        assert_eq!(find_from(&r.join("a/b/c")), Some(r.join("a/b/project.toml")));
     }
 
     #[test]
     fn git_directory_stops_the_search() {
         let (_t, r) = tree();
-        std::fs::write(r.join("Forge.toml"), "").unwrap();
+        std::fs::write(r.join("project.toml"), "").unwrap();
         std::fs::create_dir(r.join("a/.git")).unwrap();
         assert_eq!(find_from(&r.join("a/b/c")), None);
     }
@@ -134,10 +134,10 @@ mod tests {
     #[test]
     fn explicit_directory_resolves_to_its_manifest() {
         let (_t, r) = tree();
-        std::fs::write(r.join("a/Forge.toml"), "").unwrap();
+        std::fs::write(r.join("a/project.toml"), "").unwrap();
         assert_eq!(
             find_manifest(Some(&r.join("a"))).unwrap(),
-            r.join("a/Forge.toml")
+            r.join("a/project.toml")
         );
     }
 
@@ -145,6 +145,6 @@ mod tests {
     fn explicit_directory_without_manifest_is_an_error() {
         let (_t, r) = tree();
         let e = find_manifest(Some(&r.join("a"))).unwrap_err().to_string();
-        assert!(e.contains("Forge.toml"), "{e}");
+        assert!(e.contains("project.toml"), "{e}");
     }
 }

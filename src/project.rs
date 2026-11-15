@@ -295,7 +295,7 @@ impl Project {
 
     pub fn output_path(&self, profile: &str) -> PathBuf {
         let mut output = self.manifest.build.output.clone();
-        if self.uses_msvc() && output.extension().is_none() {
+        if cfg!(windows) && output.extension().is_none() {
             output.set_extension("exe");
         }
         self.build_dir(profile).join(output)
@@ -320,12 +320,11 @@ impl Project {
     pub fn target_output_path(&self, profile: &str, target: &BuildTarget) -> PathBuf {
         match target.kind {
             BuildTargetKind::Binary => {
-                let name =
-                    if self.uses_msvc() && !target.name.to_ascii_lowercase().ends_with(".exe") {
-                        format!("{}.exe", target.name)
-                    } else {
-                        target.name.clone()
-                    };
+                let name = if cfg!(windows) && !target.name.to_ascii_lowercase().ends_with(".exe") {
+                    format!("{}.exe", target.name)
+                } else {
+                    target.name.clone()
+                };
                 self.build_dir(profile).join("bin").join(name)
             }
             BuildTargetKind::StaticLibrary => {

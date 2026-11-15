@@ -9,7 +9,7 @@ use std::{
 
 use crate::{
     database::{self, Database, FileState, Snapshot, TaskRecord},
-    executor::{CommandSpec, Executor, Outcome},
+    executor::{CommandSpec, Executor, Outcome, path_arg},
     fingerprint,
     graph::{Graph, Task, TaskId, TaskKind},
     headers,
@@ -47,10 +47,6 @@ pub enum BuildError {
     Failed { count: usize },
     #[error("cannot save build database {}: {source}", path.display())]
     SaveDb { path: PathBuf, source: io::Error },
-}
-
-fn path_arg(p: &Path) -> String {
-    p.display().to_string()
 }
 
 /// The command for a task. The program and `-std=` come from the task's
@@ -119,8 +115,10 @@ pub fn command_for(task: &Task, r: &Resolved, project: &Project) -> CommandSpec 
         TaskKind::Archive => unreachable!("archive tasks return above"),
     }
 
-    args.push("-o".into());
-    args.push(path_arg(&task.outputs[0]));
+    if toolchain.driver() != Driver::Msvc {
+        args.push("-o".into());
+        args.push(path_arg(&task.outputs[0]));
+    }
     CommandSpec {
         program: toolchain.program.clone(),
         args,

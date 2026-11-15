@@ -11,7 +11,12 @@ use super::types::{Define, DepBuild, Expose, FindSpec, ListEdit, OptLevel, Prefe
 pub struct Manifest {
     /// Package-oriented manifest format.
     pub edition: Option<String>,
+    pub workspace: Option<Workspace>,
     pub package: Option<Package>,
+    #[serde(default)]
+    pub option: BTreeMap<String, toml::Value>,
+    #[serde(default)]
+    pub feature: BTreeMap<String, toml::Value>,
     pub lang: Option<Languages>,
     #[serde(default)]
     pub tools: BTreeMap<String, String>,
@@ -25,6 +30,20 @@ pub struct Manifest {
     pub profiles: BTreeMap<String, BuildProfile>,
     #[serde(default)]
     pub dependencies: BTreeMap<String, Dependency>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Workspace {
+    pub name: String,
+    pub version: String,
+    pub authors: Vec<String>,
+    pub c: Option<String>,
+    pub cxx: Option<String>,
+    #[serde(default)]
+    pub requires: BTreeMap<String, String>,
+    #[serde(flatten)]
+    pub settings: Target,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -45,6 +64,7 @@ pub struct Languages {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Target {
+    pub root: Option<PathBuf>,
     #[serde(default)]
     pub sources: Vec<String>,
     #[serde(default)]
@@ -53,10 +73,24 @@ pub struct Target {
     pub include: TargetInclude,
     #[serde(default)]
     pub deps: Vec<String>,
-    #[serde(default)]
+    #[serde(default, alias = "system")]
     pub system_libs: Vec<String>,
     #[serde(default)]
+    pub defines: Vec<Define>,
+    #[serde(default)]
+    pub private_defines: Vec<Define>,
+    #[serde(default)]
+    pub compile_flags: Vec<String>,
+    #[serde(default)]
+    pub private_compile_flags: Vec<String>,
+    #[serde(default)]
+    pub link_flags: Vec<String>,
+    #[serde(default)]
+    pub frameworks: Vec<String>,
+    #[serde(default)]
     pub platform: BTreeMap<String, TargetPlatform>,
+    #[serde(default)]
+    pub toolchain: BTreeMap<String, TargetPlatform>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -70,8 +104,20 @@ pub struct TargetPlatform {
     pub include: TargetInclude,
     #[serde(default)]
     pub deps: Vec<String>,
-    #[serde(default)]
+    #[serde(default, alias = "system")]
     pub system_libs: Vec<String>,
+    #[serde(default)]
+    pub defines: Vec<Define>,
+    #[serde(default)]
+    pub private_defines: Vec<Define>,
+    #[serde(default)]
+    pub compile_flags: Vec<String>,
+    #[serde(default)]
+    pub private_compile_flags: Vec<String>,
+    #[serde(default)]
+    pub link_flags: Vec<String>,
+    #[serde(default)]
+    pub frameworks: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -166,6 +212,8 @@ pub struct BuildProfile {
     pub opt_level: Option<OptLevel>,
     #[serde(alias = "debug")]
     pub debug_info: Option<bool>,
+    pub asserts: Option<bool>,
+    pub lto: Option<bool>,
     pub defines: ListEdit<Define>,
     pub compile_flags: ListEdit<String>,
     pub link_flags: ListEdit<String>,
@@ -225,6 +273,22 @@ pub struct Dependency {
 impl Manifest {
     /// Apply defaults and normalize package metadata for the existing resolver.
     pub fn normalize(&mut self) -> Result<(), String> {
+        if let Some(workspace) = self.workspace.take() {
+            if self.package.is_some() {
+                return Err("use `[workspace]` instead of the legacy `[package]` table".into());
+            }
+            self.project.name = workspace.name.clone();
+            self.project.version = workspace.version.clone();
+            self.project.authors = workspace.authors;
+            self.lang = Some(Languages { c: workspace.c, cxx: workspace.cxx });
+            for target in self.lib.values_mut().chain(self.bin.values_mut()) {
+                merge_workspace_target(target, &workspace.settings);
+            }
+            self.package = Some(Package { name: workspace.name, version: workspace.version });
+        }
+        for target in self.lib.values_mut().chain(self.bin.values_mut()) {
+            apply_target_root(target);
+        }
         if let Some(package) = &self.package {
             match self.edition.as_deref() {
                 None => self.edition = Some("2026".into()),
@@ -329,6 +393,17 @@ impl Manifest {
                     profile.opt_level = Some(OptLevel::O0);
                 }
             }
+            if let Some(release) = self.profiles.get_mut("release") {
+                if release.opt_level.is_none() { release.opt_level = Some(OptLevel::O3); }
+                if release.debug_info.is_none() { release.debug_info = Some(false); }
+                if release.asserts.is_none() { release.asserts = Some(false); }
+                if release.lto.is_none() { release.lto = Some(true); }
+            }
+            if let Some(debug) = self.profiles.get_mut("debug") {
+                if debug.opt_level.is_none() { debug.opt_level = Some(OptLevel::O2); }
+                if debug.debug_info.is_none() { debug.debug_info = Some(true); }
+                if debug.asserts.is_none() { debug.asserts = Some(true); }
+            }
         }
         for (dep_name, dep) in self.dependencies.iter_mut() {
             if dep.source.is_none() {
@@ -398,6 +473,61 @@ impl Manifest {
             }
         }
         Ok(())
+    }
+}
+
+
+fn merge_workspace_target(target: &mut Target, workspace: &Target) {
+    fn prepend<T: Clone>(target: &mut Vec<T>, defaults: &[T]) {
+        let mut combined = defaults.to_vec();
+        combined.append(target);
+        *target = combined;
+    }
+    prepend(&mut target.sources, &workspace.sources);
+    prepend(&mut target.source_dirs, &workspace.source_dirs);
+    prepend(&mut target.include.public, &workspace.include.public);
+    prepend(&mut target.include.private, &workspace.include.private);
+    prepend(&mut target.deps, &workspace.deps);
+    prepend(&mut target.system_libs, &workspace.system_libs);
+    prepend(&mut target.defines, &workspace.defines);
+    prepend(&mut target.private_defines, &workspace.private_defines);
+    prepend(&mut target.compile_flags, &workspace.compile_flags);
+    prepend(&mut target.private_compile_flags, &workspace.private_compile_flags);
+    prepend(&mut target.link_flags, &workspace.link_flags);
+    prepend(&mut target.frameworks, &workspace.frameworks);
+    for (key, layer) in &workspace.platform {
+        let into = target.platform.entry(key.clone()).or_default();
+        prepend(&mut into.sources, &layer.sources);
+        prepend(&mut into.source_dirs, &layer.source_dirs);
+        prepend(&mut into.include.public, &layer.include.public);
+        prepend(&mut into.include.private, &layer.include.private);
+        prepend(&mut into.deps, &layer.deps);
+        prepend(&mut into.system_libs, &layer.system_libs);
+        prepend(&mut into.defines, &layer.defines);
+        prepend(&mut into.private_defines, &layer.private_defines);
+        prepend(&mut into.compile_flags, &layer.compile_flags);
+        prepend(&mut into.private_compile_flags, &layer.private_compile_flags);
+        prepend(&mut into.link_flags, &layer.link_flags);
+        prepend(&mut into.frameworks, &layer.frameworks);
+    }
+}
+
+fn apply_target_root(target: &mut Target) {
+    let Some(root) = target.root.take() else { return };
+    let prefix = |p: &mut PathBuf| {
+        if !p.is_absolute() { *p = root.join(&*p); }
+    };
+    for dir in &mut target.source_dirs { prefix(dir); }
+    for dir in target.include.public.iter_mut().chain(&mut target.include.private) { prefix(dir); }
+    for pattern in &mut target.sources {
+        if !PathBuf::from(&*pattern).is_absolute() { *pattern = root.join(&*pattern).to_string_lossy().into_owned(); }
+    }
+    for layer in target.platform.values_mut() {
+        for dir in &mut layer.source_dirs { prefix(dir); }
+        for dir in layer.include.public.iter_mut().chain(&mut layer.include.private) { prefix(dir); }
+        for pattern in &mut layer.sources {
+            if !PathBuf::from(&*pattern).is_absolute() { *pattern = root.join(&*pattern).to_string_lossy().into_owned(); }
+        }
     }
 }
 

@@ -14,8 +14,9 @@ use crate::{
     config::{
         ConfigError,
         manifest::Dependency,
-        types::{FindSpec, ListEdit, Prefer, Source},
+        types::{Define, Expose, FindSpec, ListEdit, Prefer, Source},
     },
+    executor::path_arg,
     lang::Lang,
     project::Project,
     resolve,
@@ -49,7 +50,13 @@ fn success_env(
         return Err(format!(
             "`{program} {}` failed: {}",
             args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+            .trim()
+            .to_string()
         ));
     }
     Ok(out)
@@ -144,6 +151,150 @@ fn find_system(spec: &FindSpec, version: Option<&str>) -> Result<Vec<String>, St
     }
 }
 
+/// Reads the installed pkg-config metadata for a vendored dependency. Prefer
+/// the file matching the dependency name; if the package uses a different
+/// pkg-config name, accept a sole `.pc` file in the prefix.
+fn installed_pkg_config(prefix: &Path, name: &str) -> Option<Expose> {
+    let dir = prefix.join("lib/pkgconfig");
+    let mut files: Vec<PathBuf> = fs::read_dir(&dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "pc"))
+        .collect();
+    files.sort();
+    let pc = files
+        .iter()
+        .find(|path| path.file_stem().is_some_and(|stem| stem == name))
+        .or_else(|| (files.len() == 1).then(|| &files[0]))?;
+    let content = fs::read_to_string(pc).ok()?;
+
+    let mut variables = BTreeMap::new();
+    let mut fields: BTreeMap<String, String> = BTreeMap::new();
+    let mut pending = String::new();
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        pending.push_str(line.trim_end_matches('\\'));
+        if line.ends_with('\\') {
+            pending.push(' ');
+            continue;
+        }
+        let field_separator = pending.find(':');
+        let variable_separator = pending.find('=');
+        if field_separator
+            .is_some_and(|field| variable_separator.is_none_or(|variable| field < variable))
+        {
+            let (key, value) = pending.split_once(':').expect("separator was found");
+            fields
+                .entry(key.trim().to_owned())
+                .and_modify(|old| {
+                    old.push(' ');
+                    old.push_str(value.trim());
+                })
+                .or_insert_with(|| value.trim().to_owned());
+        } else if let Some((key, value)) = pending.split_once('=') {
+            variables.insert(key.trim().to_owned(), value.trim().to_owned());
+        }
+        pending.clear();
+    }
+    if !pending.is_empty() {
+        if let Some((key, value)) = pending.split_once(':') {
+            fields.insert(key.trim().to_owned(), value.trim().to_owned());
+        } else if let Some((key, value)) = pending.split_once('=') {
+            variables.insert(key.trim().to_owned(), value.trim().to_owned());
+        }
+    }
+
+    let expand = |value: &str| {
+        let mut result = value.to_owned();
+        for _ in 0..variables.len().max(1) {
+            let mut expanded = String::new();
+            let mut rest = result.as_str();
+            while let Some(start) = rest.find("${") {
+                expanded.push_str(&rest[..start]);
+                let after = &rest[start + 2..];
+                let Some(end) = after.find('}') else {
+                    expanded.push_str(&rest[start..]);
+                    rest = "";
+                    break;
+                };
+                let key = &after[..end];
+                if let Some(replacement) = variables.get(key) {
+                    expanded.push_str(replacement);
+                } else {
+                    expanded.push_str(&rest[start..start + end + 3]);
+                }
+                rest = &after[end + 1..];
+            }
+            expanded.push_str(rest);
+            if expanded == result {
+                break;
+            }
+            result = expanded;
+        }
+        result
+    };
+
+    let mut exposure = Expose::default();
+    for field in ["Cflags"] {
+        let Some(value) = fields.get(field) else {
+            continue;
+        };
+        let value = expand(value);
+        let tokens: Vec<_> = value.split_whitespace().collect();
+        let mut i = 0;
+        while i < tokens.len() {
+            let token = tokens[i];
+            let argument = if token == "-I" && i + 1 < tokens.len() {
+                i += 1;
+                Some(tokens[i])
+            } else {
+                token.strip_prefix("-I")
+            };
+            if let Some(path) = argument {
+                exposure.include.push(PathBuf::from(path));
+            } else if let Some(define) = token
+                .strip_prefix("-D")
+                .and_then(|value| value.parse::<Define>().ok())
+            {
+                exposure.defines.push(define);
+            } else {
+                exposure.cflags.push(token.to_owned());
+            }
+            i += 1;
+        }
+    }
+    for field in ["Libs", "Libs.private"] {
+        let Some(value) = fields.get(field) else {
+            continue;
+        };
+        let value = expand(value);
+        let tokens: Vec<_> = value.split_whitespace().collect();
+        let mut i = 0;
+        while i < tokens.len() {
+            let token = tokens[i];
+            if token == "-L" && i + 1 < tokens.len() {
+                i += 1;
+                exposure.lib_dirs.push(PathBuf::from(tokens[i]));
+            } else if let Some(path) = token.strip_prefix("-L") {
+                exposure.lib_dirs.push(PathBuf::from(path));
+            } else if token == "-l" && i + 1 < tokens.len() {
+                i += 1;
+                exposure.libs.push(tokens[i].to_owned());
+            } else if let Some(lib) = token.strip_prefix("-l") {
+                exposure.libs.push(lib.to_owned());
+            } else {
+                exposure.ldflags.push(token.to_owned());
+            }
+            i += 1;
+        }
+    }
+    Some(exposure)
+}
+
 fn source_dir(root: &Path, name: &str, dep: &Dependency, profile: &str) -> Result<PathBuf, String> {
     let base = root.join("build/deps").join(name);
     let src = base.join("source");
@@ -168,23 +319,60 @@ fn source_dir(root: &Path, name: &str, dep: &Dependency, profile: &str) -> Resul
             submodules,
         } => {
             fs::create_dir_all(&base).map_err(|e| e.to_string())?;
-            if !src.join(".git").exists() {
-                success(
+            // A previous interrupted clone can leave a non-empty directory
+            // behind. Git refuses to clone into it, so discard that partial
+            // checkout and start cleanly. Keep valid Git checkouts so pinned
+            // revisions can be fetched and reused below.
+            let valid_checkout = if src.join(".git").exists() {
+                run(
                     "git",
-                    &["clone".into(), url.clone(), src.display().to_string()],
+                    &[
+                        "-C".into(),
+                        path_arg(&src),
+                        "rev-parse".into(),
+                        "--is-inside-work-tree".into(),
+                    ],
                     root,
-                )?;
+                )
+                .is_ok_and(|out| {
+                    out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true"
+                })
+            } else {
+                false
+            };
+            if !valid_checkout && src.exists() {
+                let metadata = fs::symlink_metadata(&src).map_err(|e| e.to_string())?;
+                if metadata.file_type().is_dir() {
+                    fs::remove_dir_all(&src).map_err(|e| e.to_string())?;
+                } else {
+                    fs::remove_file(&src).map_err(|e| e.to_string())?;
+                }
             }
+            if !valid_checkout {
+                success("git", &["clone".into(), url.clone(), path_arg(&src)], root)?;
+            }
+            success(
+                "git",
+                &[
+                    "-C".into(),
+                    path_arg(&src),
+                    "remote".into(),
+                    "set-url".into(),
+                    "origin".into(),
+                    url.clone(),
+                ],
+                root,
+            )?;
             let git = |args: Vec<String>| success("git", &args, root);
             let desired = git(vec![
                 "-C".into(),
-                src.display().to_string(),
+                path_arg(&src),
                 "rev-parse".into(),
                 format!("{rev}^{{commit}}"),
             ]);
             let current = git(vec![
                 "-C".into(),
-                src.display().to_string(),
+                path_arg(&src),
                 "rev-parse".into(),
                 "HEAD".into(),
             ]);
@@ -198,7 +386,7 @@ fn source_dir(root: &Path, name: &str, dep: &Dependency, profile: &str) -> Resul
             if !up_to_date {
                 git(vec![
                     "-C".into(),
-                    src.display().to_string(),
+                    path_arg(&src),
                     "fetch".into(),
                     "--tags".into(),
                     "origin".into(),
@@ -206,7 +394,7 @@ fn source_dir(root: &Path, name: &str, dep: &Dependency, profile: &str) -> Resul
                 ])?;
                 git(vec![
                     "-C".into(),
-                    src.display().to_string(),
+                    path_arg(&src),
                     "checkout".into(),
                     "--force".into(),
                     "FETCH_HEAD".into(),
@@ -217,7 +405,7 @@ fn source_dir(root: &Path, name: &str, dep: &Dependency, profile: &str) -> Resul
                     "git",
                     &[
                         "-C".into(),
-                        src.display().to_string(),
+                        path_arg(&src),
                         "submodule".into(),
                         "update".into(),
                         "--init".into(),
@@ -239,23 +427,14 @@ fn source_dir(root: &Path, name: &str, dep: &Dependency, profile: &str) -> Resul
             if !archive.is_file() {
                 success(
                     "curl",
-                    &[
-                        "-fL".into(),
-                        url.clone(),
-                        "-o".into(),
-                        archive.display().to_string(),
-                    ],
+                    &["-fL".into(), url.clone(), "-o".into(), path_arg(&archive)],
                     root,
                 )?;
             }
             let hash = if cfg!(windows) {
                 let o = success(
                     "certutil",
-                    &[
-                        "-hashfile".into(),
-                        archive.display().to_string(),
-                        "SHA256".into(),
-                    ],
+                    &["-hashfile".into(), path_arg(&archive), "SHA256".into()],
                     root,
                 )?;
                 String::from_utf8_lossy(&o.stdout)
@@ -265,7 +444,7 @@ fn source_dir(root: &Path, name: &str, dep: &Dependency, profile: &str) -> Resul
                     .unwrap_or("")
                     .to_lowercase()
             } else {
-                let o = success("sha256sum", &[archive.display().to_string()], root)?;
+                let o = success("sha256sum", &[path_arg(&archive)], root)?;
                 String::from_utf8_lossy(&o.stdout)
                     .split_whitespace()
                     .next()
@@ -288,9 +467,9 @@ fn source_dir(root: &Path, name: &str, dep: &Dependency, profile: &str) -> Resul
                     "tar",
                     &[
                         "-xf".into(),
-                        archive.display().to_string(),
+                        path_arg(&archive),
                         "-C".into(),
-                        src.display().to_string(),
+                        path_arg(&src),
                         "--strip-components".into(),
                         strip,
                     ],
@@ -324,7 +503,7 @@ fn build_dependency(
         .join(profile)
         .join("install");
     fs::create_dir_all(&prefix).map_err(|e| e.to_string())?;
-    let p = prefix.display().to_string();
+    let p = path_arg(&prefix);
     let cc = project
         .c
         .as_ref()
@@ -401,31 +580,31 @@ fn build_dependency(
                     vec![
                         "/nologo".into(),
                         "/FS".into(),
-                        format!("/I{}", work.display()),
+                        format!("/I{}", path_arg(&work)),
                     ]
                 } else {
-                    vec!["-I".into(), work.display().to_string()]
+                    vec!["-I".into(), path_arg(&work)]
                 };
                 if let Some(expose) = &dep.expose {
                     for include in &expose.include {
                         argv.push(if is_msvc {
-                            format!("/I{}", work.join(include).display())
+                            format!("/I{}", path_arg(&work.join(include)))
                         } else {
                             "-I".into()
                         });
                         if !is_msvc {
-                            argv.push(work.join(include).display().to_string());
+                            argv.push(path_arg(&work.join(include)));
                         }
                     }
                 }
                 for include in &project.include_dirs {
                     argv.push(if is_msvc {
-                        format!("/I{}", include.display())
+                        format!("/I{}", path_arg(include))
                     } else {
                         "-I".into()
                     });
                     if !is_msvc {
-                        argv.push(include.display().to_string());
+                        argv.push(path_arg(include));
                     }
                 }
                 argv.extend(resolved.compile_args(
@@ -438,15 +617,15 @@ fn build_dependency(
                 if is_msvc {
                     argv.extend([
                         "/c".into(),
-                        format!("/Fo{}", object.display()),
-                        source.display().to_string(),
+                        format!("/Fo{}", path_arg(&object)),
+                        path_arg(source),
                     ]);
                 } else {
                     argv.extend([
                         "-c".into(),
-                        source.display().to_string(),
+                        path_arg(source),
                         "-o".into(),
-                        object.display().to_string(),
+                        path_arg(&object),
                     ]);
                 }
                 argv.extend(args.iter().cloned());
@@ -457,13 +636,13 @@ fn build_dependency(
             fs::create_dir_all(&lib_dir).map_err(|e| e.to_string())?;
             if project.uses_msvc() {
                 let archive = lib_dir.join(format!("{name}.lib"));
-                let mut argv = vec!["/nologo".into(), format!("/OUT:{}", archive.display())];
-                argv.extend(objects.iter().map(|p| p.display().to_string()));
+                let mut argv = vec!["/nologo".into(), format!("/OUT:{}", path_arg(&archive))];
+                argv.extend(objects.iter().map(|p| path_arg(p)));
                 success_env("lib.exe", &argv, root, &dep.build.env)?;
             } else {
                 let archive = lib_dir.join(format!("lib{name}.a"));
-                let mut argv = vec!["rcs".into(), archive.display().to_string()];
-                argv.extend(objects.iter().map(|p| p.display().to_string()));
+                let mut argv = vec!["rcs".into(), path_arg(&archive)];
+                argv.extend(objects.iter().map(|p| path_arg(p)));
                 success_env("ar", &argv, root, &dep.build.env)?;
             }
         }
@@ -484,9 +663,9 @@ fn build_dependency(
             let build = prefix.parent().unwrap().join("cmake-build");
             let mut a = vec![
                 "-S".into(),
-                work.display().to_string(),
+                path_arg(&work),
                 "-B".into(),
-                build.display().to_string(),
+                path_arg(&build),
                 format!("-DCMAKE_INSTALL_PREFIX={p}"),
             ];
             a.push(format!(
@@ -505,7 +684,7 @@ fn build_dependency(
                 "cmake",
                 &[
                     "--build".into(),
-                    build.display().to_string(),
+                    path_arg(&build),
                     "--parallel".into(),
                     jobs.to_string(),
                 ],
@@ -514,7 +693,7 @@ fn build_dependency(
             )?;
             success_env(
                 "cmake",
-                &["--install".into(), build.display().to_string()],
+                &["--install".into(), path_arg(&build)],
                 root,
                 &dep.build.env,
             )?;
@@ -523,8 +702,8 @@ fn build_dependency(
             let build = prefix.parent().unwrap().join("meson-build");
             let mut setup = vec![
                 "setup".into(),
-                build.display().to_string(),
-                work.display().to_string(),
+                path_arg(&build),
+                path_arg(&work),
                 format!("--prefix={p}"),
             ];
             setup.extend(args.iter().cloned());
@@ -534,7 +713,7 @@ fn build_dependency(
                 &[
                     "compile".into(),
                     "-C".into(),
-                    build.display().to_string(),
+                    path_arg(&build),
                     "-j".into(),
                     jobs.to_string(),
                 ],
@@ -543,7 +722,7 @@ fn build_dependency(
             )?;
             success_env(
                 "meson",
-                &["install".into(), "-C".into(), build.display().to_string()],
+                &["install".into(), "-C".into(), path_arg(&build)],
                 root,
                 &dep.build.env,
             )?;
@@ -714,8 +893,9 @@ pub fn prepare(project: &mut Project, profile: &str, jobs: usize) -> Result<(), 
         }
         let (prefix, source) = build_dependency(project, &name, dep, profile, jobs)
             .map_err(|e| ConfigError::invalid(format!("dependency.{name}"), e))?;
-        let exposure = dep.expose.as_ref();
-        let manual = exposure.is_some();
+        let discovered = installed_pkg_config(&prefix, &name);
+        let exposure = dep.expose.as_ref().or(discovered.as_ref());
+        let manual = dep.expose.is_some();
         let includes = exposure
             .map(|e| e.include.clone())
             .unwrap_or_else(|| vec![PathBuf::from("include")]);
