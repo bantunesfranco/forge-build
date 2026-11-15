@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    build::{BuildOptions, BuildPlan, build, prepare},
+    build::{BuildOptions, build},
     config::{self, ConfigError, Diagnostics, Level, find_manifest},
     configure::{
         model::Invocation,
@@ -15,7 +15,7 @@ use crate::{
     },
     deps::{self, Phase, prepare_all},
     executor::{Executor, ProcessExecutor},
-    explain::explain,
+    explain::explain_arg,
     graph::Graph,
     project::Project,
 };
@@ -68,9 +68,10 @@ enum Commands {
         #[arg(long)]
         dot: bool,
     },
-    Explain {
-        target: Option<PathBuf>,
-    },
+    /// Show what build would do. With a lib, bin or dependency name: its merged
+    /// configuration and where each value came from. With a path: why that
+    /// file is rebuilt. With nothing: one line per task.
+    Explain { target: Option<PathBuf> },
     /// Resolve git dependencies again and rewrite project.lock.
     Update {
         /// Update only this git dependency (default: all of them).
@@ -180,25 +181,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Some(Commands::Explain { target }) => {
-            let mut graph: Graph = Graph::from_project(&project)?;
-            let mut explain_path = target.clone();
-            if let Some(raw) = target.as_deref()
-                && let Some(named) = project
-                    .targets
-                    .iter()
-                    .find(|t| t.name.as_str() == raw.to_string_lossy().as_ref())
-            {
-                graph = graph.select_target(&project, &named.name)?;
-                explain_path = Some(project.target_output_path(named));
-            }
-            let plan: BuildPlan = prepare(&graph, &project, &ProcessExecutor);
+            // A unit name prints its configuration, anything else is a path.
             let cwd: PathBuf = current_dir().unwrap();
-            match explain(&graph, &plan, explain_path.as_deref(), &project.root, &cwd) {
-                Ok(str) => {
-                    println!("{}", str)
-                }
-                Err(e) => return Err(Box::new(e)),
-            }
+            let text = explain_arg(&project, target.as_deref(), &cwd, &ProcessExecutor)?;
+            println!("{}", text)
         }
         Some(Commands::Update { .. }) | None => {}
     }

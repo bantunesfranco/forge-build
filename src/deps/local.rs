@@ -150,7 +150,7 @@ fn prebuilt(c: &Configured, root: &Path, unit: usize) -> Result<Prepared, Config
 
 /// The alias entries that rewrote a lookup in `template` on this platform,
 /// e.g. `alias arch x86_64->x64`.
-fn alias_note(alias: &Alias, c: &Configured, template: &str) -> Option<String> {
+pub(crate) fn alias_note(alias: &Alias, c: &Configured, template: &str) -> Option<String> {
     let p = &c.platform;
     let used =
         |axis: &str| template.contains(&format!("${{{axis}}}")) || template.contains("${triplet}");

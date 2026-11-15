@@ -177,7 +177,7 @@ fn has_condition(raw_key: &str) -> bool {
 
 /// `full` relative to `root` with `/` separators and no `.` parts; unchanged
 /// when it lies outside `root`.
-fn root_relative(root: &Path, full: &Path) -> PathBuf {
+pub(crate) fn root_relative(root: &Path, full: &Path) -> PathBuf {
     let Ok(rel) = full.strip_prefix(root) else {
         return full.to_path_buf();
     };
