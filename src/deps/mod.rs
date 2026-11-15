@@ -1,5 +1,6 @@
 //! Dependency preparation per kind (spec 10).
 
+pub mod cmake;
 pub mod git;
 pub mod local;
 pub mod lockfile;
@@ -17,6 +18,7 @@ use crate::{
     project::Project,
 };
 
+use cmake::build_cmake;
 use git::{checkout, pin};
 use local::prepare_local;
 use lockfile::{LOCK_FILE, Lockfile};
@@ -29,6 +31,8 @@ pub struct Prepared {
     pub lib_dirs: Vec<PathBuf>,
     pub libs: Vec<String>,
     pub extra: Settings,
+    /// A `cmake` dependency that `Phase::Configure` has not built yet.
+    pub not_built: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,13 +53,15 @@ pub enum Phase {
 /// dependency. The lockfile is written once every git dependency succeeded.
 ///
 /// The local kinds need the same work in both phases and are done after the
-/// first call, so the second call only looks. Only `cmake` will need work in
-/// `Phase::Build`.
+/// first call, so the second call only looks. A `cmake` dependency is only
+/// marked `not_built` in `Phase::Configure` (its own `include` keys still
+/// reach its consumers); `Phase::Build` configures and builds it, and adds
+/// the include directories CMake reports unless it declares its own.
 pub fn prepare_all(
     project: &mut Project,
-    _phase: Phase,
+    phase: Phase,
     _exec: &dyn Executor,
-    _jobs: usize,
+    jobs: usize,
 ) -> Result<(), ConfigError> {
     let pending: Vec<usize> = (0..project.configured.units.len())
         .filter(|&unit| {
@@ -69,6 +75,9 @@ pub fn prepare_all(
                 .is_some_and(|d| matches!(d.source, DepSource::Path(_) | DepSource::Git { .. }));
             let done = match kind {
                 DepKind::Sources => !u.sources.is_empty(),
+                DepKind::Cmake if phase == Phase::Build => {
+                    project.prepared.get(&unit).is_some_and(|p| !p.not_built)
+                }
                 _ => project.prepared.contains_key(&unit),
             };
             local && !done
@@ -78,11 +87,56 @@ pub fn prepare_all(
     fetch_git(project, &pending)?;
 
     for unit in pending {
-        if let Some(prepared) = prepare_local(&mut project.configured, &project.root, unit)? {
+        if project.configured.units[unit].kind == UnitKind::Dep(DepKind::Cmake) {
+            let prepared = prepare_cmake(project, phase, unit, jobs)?;
+            project.prepared.insert(unit, prepared);
+        } else if let Some(prepared) = prepare_local(&mut project.configured, &project.root, unit)?
+        {
             project.prepared.insert(unit, prepared);
         }
     }
     Ok(())
+}
+
+/// A `cmake` dependency: only marked in `Phase::Configure`, built in
+/// `Phase::Build`.
+fn prepare_cmake(
+    project: &mut Project,
+    phase: Phase,
+    unit: usize,
+    jobs: usize,
+) -> Result<Prepared, ConfigError> {
+    let u = &project.configured.units[unit];
+    let field = format!("dependency.{}", u.name);
+    if u.dep.as_ref().is_none_or(|d| d.expose.is_empty()) {
+        return Err(ConfigError::invalid(
+            field,
+            "kind `cmake` needs `expose.target`",
+        ));
+    }
+    if phase == Phase::Configure {
+        return Ok(Prepared {
+            not_built: true,
+            ..Prepared::default()
+        });
+    }
+    let prepared = build_cmake(
+        &project.configured,
+        &project.root,
+        &project.build_dir(),
+        unit,
+        &project.toolchains,
+        jobs,
+    )
+    .map_err(|message| ConfigError::invalid(field, message))?;
+    // CMake's own include directories reach the consumers like `include` keys.
+    let public = &mut project.configured.units[unit].public.include;
+    for dir in &prepared.include {
+        if !public.contains(dir) {
+            public.push(dir.clone());
+        }
+    }
+    Ok(prepared)
 }
 
 /// Pins and checks out the git dependencies among `units`, then writes

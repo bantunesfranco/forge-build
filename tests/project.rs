@@ -242,40 +242,26 @@ fn only_languages_present_need_a_standard() {
 }
 
 #[test]
-fn cmake_and_system_dependencies_are_not_supported_yet() {
-    for (dep, what) in [
-        (
-            "git = \"https://example.com/glad\"
-rev = \"1\"
-kind = \"cmake\"
-expose = { target = \"glad\" }",
-            "`cmake`",
-        ),
-        (
-            "kind = \"system\"
-find = \"glad\"",
-            "`system`",
-        ),
-    ] {
-        let f = Fixture::new(&format!(
-            "[workspace]
+fn system_dependencies_are_not_supported_yet() {
+    let f = Fixture::new(
+        "[workspace]
 name = \"t\"
 version = \"1\"
 c = \"17\"
 [dependency.glad]
-{dep}
+kind = \"system\"
+find = \"glad\"
 [bin.app]
 sources = [\"main.c\"]
 deps = [\"glad\"]
-"
-        ));
-        f.touch("main.c");
-        let e = f.error();
-        assert!(
-            e.contains("dependency.glad") && e.contains(what) && e.contains("not supported yet"),
-            "{e}"
-        );
-    }
+",
+    );
+    f.touch("main.c");
+    let e = f.error();
+    assert!(
+        e.contains("dependency.glad") && e.contains("`system`") && e.contains("not supported yet"),
+        "{e}"
+    );
 }
 
 #[test]

@@ -1,0 +1,21 @@
+{
+  "name": "glfw",
+  "id": "glfw::@a",
+  "type": "STATIC_LIBRARY",
+  "artifacts": [ { "path": "src/libglfw3.a" } ],
+  "compileGroups": [
+    {
+      "language": "C",
+      "includes": [
+        { "path": "/work/glfw/include" },
+        { "path": "/work/glfw/src" },
+        { "path": "/usr/include/other", "isSystem": true }
+      ]
+    },
+    {
+      "language": "C",
+      "includes": [ { "path": "/work/glfw/include" } ]
+    }
+  ],
+  "dependencies": [ { "id": "glfw_util::@a" } ]
+}

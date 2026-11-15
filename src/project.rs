@@ -399,18 +399,15 @@ fn any_source(c: &Configured, lang: Lang) -> bool {
         .any(|s| Lang::from_path(s) == Some(lang))
 }
 
-/// The local kinds (from a `path` or a `git` checkout) are prepared by
-/// `deps::prepare_all`; the others belong to later tasks.
+/// The local kinds and `cmake` (from a `path` or a `git` checkout) are prepared
+/// by `deps::prepare_all`; `system` belongs to a later task.
 fn check_dependencies_are_supported(c: &Configured) -> Result<(), ConfigError> {
     for unit in &c.units {
         let UnitKind::Dep(kind) = unit.kind else {
             continue;
         };
         let field = format!("dependency.{}", unit.name);
-        if !matches!(
-            kind,
-            DepKind::HeaderOnly | DepKind::Sources | DepKind::Prebuilt
-        ) {
+        if kind == DepKind::System {
             return Err(ConfigError::invalid(
                 field,
                 format!("kind `{}` is not supported yet", kind.as_str()),

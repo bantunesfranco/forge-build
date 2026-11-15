@@ -124,6 +124,11 @@ fn is_at(dir: &Path, url: &str, commit: &str) -> bool {
         && git(&["remote", "get-url", "origin"], dir).is_ok_and(|origin| origin == url)
 }
 
+/// The commit a checkout is at.
+pub fn head_commit(dir: &Path) -> Result<String, String> {
+    git(&["rev-parse", "HEAD"], dir)
+}
+
 /// Checks out `commit` of `url` into `build/deps/<name>/source` and returns
 /// that directory. A checkout that is already at `commit` is left alone and
 /// nothing is fetched, so a locked build works offline.
