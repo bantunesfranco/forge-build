@@ -1,20 +1,15 @@
-//! explain reports what build would do, and runs nothing.
+//! explain reports what build would do, and runs nothing. Skipped (with a note
+//! on stderr) when no C++ compiler can be run.
+mod common;
 
-use std::{
-    fs, io,
-    path::{Path, PathBuf},
-    process::Command,
-    sync::Mutex,
-};
+use std::{io, path::Path, sync::Mutex};
 
+use common::{Fixture, exe, jobs, real_cxx};
 use forge_build::{
-    build::{BuildOptions, build, prepare},
-    config,
+    build::{build, prepare},
     executor::{CommandSpec, Executor, Outcome, ProcessExecutor},
     explain::explain,
     graph::Graph,
-    project::Project,
-    resolve,
 };
 
 struct Logging(Mutex<Vec<CommandSpec>>);
@@ -42,72 +37,67 @@ impl Executor for Logging {
     }
 }
 
-fn write(root: &Path, rel: &str, text: &str) {
-    let p = root.join(rel);
-    fs::create_dir_all(p.parent().unwrap()).unwrap();
-    fs::write(p, text).unwrap();
-}
+const MANIFEST: &str = r#"
+[workspace]
+name = "t"
+version = "0.1.0"
+cxx = "20"
 
-fn setup() -> (tempfile::TempDir, PathBuf) {
-    let t = tempfile::tempdir().unwrap();
-    let root = t.path().canonicalize().unwrap();
-    write(
-        &root,
-        "Forge.toml",
-        "[project]\nname = \"t\"\nversion = \"0.1.0\"\n\n[build]\ncompiler = \"g++\"\nstandard = \"c++20\"\n\
-        source_dirs = [\"src\"]\noutput = \"app\"\ndefault_profile = \"debug\"\n\n[build.flags]\ninclude_dirs = [\"include\"]\n\n[profile.debug]\nopt_level = 0\n\n[bin.app]\nsources = [\"src/main.cpp\"]\n\n[bin.other]\nsources = [\"src/other.cpp\"]\n",
-    );
-    write(&root, "include/a.hpp", "inline int a() { return 0; }\n");
-    write(
-        &root,
-        "src/main.cpp",
-        "#include \"a.hpp\"\nint main() { return a(); }\n",
-    );
-    write(
-        &root,
-        "src/other.cpp",
-        "int other() { return 1; }\nint main() { return other(); }\n",
-    );
-    (t, root)
+[bin.app]
+sources = ["src/main.cpp"]
+include = ["include"]
+
+[bin.other]
+sources = ["src/other.cpp"]
+"#;
+
+/// Paths print with the platform's separator; the assertions use `/`.
+fn slashes(text: String) -> String {
+    text.replace('\\', "/")
 }
 
 #[test]
 fn explain_matches_what_build_then_does_and_runs_nothing() {
-    if Command::new("g++").arg("--version").output().is_err() {
-        eprintln!("skipping: g++ not installed");
+    let Some(cxx) = real_cxx() else {
+        eprintln!("skipping: no C++ compiler can be run");
         return;
-    }
-    let (_t, root) = setup();
-    let exec = Logging::new();
-    let project = Project::from_config(config::load(&root.join("Forge.toml")).unwrap()).unwrap();
-    let graph = Graph::from_project(&project, "debug").unwrap();
-    let resolved = resolve::resolve(&project, "debug").unwrap();
-    let opts = BuildOptions {
-        jobs: 2,
-        verbose: false,
     };
+    let f = Fixture::with_toolchain(MANIFEST, "cc", &cxx);
+    f.write("include/a.hpp", "inline int a() { return 0; }\n");
+    f.write(
+        "src/main.cpp",
+        "#include \"a.hpp\"\nint main() { return a(); }\n",
+    );
+    f.write(
+        "src/other.cpp",
+        "int other() { return 1; }\nint main() { return other(); }\n",
+    );
+    let root = f.root.clone();
+    let exec = Logging::new();
+    let project = f.load_with(&f.invocation(), &exec).unwrap();
+    let graph = Graph::from_project(&project).unwrap();
 
     // A named graph/explanation is the target closure, without unrelated tasks.
-    let app_graph = graph.select_target(&project, "debug", "app").unwrap();
+    let app_graph = graph.select_target(&project, "app").unwrap();
     assert_eq!(app_graph.tasks.len(), 2);
-    let app_plan = prepare(&app_graph, &project, &resolved, &exec, "debug");
-    let app_text = explain(&app_graph, &app_plan, None, &root, &root).unwrap();
+    let app_plan = prepare(&app_graph, &project, &exec);
+    let app_text = slashes(explain(&app_graph, &app_plan, None, &root, &root).unwrap());
     assert!(app_text.contains("2 of 2 tasks need to run."), "{app_text}");
     assert!(!app_text.contains("bin/other"), "{app_text}");
 
     // before the first full build: everything is out of date
-    let plan = prepare(&graph, &project, &resolved, &exec, "debug");
-    let text = explain(&graph, &plan, None, &root, &root).unwrap();
+    let plan = prepare(&graph, &project, &exec);
+    let text = slashes(explain(&graph, &plan, None, &root, &root).unwrap());
     assert!(
         text.contains("no previous build record") && text.contains("4 of 4"),
         "{text}"
     );
 
-    build(&project, &graph, &resolved, &exec, "debug", opts).unwrap();
+    build(&project, &graph, &exec, jobs(2)).unwrap();
 
     // after: clean, and explain launches no compile or link command
     exec.clear();
-    let plan = prepare(&graph, &project, &resolved, &exec, "debug");
+    let plan = prepare(&graph, &project, &exec);
     let text = explain(&graph, &plan, None, &root, &root).unwrap();
     assert!(text.contains("Nothing to do."), "{text}");
     assert!(
@@ -120,15 +110,13 @@ fn explain_matches_what_build_then_does_and_runs_nothing() {
     );
 
     // edit the header: explain names it, and build then runs exactly that
-    write(
-        &root,
-        "include/a.hpp",
-        "inline int a() { return 0; } // edited\n",
-    );
-    let plan = prepare(&graph, &project, &resolved, &exec, "debug");
-    let text = explain(&graph, &plan, None, &root, &root).unwrap();
+    f.write("include/a.hpp", "inline int a() { return 0; } // edited\n");
+    let plan = prepare(&graph, &project, &exec);
+    let text = slashes(explain(&graph, &plan, None, &root, &root).unwrap());
+    let object = project.target_object_path("app", Path::new("src/main.cpp"));
+    let object = slashes(object.display().to_string());
     assert!(
-        text.contains("build/debug/obj/app/src/main.cpp.o: rebuild: include/a.hpp changed"),
+        text.contains(&format!("{object}: rebuild: include/a.hpp changed")),
         "{text}"
     );
     assert!(
@@ -136,20 +124,22 @@ fn explain_matches_what_build_then_does_and_runs_nothing() {
         "{text}"
     );
     assert!(
-        text.contains(
-            "build/debug/bin/app: rebuild: build/debug/obj/app/src/main.cpp.o was rebuilt"
-        ),
+        text.contains(&format!(
+            "build/debug/bin/{}: rebuild: {object} was rebuilt",
+            exe("app")
+        )),
         "{text}"
     );
 
     // a single target shows the headers the compiler reported last time
-    let detail = explain(&graph, &plan, Some(Path::new("src/main.cpp")), &root, &root).unwrap();
+    let detail =
+        slashes(explain(&graph, &plan, Some(Path::new("src/main.cpp")), &root, &root).unwrap());
     assert!(
-        detail.contains("headers:  include/a.hpp") && detail.contains("command:  g++"),
+        detail.contains("headers:  include/a.hpp") && detail.contains(&format!("command:  {cxx}")),
         "{detail}"
     );
 
     exec.clear();
-    build(&project, &graph, &resolved, &exec, "debug", opts).unwrap();
+    build(&project, &graph, &exec, jobs(2)).unwrap();
     assert_eq!(exec.real_runs(), 2, "exactly one compile and the link");
 }

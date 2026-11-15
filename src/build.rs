@@ -13,10 +13,9 @@ use crate::{
     fingerprint,
     graph::{Graph, Task, TaskId, TaskKind},
     headers,
-    lang::Driver,
+    lang::Lang,
     planner::{self, DirtyReason},
     project::Project,
-    resolve::Resolved,
 };
 
 pub struct BuildPlan {
@@ -49,90 +48,98 @@ pub enum BuildError {
     SaveDb { path: PathBuf, source: io::Error },
 }
 
-/// The command for a task. The program and `-std=` come from the task's
-/// language (a link task takes the C++ driver if any object is C++).
-pub fn command_for(task: &Task, r: &Resolved, project: &Project) -> CommandSpec {
-    if task.kind == TaskKind::Archive {
-        if project.uses_msvc() {
-            let mut args = vec![
-                "/nologo".to_string(),
-                format!("/OUT:{}", path_arg(&task.outputs[0])),
-            ];
-            args.extend(task.inputs.iter().map(|p| path_arg(p)));
-            return CommandSpec {
-                program: "lib.exe".into(),
-                args,
-                cwd: project.root.clone(),
-            };
-        }
-        let mut args = vec!["crs".to_string(), path_arg(&task.outputs[0])];
-        args.extend(task.inputs.iter().map(|p| path_arg(p)));
-        return CommandSpec {
-            program: std::env::var("AR").unwrap_or_else(|_| "ar".into()),
-            args,
-            cwd: project.root.clone(),
-        };
-    }
-    let toolchain = r.toolchain(task.lang);
-    let mut args = Vec::new();
+/// The command for a task. A compile takes its target's arguments for the
+/// source's language; a link uses the C++ driver if any object is C++.
+pub fn command_for(task: &Task, project: &Project) -> CommandSpec {
+    let cwd = project.root.clone();
+    let msvc = project.uses_msvc();
+    let target = &project.targets[task.target];
+    let program = |lang: Lang| match lang {
+        Lang::C => project.toolchains.c.clone(),
+        Lang::Cxx => project.toolchains.cxx.clone(),
+    };
+    let objects = || task.inputs.iter().map(|p| path_arg(p));
+    let out = path_arg(&task.outputs[0]);
+
     match task.kind {
+        TaskKind::Archive => {
+            let mut args = Vec::new();
+            if msvc {
+                args.push("/nologo".to_string());
+                if project.configured.profile_scalars.lto {
+                    args.push("/LTCG".to_string());
+                }
+                args.push(format!("/OUT:{out}"));
+            } else {
+                args.push("crs".to_string());
+                args.push(out);
+            }
+            args.extend(objects());
+            CommandSpec {
+                program: project.archiver.clone(),
+                args,
+                cwd,
+            }
+        }
         TaskKind::Compile => {
-            args.extend(r.compile_args(task.lang));
-            if toolchain.driver() == Driver::Msvc {
+            let mut args = match task.lang {
+                Lang::C => target.compile_c.clone(),
+                Lang::Cxx => target.compile_cxx.clone(),
+            };
+            let depfile = path_arg(&task.outputs[1]);
+            let source = path_arg(&task.inputs[0]);
+            if msvc {
                 args.extend([
-                    "/nologo".into(),
-                    "/FS".into(),
-                    "/c".into(),
-                    "/sourceDependencies".into(),
-                    path_arg(&task.outputs[1]),
-                    format!("/Fo{}", path_arg(&task.outputs[0])),
-                    path_arg(&task.inputs[0]),
+                    "/nologo".to_string(),
+                    "/FS".to_string(),
+                    "/c".to_string(),
+                    "/sourceDependencies".to_string(),
+                    depfile,
+                    format!("/Fo{out}"),
+                    source,
                 ]);
             } else {
                 args.extend([
-                    "-MMD".into(),
-                    "-MF".into(),
-                    path_arg(&task.outputs[1]),
-                    "-c".into(),
-                    path_arg(&task.inputs[0]),
+                    "-MMD".to_string(),
+                    "-MF".to_string(),
+                    depfile,
+                    "-c".to_string(),
+                    source,
+                    "-o".to_string(),
+                    out,
                 ]);
+            }
+            CommandSpec {
+                program: program(task.lang),
+                args,
+                cwd,
             }
         }
         TaskKind::Link => {
-            args.extend(task.inputs.iter().map(|p| path_arg(p)));
-            if toolchain.driver() == Driver::Msvc {
-                args.push("/link".into());
-                args.extend(r.link_args.iter().cloned());
-                args.push(format!("/OUT:{}", path_arg(&task.outputs[0])));
-                return CommandSpec {
-                    program: toolchain.program.clone(),
-                    args,
-                    cwd: project.root.clone(),
-                };
+            let mut args: Vec<String> = objects().collect();
+            if msvc {
+                args.push("/nologo".to_string());
+                args.push("/link".to_string());
+                args.extend(target.link.iter().cloned());
+                args.push(format!("/OUT:{out}"));
+            } else {
+                args.extend(target.link.iter().cloned());
+                args.push("-o".to_string());
+                args.push(out);
             }
-            args.extend(r.link_args.iter().cloned());
+            CommandSpec {
+                program: program(task.lang),
+                args,
+                cwd,
+            }
         }
-        TaskKind::Archive => unreachable!("archive tasks return above"),
-    }
-
-    if toolchain.driver() != Driver::Msvc {
-        args.push("-o".into());
-        args.push(path_arg(&task.outputs[0]));
-    }
-    CommandSpec {
-        program: toolchain.program.clone(),
-        args,
-        cwd: project.root.clone(),
     }
 }
 
-/// Where the build database for `profile` lives (inside the build directory,
-/// so `clean` removes it).
-pub fn db_path(project: &Project, profile: &str) -> PathBuf {
-    project
-        .root
-        .join(project.build_dir(profile))
-        .join("forge.db")
+/// Where the build database lives (inside the build directory, so `clean`
+/// removes it).
+pub fn db_path(project: &Project) -> PathBuf {
+    project.root.join(project.build_dir()).join("forge.db")
 }
 
 /// Builds the record for a task that just succeeded, or says why it can't be
@@ -196,9 +203,7 @@ fn make_record(
 pub fn build(
     project: &Project,
     graph: &Graph,
-    resolved: &Resolved,
     exec: &(dyn Executor + Sync), // shared across worker threads
-    profile: &str,
     opts: BuildOptions,
 ) -> Result<(), BuildError> {
     let root = project.root.as_path();
@@ -210,8 +215,8 @@ pub fn build(
         specs,
         hashes,
         dirty,
-    } = prepare(graph, project, resolved, exec, profile);
-    let db_file = db_path(project, profile);
+    } = prepare(graph, project, exec);
+    let db_file = db_path(project);
     if dirty.is_empty() {
         println!("Build is up to date");
         return Ok(());
@@ -369,15 +374,9 @@ pub fn build(
     Ok(())
 }
 
-pub fn prepare(
-    graph: &Graph,
-    project: &Project,
-    resolved: &Resolved,
-    exec: &(dyn Executor + Sync),
-    profile: &str,
-) -> BuildPlan {
+pub fn prepare(graph: &Graph, project: &Project, exec: &(dyn Executor + Sync)) -> BuildPlan {
     // ---- plan: no process is run for tasks that are up to date ----
-    let db_file = db_path(project, profile);
+    let db_file = db_path(project);
     let db = Database::load_or_empty(&db_file);
 
     // Keep records for tasks outside a selected target's closure. They remain
@@ -387,7 +386,7 @@ pub fn prepare(
     let specs: Vec<CommandSpec> = graph
         .tasks
         .iter()
-        .map(|t| command_for(t, resolved, project))
+        .map(|t| command_for(t, project))
         .collect();
     // one identity per distinct compiler program (C and C++ may differ)
     let mut identities: std::collections::HashMap<&str, String> = Default::default();

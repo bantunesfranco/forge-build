@@ -1,19 +1,10 @@
 pub mod flat;
 pub mod key;
-pub mod manifest;
 pub mod schema;
 pub mod types;
 pub mod vocab;
 
 use std::path::{Path, PathBuf};
-use toml::{self};
-
-pub use manifest::Manifest;
-
-pub struct Config {
-    pub path: PathBuf,
-    pub content: Manifest,
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -82,28 +73,8 @@ fn find_from(start: &Path) -> Option<PathBuf> {
     None
 }
 
-pub fn load(path: &PathBuf) -> Result<Config, ConfigError> {
-    let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
-        path: path.into(),
-        source,
-    })?;
-    let mut manifest: Manifest =
-        toml::from_str(text.as_str()).map_err(|source| ConfigError::Parse {
-            path: path.into(),
-            source,
-        })?;
-    manifest
-        .normalize()
-        .map_err(|message| ConfigError::invalid("manifest", message))?;
-    Ok(Config {
-        path: path.into(),
-        content: manifest,
-    })
-}
-
-/// Reads and validates a spec 0.3 manifest. (`load` is the legacy loader and
-/// goes away with the old manifest types.)
-pub fn load_manifest(path: &Path) -> Result<schema::Manifest, ConfigError> {
+/// Reads and validates a spec 0.3 manifest.
+pub fn load(path: &Path) -> Result<schema::Manifest, ConfigError> {
     let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
         path: path.into(),
         source,
@@ -141,24 +112,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn load_manifest_reports_path_and_line_for_syntax_errors() {
+    fn load_reports_path_and_line_for_syntax_errors() {
         let (_t, r) = tree();
         std::fs::write(r.join("project.toml"), "[workspace]\nname = \n").unwrap();
-        let e = load_manifest(&r.join("project.toml"))
-            .unwrap_err()
-            .to_string();
+        let e = load(&r.join("project.toml")).unwrap_err().to_string();
         assert!(e.contains("project.toml:2"), "{e}");
     }
 
     #[test]
-    fn load_manifest_parses_a_valid_file() {
+    fn load_parses_a_valid_file() {
         let (_t, r) = tree();
         std::fs::write(
             r.join("project.toml"),
             "[workspace]\nname = \"a\"\nversion = \"1\"\n[bin.a]\nsources = [\"a.c\"]\n",
         )
         .unwrap();
-        let m = load_manifest(&r.join("project.toml")).unwrap();
+        let m = load(&r.join("project.toml")).unwrap();
         assert_eq!(m.workspace.name, "a");
         assert!(m.targets.contains_key("a"));
     }

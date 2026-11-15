@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::{
     executor::{CommandSpec, Executor},
-    lang::{Driver, Toolchain},
+    platform::msvc_like_by_name,
 };
 
 /// Hashes the program, every argument (length-prefixed, so `["ab","c"]` and
@@ -31,13 +31,11 @@ pub fn command_hash(spec: &CommandSpec, compiler_id: &str) -> [u8; 32] {
 /// If the compiler cannot be run, the identity says so; the real compile
 /// then fails with a proper error.
 pub fn compiler_identity(exec: &dyn Executor, program: &str, cwd: &Path) -> String {
-    let is_msvc = Toolchain {
-        program: program.to_string(),
-        standard: String::new(),
-    }
-    .driver()
-        == Driver::Msvc;
-    let probe = if is_msvc { "/Bv" } else { "--version" };
+    let probe = if msvc_like_by_name(program).is_some() {
+        "/Bv"
+    } else {
+        "--version"
+    };
     let spec = CommandSpec {
         program: program.to_string(),
         args: vec![probe.to_string()],

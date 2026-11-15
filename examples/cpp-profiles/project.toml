@@ -1,0 +1,19 @@
+[workspace]
+name    = "cpp-profiles"
+version = "0.1.0"
+cxx     = "20"
+
+# `debug` and `release` are built in. `asserts = false` (release) defines NDEBUG.
+[profile.debug]
+opt        = "none"
+debug_info = true
+defines    = ["APP_DEBUG"]
+
+[profile.release]
+opt        = "speed"
+debug_info = false
+
+[bin.cpp-profiles]
+sources = ["src/**/*.cpp"]
+include = ["include"]
+defines = ["APP_NAME=\"Forge Example\""]

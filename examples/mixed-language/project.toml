@@ -1,19 +1,15 @@
-edition = "2026"
-
-[package]
-name = "mixed-language"
+[workspace]
+name    = "mixed-language"
 version = "0.1.0"
-
-[lang]
-c = "c11"
-cxx = "c++20"
+c       = "11"
+cxx     = "20"
 
 [profile.debug]
-opt_level = 0
+opt        = "none"
 debug_info = true
 
 [profile.release]
-opt_level = 2
+opt        = "speed"
 debug_info = false
 
 [bin.mixed-language]

@@ -73,7 +73,7 @@ fn stem(program: &str) -> String {
 }
 
 /// `cl` and `clang-cl` are recognised by name alone.
-fn msvc_like_by_name(program: &str) -> Option<Compiler> {
+pub fn msvc_like_by_name(program: &str) -> Option<Compiler> {
     match stem(program).as_str() {
         "cl" => Some(Compiler::Msvc),
         "clang-cl" => Some(Compiler::ClangCl),
@@ -403,14 +403,7 @@ mod tests {
     fn explicit_toolchain_file_is_read() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("toolchain.toml");
-        std::fs::write(
-            &path,
-            "[toolchain]
-c = \"file-cc\"
-ar = \"llvm-ar\"
-",
-        )
-        .unwrap();
+        std::fs::write(&path, "[toolchain]\nc = \"file-cc\"\nar = \"llvm-ar\"\n").unwrap();
         let t = read_toolchain_file(&path).unwrap();
         assert_eq!(t.c.as_deref(), Some("file-cc"));
         assert_eq!(t.cxx, None);
@@ -432,13 +425,7 @@ ar = \"llvm-ar\"
     fn toolchain_file_rejects_unknown_keys() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.toml");
-        std::fs::write(
-            &path,
-            "[toolchain]
-linker = \"x\"
-",
-        )
-        .unwrap();
+        std::fs::write(&path, "[toolchain]\nlinker = \"x\"\n").unwrap();
         let err = read_toolchain_file(&path).unwrap_err().to_string();
         assert!(err.contains("bad.toml") && err.contains("linker"), "{err}");
     }

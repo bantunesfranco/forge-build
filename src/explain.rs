@@ -149,6 +149,7 @@ mod tests {
         Graph::new(vec![
             Task {
                 kind: TaskKind::Compile,
+                target: 0,
                 lang: Lang::Cxx,
                 inputs: vec![p("src/a.cpp")],
                 implicit_inputs: vec![],
@@ -156,6 +157,7 @@ mod tests {
             },
             Task {
                 kind: TaskKind::Link,
+                target: 0,
                 lang: Lang::Cxx,
                 inputs: vec![p("build/debug/obj/a.o")],
                 implicit_inputs: vec![],
@@ -179,17 +181,28 @@ mod tests {
         }
     }
 
+    /// An absolute path on every OS: Windows needs a drive letter.
+    fn abs(path: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{path}")
+        } else {
+            path.to_string()
+        }
+    }
+
     #[test]
     fn target_may_be_given_in_any_form() {
         let g = graph();
-        let root = Path::new("/proj");
+        let root_dir = abs("/proj");
+        let root = Path::new(&root_dir);
         let find = |cwd: &str, raw: &str| find_task(&g, root, Path::new(cwd), Path::new(raw));
+        let proj = |rest: &str| abs(&format!("/proj/{rest}"));
 
-        assert_eq!(find("/proj", "build/debug/obj/a.o"), Some(0)); // root-relative
-        assert_eq!(find("/proj", "./build/debug/obj/a.o"), Some(0)); // with ./
-        assert_eq!(find("/proj/src", "../build/debug/obj/a.o"), Some(0)); // cwd-relative
-        assert_eq!(find("/elsewhere", "/proj/build/debug/app"), Some(1)); // absolute
-        assert_eq!(find("/proj", "build/debug/dep/a.d"), Some(0)); // any output counts
+        assert_eq!(find(&root_dir, "build/debug/obj/a.o"), Some(0)); // root-relative
+        assert_eq!(find(&root_dir, "./build/debug/obj/a.o"), Some(0)); // with ./
+        assert_eq!(find(&proj("src"), "../build/debug/obj/a.o"), Some(0)); // cwd-relative
+        assert_eq!(find(&abs("/elsewhere"), &proj("build/debug/app")), Some(1)); // absolute
+        assert_eq!(find(&root_dir, "build/debug/dep/a.d"), Some(0)); // any output counts
     }
 
     #[test]

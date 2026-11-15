@@ -39,7 +39,7 @@ pub struct ResolvedOption {
     pub source: OptionSource,
 }
 
-const CACHE_FILE: &str = "build/options.toml";
+pub const CACHE_FILE: &str = "build/options.toml";
 
 /// Splits `name=value` at the first `=`.
 pub fn parse_cli_opt(s: &str) -> Result<(String, String), String> {

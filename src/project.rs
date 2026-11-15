@@ -1,767 +1,357 @@
-use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+//! `Project::load`: the whole configure pipeline (spec 11) up to the build
+//! targets, each with its own compile and link arguments.
+
+use std::path::{Path, PathBuf};
 
 use crate::{
     config::{
-        Config, ConfigError, Manifest,
-        manifest::{Build, Dependency},
-        types::{Prefer, Source},
+        self, ConfigError, Diagnostics,
+        types::DepKind,
+        vocab::{Compiler, Os, Platform},
     },
-    configure::model::compare_versions,
-    discover::{discover_patterns, discover_sources},
-    lang::{Driver, Lang, Toolchain},
-    profile::validate_profiles,
-    resolve,
+    configure::{
+        configure,
+        model::{Configured, Invocation, UnitKind, effective},
+        options::{CACHE_FILE, load_cache},
+    },
+    executor::Executor,
+    flags,
+    lang::Lang,
+    platform::{Toolchains, check_combination, detect_compiler, host_os_arch, load_toolchains},
 };
 
-/// A validated project: normalized paths, discovered sources, and one
-/// toolchain for each language that actually appears in the sources.
+/// A validated, configured project: one build target per lib and bin, each
+/// with the arguments that its own settings produce.
 pub struct Project {
     pub root: PathBuf,
-    pub manifest: Manifest,
-    pub source_dirs: Vec<PathBuf>,
-    pub include_dirs: Vec<PathBuf>,
-    pub lib_dirs: Vec<PathBuf>,
-    /// Relative to `root`, sorted.
-    pub sources: Vec<PathBuf>,
-    /// Named package targets. `sources` remains the union used to select the
-    /// project's language toolchains; graph construction uses this ownership.
+    pub profile: String,
+    pub platform: Platform,
+    /// `--target` was given (the build directory then names the target).
+    pub target_override: bool,
+    pub toolchains: Toolchains,
+    /// The static-library archiver (`ar`, `llvm-ar` or `lib.exe`).
+    pub archiver: String,
+    pub configured: Configured,
     pub targets: Vec<BuildTarget>,
-    pub c: Option<Toolchain>,
-    pub cpp: Option<Toolchain>,
+    /// Warnings and infos found while configuring.
+    pub diagnostics: Diagnostics,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuildTargetKind {
     StaticLibrary,
     Binary,
+    /// A header-only library: nothing to compile, archive or link.
+    Interface,
 }
 
 #[derive(Clone, Debug)]
 pub struct BuildTarget {
     pub name: String,
     pub kind: BuildTargetKind,
+    /// Index into `Project::configured.units`.
+    pub unit: usize,
+    /// Relative to `root`, sorted.
     pub sources: Vec<PathBuf>,
+    /// Compile arguments for this target's C sources (empty without any).
+    pub compile_c: Vec<String>,
+    /// Compile arguments for this target's C++ sources (empty without any).
+    pub compile_cxx: Vec<String>,
+    /// What follows the object files on the link line (binaries only).
+    pub link: Vec<String>,
+    /// Library files that are linked but not built here; they are implicit
+    /// inputs of the link.
+    pub link_inputs: Vec<PathBuf>,
+    /// The static-library targets that get linked, in link order.
     pub deps: Vec<String>,
-}
-
-/// Where a directory is allowed to be.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Scope {
-    /// Relative, and inside the project root.
-    InsideRoot,
-    /// Absolute paths and `..` are fine. It must still exist and be a directory.
-    Anywhere,
 }
 
 impl Project {
     pub fn uses_msvc(&self) -> bool {
-        self.sources
-            .iter()
-            .find_map(|source| Lang::from_path(source))
-            .and_then(|lang| self.toolchain(lang))
-            .is_some_and(|toolchain| toolchain.driver() == Driver::Msvc)
+        matches!(self.platform.compiler, Compiler::Msvc | Compiler::ClangCl)
     }
 
-    pub fn from_config(cfg: Config) -> Result<Self, ConfigError> {
-        let root = cfg
-            .path
-            .parent()
-            .ok_or_else(|| ConfigError::invalid("manifest", "has no parent directory"))?
+    /// Reads the manifest and configures everything for this machine.
+    pub fn load(
+        manifest: &Path,
+        inv: &Invocation,
+        exec: &dyn Executor,
+    ) -> Result<Project, ConfigError> {
+        let manifest_dir = match manifest.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        let root = manifest_dir
             .canonicalize()
             .map_err(|source| ConfigError::Io {
-                path: cfg.path.clone(),
+                path: manifest.to_path_buf(),
                 source,
             })?;
+        let m = config::load(manifest)?;
 
-        let manifest = cfg.content;
-        validate_tools(&manifest.tools)?;
-        validate_profiles(&manifest.build.default_profile, &manifest.profiles)?;
-        resolve::validate_flags(&manifest)?;
+        // The platform. `--target` belongs to a later task; the host is the target.
+        let (os, arch) = host_os_arch()?;
+        let toolchains = load_toolchains(inv.toolchain.as_deref())?;
 
-        let flags = &manifest.build.flags;
-        let source_dirs = resolve_all(
-            &root,
-            "build.source_dirs",
-            &manifest.build.source_dirs,
-            Scope::InsideRoot,
-        )?;
-        let include_dirs = resolve_all(
-            &root,
-            "build.flags.include_dirs",
-            &flags.include_dirs,
-            Scope::Anywhere,
-        )?;
-        let lib_dirs = resolve_all(
-            &root,
-            "build.flags.lib_dirs",
-            &flags.lib_dirs,
-            Scope::Anywhere,
-        )?;
+        // Configure needs the compiler to evaluate conditions, and sources are
+        // only found while configuring, so the compiler is detected up front:
+        // the C++ program first, the C program if that cannot be run.
+        let (compiler, cxx_failure, c_known) = match detect_compiler(exec, &toolchains.cxx, &root) {
+            Ok(compiler) => (compiler, None, false),
+            Err(e) => match detect_compiler(exec, &toolchains.c, &root) {
+                Ok(compiler) => (compiler, Some(e), true),
+                Err(_) => return Err(e),
+            },
+        };
+        let mut platform = Platform { os, arch, compiler };
+        check_platform(&platform)?;
 
-        check_overlap("build.source_dirs", &source_dirs)?;
+        let cache = load_cache(&root.join(CACHE_FILE))?;
+        let mut configured = configure(&m, &root, inv, platform, &cache)?;
 
-        validate_dependencies(&manifest)?;
-        let mut names = std::collections::HashSet::new();
-        for name in manifest
-            .lib
-            .keys()
-            .chain(manifest.bin.keys())
-            .chain(manifest.dependencies.keys())
-        {
-            if name.is_empty()
-                || !name.chars().enumerate().all(|(i, c)| {
-                    if i == 0 {
-                        c.is_ascii_alphabetic() || c == '_'
-                    } else {
-                        c.is_ascii_alphanumeric() || c == '_' || c == '-'
-                    }
-                })
-            {
-                return Err(ConfigError::invalid(
-                    "target/dependency name",
-                    format!("`{name}` is not a valid name"),
-                ));
-            }
-            if !names.insert(name.clone()) {
-                return Err(ConfigError::invalid(
-                    "target/dependency name",
-                    format!("`{name}` is declared more than once"),
-                ));
-            }
-        }
-        for (name, target) in manifest.lib.iter().chain(manifest.bin.iter()) {
-            let mut deps = target.deps.clone();
-            if let Some(platform) = target.platform.get(current_platform()) {
-                deps.extend(platform.deps.iter().cloned());
-            }
-            for dep in deps {
-                if !names.contains(&dep) {
+        // A C source needs the C program to agree with the platform compiler.
+        if any_source(&configured, Lang::C) && !c_known {
+            let c = detect_compiler(exec, &toolchains.c, &root)?;
+            if c != compiler {
+                if any_source(&configured, Lang::Cxx) {
                     return Err(ConfigError::invalid(
-                        format!("target.{name}.deps"),
-                        format!("unknown target or dependency `{dep}`"),
+                        "compiler",
+                        format!(
+                            "C compiler `{}` is {} but C++ compiler `{}` is {}; use one compiler family",
+                            toolchains.c,
+                            c.as_str(),
+                            toolchains.cxx,
+                            compiler.as_str()
+                        ),
                     ));
                 }
+                // Only C is built, so the C compiler is the one that counts.
+                platform.compiler = c;
+                check_platform(&platform)?;
+                configured = configure(&m, &root, inv, platform, &cache)?;
             }
+        }
+        // The C program stood in for the platform, but C++ sources need theirs.
+        if any_source(&configured, Lang::Cxx)
+            && let Some(e) = cxx_failure
+        {
+            return Err(e);
         }
 
-        validate_output(&root, &manifest.build.output, &source_dirs)?;
+        check_dependencies_are_supported(&configured)?;
+        check_standards(&configured)?;
 
-        let mut targets = Vec::new();
-        for (name, target) in &manifest.lib {
-            let mut patterns = target.sources.clone();
-            let mut target_dirs = target.source_dirs.clone();
-            let mut deps = target.deps.clone();
-            if let Some(platform) = target.platform.get(current_platform()) {
-                patterns.extend(platform.sources.iter().cloned());
-                target_dirs.extend(platform.source_dirs.iter().cloned());
-                deps.extend(platform.deps.iter().cloned());
-            }
-            targets.push(BuildTarget {
-                name: name.clone(),
-                kind: BuildTargetKind::StaticLibrary,
-                sources: discover_target_sources(&root, name, &patterns, &target_dirs)?,
-                deps,
-            });
-        }
-        for (name, target) in &manifest.bin {
-            let mut patterns = target.sources.clone();
-            let mut target_dirs = target.source_dirs.clone();
-            let mut deps = target.deps.clone();
-            if let Some(platform) = target.platform.get(current_platform()) {
-                patterns.extend(platform.sources.iter().cloned());
-                target_dirs.extend(platform.source_dirs.iter().cloned());
-                deps.extend(platform.deps.iter().cloned());
-            }
-            targets.push(BuildTarget {
-                name: name.clone(),
-                kind: BuildTargetKind::Binary,
-                sources: discover_target_sources(&root, name, &patterns, &target_dirs)?,
-                deps,
-            });
-        }
-        if targets.is_empty() {
-            let sources = if manifest.build.source_patterns.is_empty() {
-                discover_sources(&root, &source_dirs)?
-            } else {
-                discover_patterns(&root, &manifest.build.source_patterns)?
+        let lto = configured.profile_scalars.lto;
+        let archiver = flags::archiver(
+            platform.compiler,
+            platform.os,
+            lto,
+            toolchains.ar.as_deref(),
+        )
+        .map_err(|m| ConfigError::invalid("archiver", m))?;
+
+        let diagnostics = std::mem::take(&mut configured.diagnostics);
+        let mut project = Project {
+            root,
+            profile: configured.profile.clone(),
+            platform,
+            target_override: inv.target.is_some(),
+            toolchains,
+            archiver,
+            configured,
+            targets: Vec::new(),
+            diagnostics,
+        };
+        project.targets = project.build_targets()?;
+        Ok(project)
+    }
+
+    /// One target per lib and bin, in unit order, with arguments filled in.
+    fn build_targets(&self) -> Result<Vec<BuildTarget>, ConfigError> {
+        let c = &self.configured;
+        let mut targets: Vec<BuildTarget> = Vec::new();
+        for (index, unit) in c.units.iter().enumerate() {
+            let kind = match unit.kind {
+                UnitKind::Lib => BuildTargetKind::StaticLibrary,
+                UnitKind::Bin => BuildTargetKind::Binary,
+                UnitKind::InterfaceLib => BuildTargetKind::Interface,
+                UnitKind::Dep(_) => continue,
             };
             targets.push(BuildTarget {
-                name: manifest.build.output.to_string_lossy().into_owned(),
-                kind: BuildTargetKind::Binary,
-                sources: sources.clone(),
-                deps: Vec::new(),
+                name: unit.name.clone(),
+                kind,
+                unit: index,
+                sources: unit.sources.clone(),
+                compile_c: Vec::new(),
+                compile_cxx: Vec::new(),
+                link: Vec::new(),
+                link_inputs: Vec::new(),
+                deps: effective(c, index)
+                    .link_units
+                    .into_iter()
+                    .map(|u| c.units[u].name.clone())
+                    .collect(),
             });
         }
-        let mut sources: Vec<PathBuf> = targets
-            .iter()
-            .flat_map(|t| t.sources.iter().cloned())
-            .collect();
-        sources.sort();
-        sources.dedup();
-        let (c, cpp) = resolve_toolchains(&manifest.build, &sources)?;
 
-        Ok(Project {
-            root,
-            manifest,
-            source_dirs,
-            include_dirs,
-            lib_dirs,
-            sources,
-            targets,
-            c,
-            cpp,
-        })
-    }
-
-    /// The requested profile, or the manifest default. Errors if it isn't defined.
-    pub fn select_profile(&self, requested: Option<&str>) -> Result<String, ConfigError> {
-        let name = requested.unwrap_or(&self.manifest.build.default_profile);
-        if !self.manifest.profiles.contains_key(name) {
-            let valid: Vec<&str> = self.manifest.profiles.keys().map(String::as_str).collect();
-            return Err(ConfigError::invalid(
-                "--profile",
-                format!("unknown profile `{name}` (defined: {})", valid.join(", ")),
-            ));
-        }
-        Ok(name.to_string())
-    }
-
-    /// Library files behind the `-l` flags that were found in `lib_dirs`.
-    ///
-    /// They are not on the link command line (`-L`/`-l` already pass them), but
-    /// the link must be redone when one is rebuilt, so the graph tracks them as
-    /// implicit inputs. System libraries such as `m` or `pthread` are not in
-    /// `lib_dirs`, so they are ignored. For each library the first directory
-    /// that has any variant wins, and every variant there is tracked, because
-    /// which one the linker takes (`.so` or `.a`) depends on its options.
-    pub fn library_files(&self) -> Vec<PathBuf> {
-        let mut found: Vec<PathBuf> = Vec::new();
-        for lib in &self.manifest.build.flags.libs {
-            for dir in &self.lib_dirs {
-                let hits: Vec<PathBuf> = ["so", "dylib", "a", "lib"]
+        // Output paths only depend on names, so the link arguments can ask for
+        // any library's file while the targets are being filled in.
+        let artifact = |unit: usize| {
+            targets
+                .iter()
+                .find(|t| t.unit == unit)
+                .map(|t| self.target_output_path(t))
+                .unwrap_or_else(|| PathBuf::from(&c.units[unit].name))
+        };
+        let mut filled = Vec::new();
+        for target in &targets {
+            let has_lang = |lang| {
+                target
+                    .sources
                     .iter()
-                    .flat_map(|ext| {
-                        let name = if *ext == "lib" {
-                            format!("{lib}.{ext}")
-                        } else {
-                            format!("lib{lib}.{ext}")
-                        };
-                        [dir.join(name)]
-                    })
-                    .filter(|p| p.is_file())
-                    .collect();
-                if !hits.is_empty() {
-                    for hit in hits {
-                        let path = hit.strip_prefix(&self.root).unwrap_or(&hit).to_path_buf();
-                        if !found.contains(&path) {
-                            found.push(path);
-                        }
-                    }
-                    break;
-                }
-            }
+                    .any(|s| Lang::from_path(s) == Some(lang))
+            };
+            let compile_c = if has_lang(Lang::C) {
+                flags::compile_args(c, target.unit, Lang::C)?
+            } else {
+                Vec::new()
+            };
+            let compile_cxx = if has_lang(Lang::Cxx) {
+                flags::compile_args(c, target.unit, Lang::Cxx)?
+            } else {
+                Vec::new()
+            };
+            let link = if target.kind == BuildTargetKind::Binary {
+                flags::link_args(c, target.unit, &artifact, &[])
+            } else {
+                Vec::new()
+            };
+            filled.push((compile_c, compile_cxx, link));
         }
-        found
-    }
-
-    pub fn toolchain(&self, lang: Lang) -> Option<&Toolchain> {
-        match lang {
-            Lang::C => self.c.as_ref(),
-            Lang::Cxx => self.cpp.as_ref(),
+        for (target, (compile_c, compile_cxx, link)) in targets.iter_mut().zip(filled) {
+            target.compile_c = compile_c;
+            target.compile_cxx = compile_cxx;
+            target.link = link;
         }
+        Ok(targets)
     }
 
     // ---- build layout (relative to `root`): one place defines it ----
 
-    pub fn build_dir(&self, profile: &str) -> PathBuf {
-        PathBuf::from("build").join(profile)
+    pub fn build_dir(&self) -> PathBuf {
+        PathBuf::from("build").join(&self.profile)
     }
 
-    pub fn object_path(&self, profile: &str, src: &Path) -> PathBuf {
+    pub fn target_object_path(&self, target: &str, src: &Path) -> PathBuf {
         let mut name = src.as_os_str().to_owned();
         name.push(if self.uses_msvc() { ".obj" } else { ".o" });
-        self.build_dir(profile).join("obj").join(name)
+        self.build_dir().join("obj").join(target).join(name)
     }
 
-    pub fn depfile_path(&self, profile: &str, src: &Path) -> PathBuf {
+    pub fn target_depfile_path(&self, target: &str, src: &Path) -> PathBuf {
         let mut name = src.as_os_str().to_owned();
         name.push(if self.uses_msvc() {
             ".obj.json"
         } else {
             ".o.d"
         });
-        self.build_dir(profile).join("dep").join(name)
+        self.build_dir().join("dep").join(target).join(name)
     }
 
-    pub fn output_path(&self, profile: &str) -> PathBuf {
-        let mut output = self.manifest.build.output.clone();
-        if cfg!(windows) && output.extension().is_none() {
-            output.set_extension("exe");
-        }
-        self.build_dir(profile).join(output)
-    }
-
-    pub fn target_object_path(&self, profile: &str, target: &str, src: &Path) -> PathBuf {
-        let mut name = src.as_os_str().to_owned();
-        name.push(if self.uses_msvc() { ".obj" } else { ".o" });
-        self.build_dir(profile).join("obj").join(target).join(name)
-    }
-
-    pub fn target_depfile_path(&self, profile: &str, target: &str, src: &Path) -> PathBuf {
-        let mut name = src.as_os_str().to_owned();
-        name.push(if self.uses_msvc() {
-            ".obj.json"
-        } else {
-            ".o.d"
-        });
-        self.build_dir(profile).join("dep").join(target).join(name)
-    }
-
-    pub fn target_output_path(&self, profile: &str, target: &BuildTarget) -> PathBuf {
+    pub fn target_output_path(&self, target: &BuildTarget) -> PathBuf {
+        let output = &self.configured.units[target.unit].output;
         match target.kind {
             BuildTargetKind::Binary => {
-                let name = if cfg!(windows) && !target.name.to_ascii_lowercase().ends_with(".exe") {
-                    format!("{}.exe", target.name)
+                let name = if self.platform.os == Os::Windows
+                    && !output.to_ascii_lowercase().ends_with(".exe")
+                {
+                    format!("{output}.exe")
                 } else {
-                    target.name.clone()
+                    output.clone()
                 };
-                self.build_dir(profile).join("bin").join(name)
+                self.build_dir().join("bin").join(name)
             }
-            BuildTargetKind::StaticLibrary => {
-                self.build_dir(profile)
-                    .join("lib")
-                    .join(if self.uses_msvc() {
-                        format!("{}.lib", target.name)
-                    } else {
-                        format!("lib{}.a", target.name)
-                    })
+            // An interface library has no file; this is where its archive would be.
+            BuildTargetKind::StaticLibrary | BuildTargetKind::Interface => {
+                self.build_dir().join("lib").join(if self.uses_msvc() {
+                    format!("{output}.lib")
+                } else {
+                    format!("lib{output}.a")
+                })
             }
         }
     }
 }
 
-fn discover_target_sources(
-    root: &Path,
-    name: &str,
-    patterns: &[String],
-    dirs: &[PathBuf],
-) -> Result<Vec<PathBuf>, ConfigError> {
-    let mut found = if patterns.is_empty() {
-        Vec::new()
-    } else {
-        discover_patterns(root, patterns)?
-    };
-    let resolved_dirs = resolve_all(
-        root,
-        &format!("target.{name}.source_dirs"),
-        dirs,
-        Scope::InsideRoot,
-    )?;
-    if !resolved_dirs.is_empty() {
-        found.extend(discover_sources(root, &resolved_dirs)?);
-    }
-    found.sort();
-    found.dedup();
-    if found.is_empty() {
-        return Err(ConfigError::invalid(
-            format!("target.{name}.sources"),
-            "no sources found; set sources or source_dirs",
-        ));
-    }
-    Ok(found)
+fn check_platform(platform: &Platform) -> Result<(), ConfigError> {
+    check_combination(platform).map_err(|m| ConfigError::invalid("compiler", m))
 }
 
-fn current_platform() -> &'static str {
-    if cfg!(target_os = "linux") {
-        "linux"
-    } else if cfg!(target_os = "macos") {
-        "macos"
-    } else if cfg!(target_os = "windows") {
-        "windows"
-    } else {
-        "other"
-    }
+/// Whether any lib or bin has a source of this language.
+fn any_source(c: &Configured, lang: Lang) -> bool {
+    c.units
+        .iter()
+        .filter(|u| matches!(u.kind, UnitKind::Lib | UnitKind::Bin))
+        .flat_map(|u| &u.sources)
+        .any(|s| Lang::from_path(s) == Some(lang))
 }
 
-fn validate_tools(tools: &std::collections::BTreeMap<String, String>) -> Result<(), ConfigError> {
-    for (name, requirement) in tools {
-        let output = Command::new(name).arg("--version").output().map_err(|e| {
-            ConfigError::invalid(
-                format!("tools.{name}"),
-                format!("required tool not found: {e}"),
-            )
-        })?;
-        if !output.status.success() {
+/// Dependencies are prepared by later tasks; only a local `header-only` one
+/// needs nothing beyond its include directories.
+fn check_dependencies_are_supported(c: &Configured) -> Result<(), ConfigError> {
+    use crate::config::schema::DepSource;
+    for unit in &c.units {
+        let UnitKind::Dep(kind) = unit.kind else {
+            continue;
+        };
+        let local = unit
+            .dep
+            .as_ref()
+            .is_some_and(|d| matches!(d.source, DepSource::Path(_)));
+        let field = format!("dependency.{}", unit.name);
+        if kind != DepKind::HeaderOnly {
             return Err(ConfigError::invalid(
-                format!("tools.{name}"),
-                "could not read tool version",
+                field,
+                format!("kind `{}` is not supported yet", kind.as_str()),
             ));
         }
-        let text = String::from_utf8_lossy(&output.stdout);
-        let version = text
-            .split(|c: char| !c.is_ascii_digit() && c != '.')
-            .find(|part| {
-                part.contains('.') && part.chars().next().is_some_and(|c| c.is_ascii_digit())
-            })
-            .unwrap_or("");
-        if let Some(minimum) = requirement.strip_prefix(">=")
-            && (version.is_empty()
-                || compare_versions(version, minimum.trim()) == std::cmp::Ordering::Less)
-        {
+        if !local {
             return Err(ConfigError::invalid(
-                format!("tools.{name}"),
-                format!(
-                    "requires {requirement}, found {}",
-                    if version.is_empty() {
-                        "unknown version"
-                    } else {
-                        version
-                    }
-                ),
+                field,
+                "kind `header-only` from a git source is not supported yet",
             ));
         }
     }
     Ok(())
 }
 
-// ------------------------------------------------------------ toolchains
-
-/// Chooses a compiler and standard for each language present in `sources`, and
-/// retains explicitly configured language toolchains for source-built deps.
-///
-/// Like Make's `CC`/`CXX`, each language has its own compiler. The bare
-/// `compiler`/`standard` keys are a shorthand for a project with exactly one
-/// language; with both languages they would be ambiguous, so they are rejected.
-fn resolve_toolchains(
-    b: &Build,
-    sources: &[PathBuf],
-) -> Result<(Option<Toolchain>, Option<Toolchain>), ConfigError> {
-    let first = |lang| sources.iter().find(|s| Lang::from_path(s) == Some(lang));
-    let (c_src, cpp_src) = (first(Lang::C), first(Lang::Cxx));
-    let mixed = c_src.is_some() && cpp_src.is_some();
-
-    // A standard from the wrong language is always a mistake, wherever it is written.
-    check_standard("build.c_standard", b.c_standard.as_deref(), Lang::C)?;
-    check_standard("build.cxx_standard", b.cxx_standard.as_deref(), Lang::Cxx)?;
-
-    if mixed && (b.compiler.is_some() || b.standard.is_some()) {
-        return Err(ConfigError::invalid(
-            "build.compiler",
-            "project has C and C++ sources, so `compiler`/`standard` are ambiguous; \
-             set c_compiler/c_standard and cpp/cpp",
-        ));
-    }
-
-    let pick = |lang: Lang,
-                src: Option<&PathBuf>,
-                prefix: &str,
-                compiler: &Option<String>,
-                standard: &Option<String>|
-     -> Result<Option<Toolchain>, ConfigError> {
-        let Some(src) = src else {
-            // A dependency built from sources can contain C even when the
-            // consumer project only has C++ sources (or vice versa). Keep a
-            // fully specified language toolchain available for that case.
-            return Ok(match (compiler, standard) {
-                (Some(program), Some(standard)) => Some(Toolchain {
-                    program: program.clone(),
-                    standard: standard.clone(),
-                }),
-                _ => None,
-            });
-        };
-        let (bare_compiler, bare_standard) = (&b.compiler, &b.standard);
-
-        for (key, specific, bare) in [
-            ("compiler", compiler, bare_compiler),
-            ("standard", standard, bare_standard),
-        ] {
-            if specific.is_some() && bare.is_some() {
+/// A language that appears in the sources needs its standard.
+fn check_standards(c: &Configured) -> Result<(), ConfigError> {
+    for unit in c
+        .units
+        .iter()
+        .filter(|u| matches!(u.kind, UnitKind::Lib | UnitKind::Bin))
+    {
+        for (lang, key, std) in [(Lang::C, "c", &c.c_std), (Lang::Cxx, "cxx", &c.cxx_std)] {
+            let Some(src) = unit
+                .sources
+                .iter()
+                .find(|s| Lang::from_path(s) == Some(lang))
+            else {
+                continue;
+            };
+            if std.is_none() {
                 return Err(ConfigError::invalid(
-                    format!("build.{key}"),
-                    format!("`{key}` and `{prefix}_{key}` are both set; use one"),
-                ));
-            }
-        }
-        check_standard("build.standard", bare_standard.as_deref(), lang)?;
-
-        let missing = |what: &str| {
-            ConfigError::invalid(
-                format!("build.{prefix}_{what}"),
-                format!(
-                    "{} source `{}` found, but no {} {what} is set; set `{prefix}_{what}` \
-                     (or `{what}` in a project with only {} sources)",
-                    lang.name(),
-                    src.display(),
-                    lang.name(),
-                    lang.name()
-                ),
-            )
-        };
-        let program = compiler
-            .as_ref()
-            .or(bare_compiler.as_ref())
-            .ok_or_else(|| missing("compiler"))?;
-        let standard = standard
-            .as_ref()
-            .or(bare_standard.as_ref())
-            .ok_or_else(|| missing("standard"))?;
-        if program.is_empty() {
-            return Err(ConfigError::invalid(
-                format!("build.{prefix}_compiler"),
-                "is empty",
-            ));
-        }
-        Ok(Some(Toolchain {
-            program: program.clone(),
-            standard: standard.clone(),
-        }))
-    };
-
-    Ok((
-        pick(Lang::C, c_src, "c", &b.c_compiler, &b.c_standard)?,
-        pick(Lang::Cxx, cpp_src, "cxx", &b.cxx_compiler, &b.cxx_standard)?,
-    ))
-}
-
-/// Which language a `-std=` value belongs to, when it is recognizable.
-fn standard_lang(s: &str) -> Option<Lang> {
-    if s.starts_with("c++") || s.starts_with("gnu++") {
-        Some(Lang::Cxx)
-    } else if s.starts_with('c') || s.starts_with("gnu") {
-        Some(Lang::C)
-    } else {
-        None
-    }
-}
-
-fn check_standard(field: &str, value: Option<&str>, lang: Lang) -> Result<(), ConfigError> {
-    let Some(s) = value else { return Ok(()) };
-    if s.is_empty() || s.chars().any(char::is_whitespace) {
-        return Err(ConfigError::invalid(
-            field,
-            format!("`{s}` is not a valid language standard"),
-        ));
-    }
-    match standard_lang(s) {
-        Some(found) if found != lang => Err(ConfigError::invalid(
-            field,
-            format!(
-                "`{s}` is a {} standard, but it is used for {} sources",
-                found.name(),
-                lang.name()
-            ),
-        )),
-        _ => Ok(()),
-    }
-}
-
-// ------------------------------------------------------------ path checks
-
-fn resolve_all(
-    root: &Path,
-    field: &str,
-    dirs: &[PathBuf],
-    scope: Scope,
-) -> Result<Vec<PathBuf>, ConfigError> {
-    dirs.iter()
-        .map(|d| resolve_dir(root, field, d, scope))
-        .collect()
-}
-
-fn resolve_dir(root: &Path, field: &str, rel: &Path, scope: Scope) -> Result<PathBuf, ConfigError> {
-    if scope == Scope::InsideRoot && rel.is_absolute() {
-        return Err(ConfigError::invalid(
-            field,
-            format!("`{}` must be a relative path", rel.display()),
-        ));
-    }
-    let canon = root.join(rel).canonicalize().map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => ConfigError::invalid(
-            field,
-            format!(
-                "`{}` does not exist (looked in {})",
-                rel.display(),
-                root.display()
-            ),
-        ),
-        _ => ConfigError::invalid(field, format!("`{}`: {e}", rel.display())),
-    })?;
-    if !canon.is_dir() {
-        return Err(ConfigError::invalid(
-            field,
-            format!("`{}` is not a directory", rel.display()),
-        ));
-    }
-    if scope == Scope::InsideRoot && !canon.starts_with(root) {
-        return Err(ConfigError::invalid(
-            field,
-            format!("`{}` is outside the project root", rel.display()),
-        ));
-    }
-    Ok(canon)
-}
-
-fn check_overlap(field: &str, dirs: &[PathBuf]) -> Result<(), ConfigError> {
-    for (i, a) in dirs.iter().enumerate() {
-        for b in &dirs[i + 1..] {
-            if a.starts_with(b) || b.starts_with(a) {
-                return Err(ConfigError::invalid(
-                    field,
-                    format!("`{}` and `{}` overlap", a.display(), b.display()),
+                    format!("workspace.{key}"),
+                    format!(
+                        "{} source `{}` found, but no {} standard is set; set `{key}` in [workspace]",
+                        lang.name(),
+                        src.display(),
+                        lang.name()
+                    ),
                 ));
             }
         }
     }
     Ok(())
-}
-
-fn validate_output(root: &Path, out: &Path, source_dirs: &[PathBuf]) -> Result<(), ConfigError> {
-    let bad = |m: String| ConfigError::invalid("build.output", m);
-    if out.is_absolute() {
-        return Err(bad(format!("`{}` must be a relative path", out.display())));
-    }
-    if out.components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err(bad(format!("`{}` must not contain `..`", out.display())));
-    }
-    if out.components().all(|c| matches!(c, Component::CurDir)) {
-        return Err(bad("must name a file, not the project root".into()));
-    }
-    let full = root.join(out);
-    if full.is_dir() {
-        return Err(bad(format!("`{}` is an existing directory", out.display())));
-    }
-    if source_dirs.iter().any(|d| full.starts_with(d)) {
-        return Err(bad(format!(
-            "`{}` is inside a source directory",
-            out.display()
-        )));
-    }
-    Ok(())
-}
-
-// --------------------------- dependencies -------------------
-
-impl Dependency {
-    pub fn validate(&self, name: &str) -> Result<(), ConfigError> {
-        let bad = |m: &str| ConfigError::invalid(format!("dependency.{}", name), m);
-
-        match (self.prefer.unwrap_or(Prefer::System), &self.source) {
-            (Prefer::Vendored, None) => return Err(bad("prefer = \"vendored\" needs a [source]")),
-            (Prefer::SystemOnly, Some(_)) => {
-                return Err(bad("system-only conflicts with [source]"));
-            }
-            (Prefer::System, None) if self.find.is_empty() => {
-                return Err(bad("needs `find` entries or a [source]"));
-            }
-            _ => {}
-        }
-
-        if let Some(Source::Tar { sha256, .. }) = &self.source
-            && (sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()))
-        {
-            return Err(bad("sha256 must be 64 hex characters"));
-        }
-
-        if self.build.steps.is_some()
-            && !matches!(self.build.system.as_deref(), None | Some("steps"))
-        {
-            return Err(bad("`steps` can't be combined with another build.system"));
-        }
-        if self.build.system.as_deref() == Some("steps")
-            && self.build.steps.as_ref().is_none_or(Vec::is_empty)
-        {
-            return Err(bad(
-                "build.system = \"steps\" needs a non-empty `steps` array",
-            ));
-        }
-        Ok(())
-    }
-}
-
-pub fn validate_dependencies(m: &Manifest) -> Result<(), ConfigError> {
-    for (name, dep) in &m.dependencies {
-        dep.validate(name)?;
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn fixture() -> (tempfile::TempDir, PathBuf) {
-        let t = tempfile::tempdir().unwrap();
-        let r = t.path().canonicalize().unwrap();
-        std::fs::create_dir_all(r.join("src/util")).unwrap();
-        std::fs::write(r.join("file.txt"), "").unwrap();
-        (t, r)
-    }
-
-    #[test]
-    fn output_rules() {
-        let (_t, r) = fixture();
-        let src = vec![r.join("src")];
-        let ok = |p: &str| validate_output(&r, Path::new(p), &src).is_ok();
-        assert!(ok("hello"));
-        assert!(ok("build/hello"));
-        assert!(!ok("../x"));
-        assert!(!ok("/tmp/x"));
-        assert!(!ok("."));
-        assert!(!ok("src/hello"));
-        assert!(!ok("src"));
-    }
-
-    #[test]
-    fn overlap_rules() {
-        let (_t, r) = fixture();
-        let a = r.join("src");
-        let b = r.join("src/util");
-        assert!(check_overlap("f", &[a.clone(), b]).is_err());
-        assert!(check_overlap("f", &[a.clone(), a]).is_err());
-        assert!(check_overlap("f", &[r.join("src"), r.join("other")]).is_ok());
-    }
-
-    #[test]
-    fn resolve_dir_rules() {
-        let (_t, r) = fixture();
-        let msg = |p: &str| {
-            resolve_dir(&r, "f", Path::new(p), Scope::InsideRoot)
-                .unwrap_err()
-                .to_string()
-        };
-        assert!(resolve_dir(&r, "f", Path::new("src"), Scope::InsideRoot).is_ok());
-        assert!(msg("/usr/bin").contains("relative"));
-        assert!(msg("missing").contains("does not exist"));
-        assert!(msg("file.txt").contains("not a directory"));
-        assert!(msg("..").contains("outside"));
-    }
-
-    #[test]
-    fn scope_rules() {
-        let (_t, r) = fixture();
-        let outside = tempfile::tempdir().unwrap();
-        let abs = outside.path();
-        assert!(resolve_dir(&r, "f", abs, Scope::InsideRoot).is_err());
-        assert!(resolve_dir(&r, "f", abs, Scope::Anywhere).is_ok());
-        assert!(resolve_dir(&r, "f", Path::new("/definitely/missing"), Scope::Anywhere).is_err());
-        assert!(resolve_dir(&r, "f", Path::new("file.txt"), Scope::Anywhere).is_err());
-    }
-
-    #[test]
-    fn standards_are_matched_to_languages() {
-        assert!(check_standard("f", Some("c++20"), Lang::Cxx).is_ok());
-        assert!(check_standard("f", Some("gnu++17"), Lang::Cxx).is_ok());
-        assert!(check_standard("f", Some("c17"), Lang::C).is_ok());
-        assert!(check_standard("f", Some("gnu11"), Lang::C).is_ok());
-        assert!(check_standard("f", Some("iso9899:1999"), Lang::C).is_ok()); // unrecognized: left to the compiler
-        assert!(check_standard("f", Some("c++20"), Lang::C).is_err());
-        assert!(check_standard("f", Some("gnu++20"), Lang::C).is_err());
-        assert!(check_standard("f", Some("c17"), Lang::Cxx).is_err());
-        assert!(check_standard("f", Some("gnu11"), Lang::Cxx).is_err());
-        assert!(check_standard("f", Some(""), Lang::C).is_err());
-        assert!(check_standard("f", Some("c 17"), Lang::C).is_err());
-        assert!(check_standard("f", None, Lang::C).is_ok());
-    }
 }

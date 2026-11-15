@@ -1,0 +1,21 @@
+[workspace]
+name    = "c-library"
+version = "0.1.0"
+c       = "17"
+
+[profile.debug]
+opt        = "none"
+debug_info = true
+
+[profile.release]
+opt        = "speed"
+debug_info = false
+
+[lib.math_utils]
+sources        = ["src/math_utils.c"]
+include.public = ["include"]
+system.public  = ["math"]
+
+[bin.c-library]
+sources = ["src/main.c"]
+deps    = ["math_utils"]

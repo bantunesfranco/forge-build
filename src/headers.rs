@@ -93,6 +93,15 @@ mod tests {
         normalize(Path::new(root), raw)
     }
 
+    /// An absolute path on every OS: Windows needs a drive letter.
+    fn abs(p: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{p}")
+        } else {
+            p.to_string()
+        }
+    }
+
     #[test]
     fn strips_leading_dot_slash() {
         assert_eq!(n("/proj", "./src/main.cpp"), PathBuf::from("src/main.cpp"));
@@ -114,7 +123,7 @@ mod tests {
     #[test]
     fn absolute_inside_root_becomes_relative() {
         assert_eq!(
-            n("/proj", "/proj/include/a.hpp"),
+            n(&abs("/proj"), &abs("/proj/include/a.hpp")),
             PathBuf::from("include/a.hpp")
         );
     }
@@ -122,20 +131,26 @@ mod tests {
     #[test]
     fn absolute_outside_root_stays_absolute() {
         assert_eq!(
-            n("/proj", "/usr/include/x.h"),
-            PathBuf::from("/usr/include/x.h")
+            n(&abs("/proj"), &abs("/usr/include/x.h")),
+            PathBuf::from(abs("/usr/include/x.h"))
         );
     }
 
     #[test]
     fn root_prefix_must_match_whole_components() {
         // /project is not inside /proj
-        assert_eq!(n("/proj", "/project/a.h"), PathBuf::from("/project/a.h"));
+        assert_eq!(
+            n(&abs("/proj"), &abs("/project/a.h")),
+            PathBuf::from(abs("/project/a.h"))
+        );
     }
 
     #[test]
     fn dotdot_cannot_climb_above_filesystem_root() {
-        assert_eq!(n("/proj", "/../etc/x"), PathBuf::from("/etc/x"));
+        assert_eq!(
+            n(&abs("/proj"), &abs("/../etc/x")),
+            PathBuf::from(abs("/etc/x"))
+        );
     }
 
     #[test]
