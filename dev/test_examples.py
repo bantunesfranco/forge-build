@@ -160,7 +160,16 @@ def build(
     for option in options:
         arguments.extend(["--opt", option])
 
-    return forge(project, *arguments)
+    result = forge(project, *arguments)
+
+    # MSVC must keep its PDBs below build/, never next to the manifest.
+    stray = sorted(p.name for p in project.glob("*.pdb"))
+    if stray:
+        raise IntegrationTestFailure(
+            f"build left debug-info files in the project root: {stray}"
+        )
+
+    return result
 
 
 def executable(project: Path, name: str, profile: str) -> Path:

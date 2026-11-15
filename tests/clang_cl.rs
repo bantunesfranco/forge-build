@@ -60,6 +60,26 @@ fn position(args: &[String], wanted: &str) -> usize {
 }
 
 #[test]
+fn msvc_like_compiles_keep_their_pdb_in_the_target_object_dir() {
+    for program in ["cl", "clang-cl"] {
+        let c = Case::new(program, "debug");
+        for (input, target) in [("main.c", "app"), ("core.c", "core")] {
+            let args = c.command(TaskKind::Compile, input).args;
+            let fd: Vec<String> = args
+                .iter()
+                .filter(|a| a.starts_with("/Fd"))
+                .map(|a| a.replace('\\', "/"))
+                .collect();
+            assert_eq!(
+                fd,
+                vec![format!("/Fdbuild/x86_64-windows/debug/obj/{target}/")],
+                "{program}: {args:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn clang_cl_writes_a_makefile_depfile() {
     let c = Case::new("clang-cl", "debug");
     let args = c.command(TaskKind::Compile, "main.c").args;

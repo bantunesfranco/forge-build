@@ -101,6 +101,15 @@ pub fn command_for(task: &Task, project: &Project) -> CommandSpec {
                 } else {
                     args.extend(["/sourceDependencies".to_string(), depfile]);
                 }
+                // One PDB directory per target and build dir, so /Zi never
+                // writes `vc140.pdb` into the project root. The trailing
+                // separator makes it a directory.
+                let pdb_dir = project.build_dir().join("obj").join(&target.name);
+                args.push(format!(
+                    "/Fd{}{}",
+                    path_arg(&pdb_dir),
+                    std::path::MAIN_SEPARATOR
+                ));
                 args.extend([format!("/Fo{out}"), source]);
             } else {
                 args.extend([
