@@ -870,10 +870,29 @@ fn diagnose_dependency(
     diags: &mut Diagnostics,
 ) {
     let origin = &decl.settings.origin;
-    if decl.kind == DepKind::HeaderOnly && merged.scalar("options").is_some() {
-        diags.warn(format!(
-            "{origin}: `options` has no effect on a `header-only` dependency"
-        ));
+    // Keys that only some kinds read (spec 10.3): accepted, but a warning says they do nothing here.
+    let present = |name: &str| decl.settings.entries.iter().any(|e| e.key.name == name);
+    let used: [(&str, bool, &[DepKind]); 6] = [
+        ("options", present("options"), &[DepKind::Cmake]),
+        ("files", present("files"), &[DepKind::Sources]),
+        ("libs", present("libs"), &[DepKind::Prebuilt]),
+        ("lib_dir", present("lib_dir"), &[DepKind::Prebuilt]),
+        (
+            "expose",
+            !decl.expose.is_empty(),
+            &[DepKind::Cmake, DepKind::Prebuilt],
+        ),
+        ("find", decl.find.is_some(), &[DepKind::System]),
+    ];
+    for (key, is_present, kinds) in used {
+        if is_present && !kinds.contains(&decl.kind) {
+            let kinds: Vec<String> = kinds.iter().map(|k| format!("`{}`", k.as_str())).collect();
+            diags.warn(format!(
+                "{origin}: `{key}` has no effect on a `{}` dependency (it applies to {})",
+                decl.kind.as_str(),
+                kinds.join(" and ")
+            ));
+        }
     }
 
     // Private parts of a feature: only `sources` dependencies compile anything.

@@ -1055,6 +1055,57 @@ features = [\"x\"]
     }
 
     #[test]
+    fn kind_specific_keys_on_the_wrong_kind_warn() {
+        let src = "
+[dependency.h]
+path = \"h\"
+kind = \"header-only\"
+libs = [\"x\"]
+lib_dir = \"l\"
+files = [\"a.c\"]
+find = \"X\"
+expose = { target = \"t\" }
+options.linux = { A = true }
+[dependency.c]
+path = \"c\"
+kind = \"cmake\"
+libs = [\"x\"]
+files = [\"a.c\"]
+expose = { target = \"t\" }
+options = { A = true }
+[dependency.p]
+path = \"p\"
+kind = \"prebuilt\"
+libs = [\"x\"]
+expose = { target = \"t\" }
+[dependency.s]
+kind = \"system\"
+find = \"X\"
+options = { A = true }
+";
+        let c = cfg(src, &["h/", "c/", "p/"], LINUX);
+        let w = warnings(&c);
+        let on = |dep: &str, key: &str| {
+            w.iter().any(|m| {
+                m.contains(&format!("dependency.{dep}")) && m.contains(&format!("`{key}`"))
+            })
+        };
+        for key in ["libs", "lib_dir", "files", "find", "expose", "options"] {
+            assert!(on("h", key), "header-only {key}: {w:?}");
+        }
+        assert!(on("c", "libs") && on("c", "files"));
+        assert!(!on("c", "expose") && !on("c", "options"));
+        assert!(
+            w.iter()
+                .any(|m| m.contains("`libs`") && m.contains("`prebuilt`"))
+        );
+        assert!(!w.iter().any(|m| m.contains("dependency.p")), "{w:?}");
+        assert!(on("s", "options") && !on("s", "find"));
+        // The same warnings on every platform, whatever condition the key sits under.
+        assert_eq!(warnings(&cfg(src, &["h/", "c/", "p/"], WINDOWS)), w);
+    }
+
+    #[test]
     fn feature_provenance_uses_the_full_origin() {
         let c = cfg(SPEC, SPEC_FILES, LINUX);
         let glm = unit(&c, "glm");
