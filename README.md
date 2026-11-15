@@ -244,12 +244,15 @@ cargo build --release && python3 dev/test_examples.py   # the example projects
 
 Unit tests live next to the code. Integration tests in `tests/` drive the real
 pipeline with real compilers (`gcc`/`g++`, `ar`) in temporary directories
-and skip themselves when a tool is missing. CI builds and tests on Linux and macOS.
+and skip themselves when a tool is missing.
+
+CI (`.github/workflows/ci.yml`) runs clippy and the Rust tests on Linux, macOS and
+Windows, builds the examples with gcc and clang (Linux), Apple clang (macOS), MSVC,
+clang-cl and clang (Windows), and runs the Rust tests of the Windows build under Wine.
 
 ## Platforms and limitations
 
-Linux, macOS and Windows (MSVC `cl` or `clang-cl`). CI builds and tests on Linux and
-macOS.
+Linux, macOS and Windows (MSVC `cl` or `clang-cl`).
 
 - **Environment variables** that change compilation (`CPATH`, `SDKROOT`, ...) are not
   part of the fingerprint.
