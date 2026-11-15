@@ -615,6 +615,44 @@ mod tests {
     }
 
     #[test]
+    fn remove_can_drop_a_value_a_feature_adds() {
+        let src = "[workspace]
+features = [\"f\"]
+[feature.f]
+defines = [\"A\", \"B\"]
+[bin.app]
+sources = [\"a.c\"]
+remove.defines = [\"A\"]
+";
+        let c = cfg(src, &["a.c"], LINUX);
+        assert!(!has_define(&unit(&c, "app").private, "A"));
+        assert!(has_define(&unit(&c, "app").private, "B"));
+    }
+
+    #[test]
+    fn profile_remove_drops_a_workspace_value() {
+        let src = "[workspace]
+defines = [\"LOG\", \"KEEP\"]
+[profile.release]
+remove.defines = [\"LOG\"]
+[bin.app]
+sources = [\"a.c\"]
+[dependency.d]
+path = \"d\"
+kind = \"header-only\"
+";
+        let inv = Invocation {
+            profile: Some("release".into()),
+            ..Invocation::default()
+        };
+        let c = run(src, &["a.c", "d/"], LINUX, &inv).unwrap();
+        let d = &unit(&c, "app").private;
+        assert!(!has_define(d, "LOG") && has_define(d, "KEEP"));
+        // Dependencies never see workspace values, so the removal has nothing to do there.
+        assert!(!has_define(&c.profile_settings, "LOG"));
+    }
+
+    #[test]
     fn lib_without_sources_or_include_is_error() {
         let e = err("[lib.x]\ndefines = [\"A\"]\n", &[], LINUX);
         assert!(e.contains("lib.x") && e.contains("needs `sources`"), "{e}");

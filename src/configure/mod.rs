@@ -23,7 +23,7 @@ use crate::discover::discover_globs;
 use crate::platform::{host_os_arch, llvm_triple};
 use features::{ActiveFeature, select_features};
 use lookup::{Alias, LookupCtx, uses_platform_lookup};
-use merge::{Layer, Merged, Sourced, merge};
+use merge::{Layer, Merged, Removals, Sourced, merge, merge_with};
 use model::{
     Configured, DepDetails, IncludeDir, Invocation, ProfileScalars, Settings, Unit, UnitKind,
     compare_versions,
@@ -324,12 +324,12 @@ impl<'a> Cx<'a> {
     /// without them, because `features` is itself a (conditional) list.
     fn merge_unit<'b>(
         &'b self,
-        origin: &str,
         mut layers: Vec<Layer<'b>>,
         alias: Option<&'b Alias>,
     ) -> Result<(Merged, Vec<&'b ActiveFeature<'a>>), ConfigError> {
         let lctx = self.lookup(alias);
-        let first = merge(&layers, &lctx, LIST_KEYS)?;
+        // Removals wait for the final merge, so a value a feature adds can be removed.
+        let first = merge_with(&layers, &lctx, LIST_KEYS, Removals::Only("features"))?;
         let mut active = Vec::new();
         for s in first.list("features", Visibility::Private) {
             let name = want_str(s)?;
@@ -337,7 +337,7 @@ impl<'a> Cx<'a> {
                 None => {
                     let declared: Vec<&str> = self.features.keys().map(String::as_str).collect();
                     return Err(ConfigError::invalid(
-                        origin,
+                        &s.origin,
                         format!(
                             "unknown feature `{name}` (declared features: {})",
                             if declared.is_empty() {
@@ -351,9 +351,6 @@ impl<'a> Cx<'a> {
                 Some(None) => {}
                 Some(Some(f)) => active.push(f),
             }
-        }
-        if active.is_empty() {
-            return Ok((first, active));
         }
         for f in &active {
             layers.push(Layer {
@@ -460,7 +457,13 @@ pub fn configure(
     };
 
     // Profile scalars and the profile's defines/flags, for dependency builds (spec 8.1).
-    let mut profile_merged = merge(&profile_layers(), &cx.lookup(None), LIST_KEYS)?;
+    // A dependency never sees workspace values, so a profile removal of one has nothing to remove.
+    let mut profile_merged = merge_with(
+        &profile_layers(),
+        &cx.lookup(None),
+        LIST_KEYS,
+        Removals::SkipAbsent,
+    )?;
     let missing = |k: &str| {
         ConfigError::invalid(
             format!("profile.{profile}"),
@@ -500,7 +503,7 @@ pub fn configure(
             table: &decl.settings,
             alias: None,
         });
-        let (mut merged, _) = cx.merge_unit(origin, layers, None)?;
+        let (mut merged, _) = cx.merge_unit(layers, None)?;
         if !profile_scalars.asserts {
             ensure_ndebug(&mut merged, &profile);
         }
@@ -640,7 +643,7 @@ fn dependency_unit(
         table: &decl.settings,
         alias: alias.as_ref(),
     }];
-    let (merged, active) = cx.merge_unit(origin, layers, alias.as_ref())?;
+    let (merged, active) = cx.merge_unit(layers, alias.as_ref())?;
 
     let source_dir = match &decl.source {
         DepSource::Path(p) => {

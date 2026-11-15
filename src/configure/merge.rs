@@ -52,12 +52,34 @@ impl Merged {
     }
 }
 
+/// Which `remove.*` entries a merge applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Removals {
+    /// Every removal; a value that is not present is an error.
+    All,
+    /// Every removal, but a value that is not present is skipped. For merges
+    /// that do not see the layer that adds the value (a dependency's profile).
+    SkipAbsent,
+    /// Only the removals of this key; the rest wait for the final merge.
+    Only(&'static str),
+}
+
 /// Merges `layers` for the platform in `ctx`. `list_keys` names the keys that
 /// hold lists: they must be arrays, and every other key must not be.
 pub fn merge(layers: &[Layer], ctx: &LookupCtx, list_keys: &[&str]) -> Result<Merged, ConfigError> {
+    merge_with(layers, ctx, list_keys, Removals::All)
+}
+
+/// [`merge`] with a choice of which removals apply.
+pub fn merge_with(
+    layers: &[Layer],
+    ctx: &LookupCtx,
+    list_keys: &[&str],
+    removals: Removals,
+) -> Result<Merged, ConfigError> {
     let mut merged = Merged::default();
     // Remove entries wait until every layer is merged, with their layer's alias.
-    let mut removals: Vec<(&Table, &Entry, Option<&Alias>)> = Vec::new();
+    let mut pending: Vec<(&Table, &Entry, Option<&Alias>)> = Vec::new();
 
     for layer in layers {
         let lctx = layer_ctx(ctx, layer.alias);
@@ -67,12 +89,19 @@ pub fn merge(layers: &[Layer], ctx: &LookupCtx, list_keys: &[&str]) -> Result<Me
             .iter()
             .filter(|e| e.key.condition.is_none_or(|c| c.matches(&ctx.platform)))
             .collect();
-        // Stable: file order is kept within a rank.
+        // Stable sort, but `Table.entries` are alphabetical by key, so within
+        // a rank the order is by key name, not file order.
         active.sort_by_key(|e| e.key.condition.map_or(0, |c| c.rank()));
 
         for entry in active {
             if entry.key.remove {
-                removals.push((layer.table, entry, layer.alias));
+                let wanted = match removals {
+                    Removals::Only(key) => entry.key.name == key,
+                    Removals::All | Removals::SkipAbsent => true,
+                };
+                if wanted {
+                    pending.push((layer.table, entry, layer.alias));
+                }
             } else if list_keys.contains(&entry.key.name.as_str()) {
                 add_list(&mut merged, layer.table, entry, &lctx)?;
             } else {
@@ -81,8 +110,9 @@ pub fn merge(layers: &[Layer], ctx: &LookupCtx, list_keys: &[&str]) -> Result<Me
         }
     }
 
-    for (table, entry, alias) in removals {
-        apply_remove(&mut merged, table, entry, &layer_ctx(ctx, alias))?;
+    for (table, entry, alias) in pending {
+        let lctx = layer_ctx(ctx, alias);
+        apply_remove(&mut merged, layers, table, entry, &lctx, removals)?;
     }
     Ok(merged)
 }
@@ -145,9 +175,11 @@ fn set_scalar(
 
 fn apply_remove(
     merged: &mut Merged,
+    layers: &[Layer],
     table: &Table,
     entry: &Entry,
     ctx: &LookupCtx,
+    removals: Removals,
 ) -> Result<(), ConfigError> {
     let items = array_of(table, entry)?;
     let name = &entry.key.name;
@@ -156,6 +188,9 @@ fn apply_remove(
         let want = sourced(table, entry, item, ctx)?.value;
         let list = merged.lists.entry((name.clone(), vis)).or_default();
         let Some(at) = list.iter().position(|s| s.value == want) else {
+            if removals == Removals::SkipAbsent {
+                continue;
+            }
             let shown = match &want {
                 toml::Value::String(s) => s.clone(),
                 other => other.to_string(),
@@ -163,15 +198,42 @@ fn apply_remove(
             return Err(ConfigError::invalid(
                 &table.origin,
                 format!(
-                    "`{shown}` is not present in `{name}` ({vis_name}) on {triplet}; if it is only added under a condition, use the same condition on the remove key (e.g. `remove.{name}.{vis_name}.windows`)",
+                    "`{shown}` is not present in `{name}` ({vis_name}) on {triplet}; {hint}",
                     vis_name = vis.as_str(),
                     triplet = ctx.platform.triplet(),
+                    hint = absent_hint(layers, entry, item),
                 ),
             ));
         };
         list.remove(at);
     }
     Ok(())
+}
+
+/// What to do about a removal of a value that is not there: name the key that
+/// adds it under a condition when there is one.
+fn absent_hint(layers: &[Layer], remove: &Entry, item: &toml::Value) -> String {
+    let adds = layers
+        .iter()
+        .flat_map(|l| l.table.entries.iter().map(move |e| (l.table, e)))
+        .find(|(_, e)| {
+            !e.key.remove
+                && e.key.name == remove.key.name
+                && e.key.visibility == remove.key.visibility
+                && e.key.condition.is_some()
+                && e.value.as_array().is_some_and(|a| a.contains(item))
+        });
+    match adds {
+        Some((table, e)) => format!(
+            "`{}` adds it under a condition (`{}`), so use `remove.{}`",
+            table.origin, e.raw_key, e.raw_key
+        ),
+        None => format!(
+            "if it is only added under a condition, use the same condition on the remove key (e.g. `remove.{}.{}.windows`)",
+            remove.key.name,
+            remove.key.visibility.as_str()
+        ),
+    }
 }
 
 /// The items of a list entry, or the "needs an array" error.
