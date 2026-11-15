@@ -444,12 +444,23 @@ fn make_static_lib(f: &Fixture, cxx: &str, ar: &str, value: i32) {
         "libsrc/foo.cpp",
         &format!("extern \"C\" int foo() {{ return {value}; }}\n"),
     );
-    let run = |cmd: &mut Command| assert!(cmd.current_dir(root).status().unwrap().success());
+    let run = |cmd: &mut Command| {
+        let out = cmd.current_dir(root).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{cmd:?} failed:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
     run(Command::new(cxx).args(["-c", "libsrc/foo.cpp", "-o", "libsrc/foo.o"]));
-    let dir = root.join("vendor/foo").join(host_lib_dir());
-    fs::create_dir_all(&dir).unwrap();
-    let file = dir.join(if cfg!(windows) { "foo.lib" } else { "libfoo.a" });
-    let _ = fs::remove_file(&file);
+    // Relative to `root` (the working directory): MinGW's `ar` cannot open the
+    // `\\?\` paths that a canonicalized Windows root has.
+    let file = Path::new("vendor/foo")
+        .join(host_lib_dir())
+        .join(if cfg!(windows) { "foo.lib" } else { "libfoo.a" });
+    fs::create_dir_all(root.join(file.parent().unwrap())).unwrap();
+    let _ = fs::remove_file(root.join(&file));
     run(Command::new(ar).arg("rcs").arg(&file).arg("libsrc/foo.o"));
 }
 
