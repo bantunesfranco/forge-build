@@ -155,6 +155,22 @@ pub fn command_for(task: &Task, project: &Project) -> CommandSpec {
     }
 }
 
+/// `cl` and `lib` are only on the PATH of a Developer Command Prompt, and forge
+/// never runs `cl` before the first compile, so say what to do.
+fn missing_program_hint(program: &str, error: &io::Error) -> Option<&'static str> {
+    let msvc_tool = matches!(
+        Path::new(program)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("cl" | "lib")
+    );
+    (error.kind() == io::ErrorKind::NotFound && msvc_tool).then_some(
+        "hint: run forge from a Developer Command Prompt, or name another compiler with CC/CXX or --toolchain",
+    )
+}
+
 /// Where the build database lives (inside the build directory, so `clean`
 /// removes it).
 pub fn db_path(project: &Project) -> PathBuf {
@@ -392,6 +408,9 @@ pub fn build(
                 }
                 Err(e) => {
                     eprintln!("error: could not run `{}`: {e}", specs[id].program);
+                    if let Some(hint) = missing_program_hint(&specs[id].program, &e) {
+                        eprintln!("{hint}");
+                    }
                     db.tasks.remove(&task.outputs[0]);
                     db_changed = true;
                     failed += 1;
@@ -447,5 +466,24 @@ pub fn prepare(graph: &Graph, project: &Project, exec: &(dyn Executor + Sync)) -
         specs,
         hashes,
         dirty,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_cl_gets_a_developer_prompt_hint() {
+        let missing = io::Error::new(io::ErrorKind::NotFound, "program not found");
+        for program in ["cl", "cl.exe", "C:/VS/bin/lib.exe"] {
+            assert!(
+                missing_program_hint(program, &missing).is_some(),
+                "{program}"
+            );
+        }
+        assert!(missing_program_hint("clang", &missing).is_none());
+        let denied = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        assert!(missing_program_hint("cl", &denied).is_none());
     }
 }
