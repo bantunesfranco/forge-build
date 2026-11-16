@@ -13,9 +13,9 @@ plan without running anything.
 
 ## Features
 
-- A declarative `project.toml` manifest ([spec 0.3](docs/manifest-spec.md)): no conditionals or scripting, one key grammar for platforms, compilers and architectures.
+- A declarative `project.toml` manifest ([spec 0.4](docs/manifest-spec.md)): no conditionals or scripting, one key grammar for platforms, compilers and architectures.
 - Typed options (`--opt name=value`) and features that bundle defines, flags and libraries.
-- C and C++ in one project, static libraries and executables, and dependencies from a local path, git, CMake or the system.
+- C and C++ in one project, static and shared libraries and executables, and dependencies from a local path, git, CMake or the system.
 - `project.lock` pins git dependencies to a commit.
 - Header dependencies from the compiler itself, not from guessing.
 - Rebuild decisions from **file contents**, not timestamps.
@@ -61,6 +61,8 @@ To start a new project, run `forge init my-app`, then `cd my-app && forge run`.
 `forge explain` shows what a rebuild would do and why, without running anything.
 The `examples/` directory has more projects. `examples/features` uses an option, a
 variant feature, a `${option.*}` lookup, `remove.*` and logical system libraries.
+`examples/shared-library` is a shared library that links a static one;
+`forge --opt lib_kind=static build` builds the same project all static.
 
 ## Commands
 
@@ -130,12 +132,53 @@ defines.windows = ["NOMINMAX"]
 ```
 
 Any key can take a visibility and a condition suffix (`defines.public.macos`).
-Targets are `[lib.<name>]` (a static library, `build/<profile>/lib/`) and
-`[bin.<name>]` (an executable, `build/<profile>/bin/`). Unknown tables, keys and
+Targets are `[lib.<name>]` (a static library by default, or a shared one with
+`kind = "shared"`) and `[bin.<name>]` (an executable, `build/<profile>/bin/`). Unknown tables, keys and
 conditions are errors that name the key and the file.
 
 The dotted-key grammar is only lexically TOML: Forge has its own reader, and generic
 TOML tools or editors may flag `project.toml` files.
+
+### Shared libraries
+
+`kind = "static" | "shared"` on a `[lib.<name>]` (default `static`; it may be a
+lookup such as `"${option.lib_kind}"`):
+
+```toml
+[lib.engine]
+kind           = "shared"
+sources        = ["src/**/*.cpp"]
+include.public = ["include"]
+
+[bin.game]
+sources = ["src/main.cpp"]
+deps    = ["engine"]
+```
+
+- **Export macros.** Symbols are not exported automatically. forge defines
+  `<NAME>_SHARED` for the library's sources and every consumer, and `<NAME>_BUILDING`
+  for the library's own sources only, where `<NAME>` is the target name in upper
+  case with every character that is not a letter or digit replaced by `_`
+  (`engine` gives `ENGINE_SHARED` and `ENGINE_BUILDING`). The library's header turns
+  them into `__declspec(dllexport)` or `dllimport` on Windows and
+  `visibility("default")` elsewhere. Neither macro is defined for a static
+  library, so the same header builds both kinds. The pattern is in section 6.5 of
+  the specification and in `examples/shared-library`.
+- **Outputs.** Windows: `bin/<name>.dll`, next to the executables, and the import
+  library `lib/<name>.lib`. Linux and BSD: `lib/lib<name>.so`. macOS:
+  `lib/lib<name>.dylib`. `<name>` is `output`, or the target name.
+- **Linking.** A shared library links the static libraries and `sources` dependencies
+  it reaches, and a consumer links only the shared library (its import library on
+  Windows), not the static code inside it. Its public `include`, `defines`, `flags`
+  and public `deps` still reach the consumer; `system`, `link_flags` and library
+  files of what is inside it stop at the library. Static libraries that go into a
+  shared one are compiled `-fPIC` on Linux and macOS, and a `cmake` dependency is
+  configured position-independent.
+- **Running.** A program built by forge runs from the build directory without
+  setup: on Windows the DLLs are next to the executables, and on Linux and macOS
+  the executables and shared libraries get a run path relative to their own
+  location (`$ORIGIN/../lib` and `$ORIGIN`, or `@loader_path/../lib` and
+  `@loader_path`). Moving the files elsewhere is up to you; there is no install step.
 
 ### Dependencies and `project.lock`
 
@@ -285,6 +328,8 @@ build/<profile>/obj/<target>/<source>.o  objects, grouped by target
 build/<profile>/dep/<target>/<source>.o.d depfiles
 build/<profile>/bin/<target>             executable targets
 build/<profile>/lib/lib<target>.a        static library targets
+build/<profile>/lib/lib<target>.so       shared library targets (Linux; `.dylib` on macOS)
+build/<profile>/bin/<target>.dll         shared library targets (Windows), import library in lib/
 build/<profile>/forge.db                 records for this profile
 build/<profile>/compile_commands.json    compilation database for editors
 build/compile_commands.json              copy of the one written last
@@ -293,7 +338,7 @@ build/<arch>-<os>/options.toml           cached --opt values (--target builds)
 build/deps/<name>/                       fetched and built dependencies
 ```
 
-Object and library names follow the platform (`.obj` and `.lib` with MSVC). With
+Object and library names follow the platform (`.obj` and `.lib` with MSVC; a static library from `clang` or `gcc` on Windows is still `lib<target>.a`). With
 `--target`, `<profile>` is `<arch>-<os>/<profile>`. Profiles do not share anything,
 so switching between them never rebuilds.
 

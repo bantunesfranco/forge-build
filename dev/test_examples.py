@@ -61,6 +61,12 @@ PROJECTS = {
             "legacy: removed",
         ],
     },
+    "shared-library": {
+        "expected_output": [
+            "area(3, 4) = 12",
+            "diagonal(3, 4) = 5",
+        ],
+    },
 }
 
 
@@ -178,6 +184,30 @@ def executable(project: Path, name: str, profile: str) -> Path:
         name += ".exe"
 
     return project / "build" / profile / "bin" / name
+
+
+def library_files(project: Path, name: str, profile: str, shared: bool) -> list[Path]:
+    """Return where a lib's output may be on the current platform.
+
+    On Windows a static library is `<name>.lib` with MSVC-like compilers and
+    `lib<name>.a` with clang and gcc, so there is more than one candidate.
+    """
+    build_dir = project / "build" / profile
+
+    if sys.platform == "win32":
+        if shared:
+            return [build_dir / "bin" / f"{name}.dll"]
+        return [build_dir / "lib" / f"{name}.lib", build_dir / "lib" / f"lib{name}.a"]
+
+    if shared:
+        suffix = "dylib" if sys.platform == "darwin" else "so"
+        return [build_dir / "lib" / f"lib{name}.{suffix}"]
+
+    return [build_dir / "lib" / f"lib{name}.a"]
+
+
+def has_library(project: Path, name: str, profile: str, shared: bool) -> bool:
+    return any(p.is_file() for p in library_files(project, name, profile, shared))
 
 
 def run_program(
@@ -400,6 +430,54 @@ def test_features(temp_root: Path) -> None:
     print("[PASS] features")
 
 
+def test_shared_library(temp_root: Path) -> None:
+    """A shared lib that links a static one, then the same project all static."""
+    print("[TEST] shared-library")
+
+    source = require_project("shared-library")
+    expected = PROJECTS["shared-library"]["expected_output"]
+
+    shared_root = temp_root / "shared"
+    shared_root.mkdir()
+    project = copy_project(source, shared_root)
+
+    build(project)
+    run_program(project, "shared-library", "debug", ["geometry is shared", *expected])
+
+    if not has_library(project, "geometry", "debug", shared=True):
+        raise IntegrationTestFailure(
+            "the shared library was not produced: "
+            f"{library_files(project, 'geometry', 'debug', shared=True)}"
+        )
+
+    # The static library inside it stays in `lib/` and is not a consumer's input.
+    if not has_library(project, "vec", "debug", shared=False):
+        raise IntegrationTestFailure("the static library vec was not produced")
+
+    build(project, profile="release")
+    run_program(project, "shared-library", "release", ["geometry is shared", *expected])
+
+    explanation = forge(project, "explain", "geometry").stdout
+    if "GEOMETRY_SHARED" not in explanation:
+        raise IntegrationTestFailure(
+            f"forge explain geometry does not show the export macros:\n{explanation}"
+        )
+
+    static_root = temp_root / "static"
+    static_root.mkdir()
+    project = copy_project(source, static_root)
+
+    build(project, options=("lib_kind=static",))
+    run_program(project, "shared-library", "debug", ["geometry is static", *expected])
+
+    if not has_library(project, "geometry", "debug", shared=False):
+        raise IntegrationTestFailure("lib_kind=static did not produce a static library")
+    if has_library(project, "geometry", "debug", shared=True):
+        raise IntegrationTestFailure("lib_kind=static still produced a shared library")
+
+    print("[PASS] shared-library")
+
+
 def main() -> int:
     if not FORGE.is_file():
         print(
@@ -443,6 +521,7 @@ def main() -> int:
             test_mixed_language(temp_root)
             test_dependencies(temp_root)
             test_features(temp_root)
+            test_shared_library(temp_root)
 
     except (IntegrationTestFailure, OSError) as error:
         print(f"\n[FAIL] {error}", file=sys.stderr)
