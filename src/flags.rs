@@ -328,6 +328,10 @@ pub fn link_args(
         if msvc {
             args.push("/SUBSYSTEM:WINDOWS".to_string());
             args.push("/ENTRY:mainCRTStartup".to_string());
+        } else if compiler == Compiler::Clang {
+            // clang targets windows-msvc here and ignores `-mwindows`.
+            args.push("-Wl,/SUBSYSTEM:WINDOWS".to_string());
+            args.push("-Wl,/ENTRY:mainCRTStartup".to_string());
         } else {
             args.push("-mwindows".to_string());
         }
@@ -1092,6 +1096,14 @@ sources = [\"m.c\"]
         let c = link_fixture(windows(Compiler::ClangCl), extra);
         let a = link_args(&c, idx(&c, "m"), &artifact_of(&c), &[]);
         assert!(a.contains(&"/SUBSYSTEM:WINDOWS".to_string()));
+        // clang on Windows targets windows-msvc, where `-mwindows` does nothing.
+        let c = link_fixture(windows(Compiler::Clang), extra);
+        let a = link_args(&c, idx(&c, "m"), &artifact_of(&c), &[]);
+        assert_eq!(
+            &a[a.len() - 2..],
+            ["-Wl,/SUBSYSTEM:WINDOWS", "-Wl,/ENTRY:mainCRTStartup"]
+        );
+        assert!(!a.contains(&"-mwindows".to_string()), "{a:?}");
         // Ignored elsewhere.
         for p in [linux(Compiler::Gcc), plat(Os::Macos, Compiler::AppleClang)] {
             let c = link_fixture(p, extra);
