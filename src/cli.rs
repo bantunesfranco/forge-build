@@ -8,7 +8,7 @@ use std::{
 
 use crate::{
     build::{BuildOptions, build},
-    config::{self, ConfigError, Diagnostics, Level, find_manifest},
+    config::{self, ConfigError, Diagnostics, Level, find_manifest, flat::Locations},
     configure::{
         model::Invocation,
         options::{cache_path, load_cache, parse_cli_opt, save_cache},
@@ -80,8 +80,8 @@ enum Commands {
 }
 
 /// Prints what configure had to say, before any command runs.
-fn print_diagnostics(diagnostics: &Diagnostics) {
-    for (level, message) in &diagnostics.items {
+fn print_diagnostics(diagnostics: &Diagnostics, locations: &Locations) {
+    for (level, message) in &diagnostics.located(locations) {
         match level {
             Level::Warning => eprintln!("warning: {message}"),
             Level::Info => eprintln!("info: {message}"),
@@ -141,7 +141,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         return update(&manifest, dep.as_deref());
     }
     let mut project: Project = load_project(&manifest, &args, &ProcessExecutor)?;
-    print_diagnostics(&project.diagnostics);
+    print_diagnostics(&project.diagnostics, &project.locations);
 
     match args.command {
         Some(Commands::Build {
@@ -156,7 +156,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             // Whatever needs the network or a build system happens now; the
             // local kinds were prepared when the project was loaded.
-            prepare_all(&mut project, Phase::Build, &ProcessExecutor, opts.jobs)?;
+            prepare_all(&mut project, Phase::Build, &ProcessExecutor, opts.jobs)
+                .map_err(|e| project.locations.locate(e))?;
             project.rebuild_targets()?;
 
             let mut graph: Graph = Graph::from_project(&project)?;
@@ -216,7 +217,7 @@ fn update(manifest: &Path, dep: Option<&str>) -> Result<(), Box<dyn std::error::
     };
     let mut diagnostics = Diagnostics::default();
     let result = deps::update(root, &m, dep, &mut diagnostics);
-    print_diagnostics(&diagnostics);
+    print_diagnostics(&diagnostics, &m.locations);
     result?;
     Ok(())
 }

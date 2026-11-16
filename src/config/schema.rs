@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use super::ConfigError;
+use super::flat::Locations;
 use super::key::{Key, KeyRule, parse_key};
 use super::types::DepKind;
 use super::vocab::{Arch, CompilerCond, Condition, Os, Platform};
@@ -140,6 +141,8 @@ pub struct Manifest {
     pub profiles: BTreeMap<String, Table>,
     pub dependencies: BTreeMap<String, DependencyDecl>,
     pub targets: BTreeMap<String, TargetDecl>,
+    /// Where the tables and keys are in the file; empty unless the manifest was read by `config::load`.
+    pub locations: Locations,
 }
 
 // ---------------------------------------------------------------- key rules
@@ -398,6 +401,7 @@ pub fn parse_manifest(t: toml::Table) -> Result<Manifest, ConfigError> {
         profiles,
         dependencies,
         targets,
+        locations: Locations::default(),
     })
 }
 

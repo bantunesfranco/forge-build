@@ -4,7 +4,10 @@ pub mod schema;
 pub mod types;
 pub mod vocab;
 
+use std::fmt;
 use std::path::{Path, PathBuf};
+
+use flat::Locations;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -18,19 +21,111 @@ pub enum ConfigError {
         path: PathBuf,
         source: toml::de::Error,
     },
-    #[error("{field}: {message}")]
-    Invalid { field: String, message: String },
+    #[error("{}{}{message}", prefix(.at), label(.field))]
+    Invalid {
+        /// The table (`lib.engine`) or option (`--target`) the message is about.
+        field: String,
+        /// The key of `field` the message is about, as written in the manifest.
+        key: Option<String>,
+        message: String,
+        /// Where in the manifest `field` (or `key`) is; filled in by [`Locations::locate`].
+        at: Option<Location>,
+    },
     #[error("could not find project.toml in {} or any parent directory", start.display())]
     NotFound { start: PathBuf },
 }
 
+/// A line of a manifest file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Location {
+    pub path: PathBuf,
+    pub line: usize,
+}
+
+impl fmt::Display for Location {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.path.display(), self.line)
+    }
+}
+
+fn prefix(at: &Option<Location>) -> String {
+    at.as_ref().map_or_else(String::new, |l| format!("{l}: "))
+}
+
+fn label(field: &str) -> String {
+    if field.is_empty() {
+        String::new()
+    } else {
+        format!("{field}: ")
+    }
+}
+
 impl ConfigError {
+    /// A message about `field`: a table of the manifest such as `lib.engine`
+    /// (it then gets the line of its header), or something else, such as `--target`.
     pub fn invalid(field: impl Into<String>, message: impl Into<String>) -> Self {
         ConfigError::Invalid {
             field: field.into(),
+            key: None,
             message: message.into(),
+            at: None,
         }
     }
+
+    /// A message about the key `raw_key` of the table `table`, as the key is
+    /// written in the manifest (`defines.public.windows`). It gets the line of
+    /// the key, or of the table when the key is not found.
+    pub fn at_key(
+        table: impl Into<String>,
+        raw_key: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        ConfigError::Invalid {
+            field: table.into(),
+            key: Some(raw_key.into()),
+            message: message.into(),
+            at: None,
+        }
+    }
+}
+
+impl Locations {
+    /// Adds the file and line to an error about a table or key of this manifest.
+    pub fn locate(&self, error: ConfigError) -> ConfigError {
+        match error {
+            ConfigError::Invalid {
+                field,
+                key,
+                message,
+                at: None,
+            } => {
+                let at = self.line(&field, key.as_deref()).map(|line| Location {
+                    path: self.file().to_path_buf(),
+                    line,
+                });
+                ConfigError::Invalid {
+                    field,
+                    key,
+                    message,
+                    at,
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+/// `path` as the user would type it: relative to the working directory when it
+/// is inside it, else as given.
+fn display_path(path: &Path) -> PathBuf {
+    if path.is_absolute()
+        && let Ok(cwd) = std::env::current_dir()
+        && let Ok(rel) = path.strip_prefix(&cwd)
+        && !rel.as_os_str().is_empty()
+    {
+        return rel.to_path_buf();
+    }
+    path.to_path_buf()
 }
 
 const MANIFEST_NAME: &str = "project.toml";
@@ -79,9 +174,20 @@ pub fn load(path: &Path) -> Result<schema::Manifest, ConfigError> {
         path: path.into(),
         source,
     })?;
-    let table = flat::parse_flat(&text)
-        .map_err(|e| ConfigError::invalid(format!("{}:{}", path.display(), e.line), e.message))?;
-    schema::parse_manifest(table)
+    let file = display_path(path);
+    let (table, locations) = flat::parse_located(&text).map_err(|e| ConfigError::Invalid {
+        field: String::new(),
+        key: None,
+        message: e.message,
+        at: Some(Location {
+            path: file.clone(),
+            line: e.line,
+        }),
+    })?;
+    let locations = locations.with_file(file);
+    let mut manifest = schema::parse_manifest(table).map_err(|e| locations.locate(e))?;
+    manifest.locations = locations;
+    Ok(manifest)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,11 +201,38 @@ pub enum Level {
 #[derive(Debug, Default)]
 pub struct Diagnostics {
     pub items: Vec<(Level, String)>,
+    /// For items about a table or key of the manifest: the item's index, the
+    /// table and the key. `located` turns them into `path:line:` prefixes.
+    at: Vec<(usize, String, Option<String>)>,
 }
 
 impl Diagnostics {
     pub fn warn(&mut self, message: impl Into<String>) {
         self.items.push((Level::Warning, message.into()));
+    }
+
+    /// A warning about `table` (`dependency.glm`), or about its key `raw_key`
+    /// as written in the manifest. The text reads `table: message`.
+    pub fn warn_at(&mut self, table: &str, raw_key: Option<&str>, message: impl fmt::Display) {
+        self.at.push((
+            self.items.len(),
+            table.to_owned(),
+            raw_key.map(str::to_owned),
+        ));
+        self.warn(format!("{table}: {message}"));
+    }
+
+    /// The items with `path:line: ` in front of those whose table or key is in `locations`.
+    pub fn located(&self, locations: &Locations) -> Vec<(Level, String)> {
+        let mut items = self.items.clone();
+        for (index, table, key) in &self.at {
+            if let Some(line) = locations.line(table, key.as_deref())
+                && let Some((_, text)) = items.get_mut(*index)
+            {
+                *text = format!("{}:{line}: {text}", locations.file().display());
+            }
+        }
+        items
     }
 
     pub fn info(&mut self, message: impl Into<String>) {
