@@ -109,7 +109,7 @@ TOML tools or editors may flag `project.toml` files.
 `path` or a `git` checkout), `cmake` (built through CMake, with `expose.target`)
 or `system` (`find`, tried with `pkg-config` and then CMake's `find-package`).
 Git dependencies are checked out under `build/deps/` and removed by
-`forge clean --all`.
+`forge clean --all`. Their submodules are fetched recursively.
 
 `project.lock` sits next to `project.toml` and records the commit each git
 dependency resolved to. Commit it. Builds use the pinned commit; `forge update`
