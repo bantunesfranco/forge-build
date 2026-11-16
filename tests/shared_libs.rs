@@ -361,3 +361,217 @@ fn a_static_lib_linked_directly_and_through_a_shared_one_is_warned_about() {
         "{hits:?}"
     );
 }
+
+// ------------------------------------------------------------ real compilers
+
+/// Whether `program` runs: `cl` has no `--version` and answers `/?`.
+fn usable(program: &str) -> bool {
+    let probe = if program.eq_ignore_ascii_case("cl") {
+        "/?"
+    } else {
+        "--version"
+    };
+    std::process::Command::new(program)
+        .arg(probe)
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Every C++ compiler of this machine that can be run, once per family: the
+/// scenario below is built with each of them.
+fn compilers() -> Vec<String> {
+    let mut candidates: Vec<&str> = vec!["g++", "clang++"];
+    if cfg!(windows) {
+        candidates.extend(["cl", "clang-cl"]);
+    }
+    let mut found: Vec<String> = candidates
+        .into_iter()
+        .filter(|c| usable(c))
+        .map(String::from)
+        .collect();
+    // Whatever `CXX` names, if nothing above runs.
+    if found.is_empty()
+        && let Ok(cxx) = std::env::var("CXX")
+        && !cxx.is_empty()
+        && usable(&cxx)
+    {
+        found.push(cxx);
+    }
+    found
+}
+
+/// Runs `body` with a fixture for each compiler, or says that there is none.
+fn with_each_compiler(manifest: &str, files: &[(&str, &str)], body: impl Fn(&str, &Fixture)) {
+    let compilers = compilers();
+    if compilers.is_empty() {
+        eprintln!("skipping: no C++ compiler can be run");
+        return;
+    }
+    for cxx in &compilers {
+        eprintln!("building with {cxx}");
+        let f = Fixture::with_toolchain(manifest, cxx, cxx);
+        for (path, text) in files {
+            f.write(path, text);
+        }
+        body(cxx, &f);
+    }
+}
+
+const EXPORT_HEADER: &str = concat!(
+    "#pragma once\n",
+    "#if defined(ENGINE_SHARED) && defined(_WIN32)\n",
+    "#  if defined(ENGINE_BUILDING)\n",
+    "#    define ENGINE_API __declspec(dllexport)\n",
+    "#  else\n",
+    "#    define ENGINE_API __declspec(dllimport)\n",
+    "#  endif\n",
+    "#elif defined(ENGINE_SHARED)\n",
+    "#  define ENGINE_API __attribute__((visibility(\"default\")))\n",
+    "#else\n",
+    "#  define ENGINE_API\n",
+    "#endif\n",
+    "ENGINE_API int engine_value();\n",
+);
+
+/// What `forge build` made, run from another directory.
+fn run_built(f: &Fixture, bin: &str) -> String {
+    let exe = f.root.join("build/debug/bin").join(common::exe(bin));
+    let elsewhere = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new(&exe)
+        .current_dir(elsewhere.path())
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run {}: {e}", exe.display()));
+    assert!(
+        out.status.success(),
+        "{} failed: {:?}\n{}",
+        exe.display(),
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n")
+}
+
+fn build_ok(cxx: &str, f: &Fixture) {
+    let out = f.forge(&["build"]);
+    assert!(
+        out.status.success(),
+        "{cxx}: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+const REAL: &str = concat!(
+    "[lib.core]\nsources = [\"core/core.cpp\"]\ninclude.public = [\"core\"]\n",
+    "[lib.engine]\nkind = \"shared\"\nsources = [\"engine/engine.cpp\"]\ninclude.public = [\"engine\"]\ndeps = [\"core\"]\n",
+    "[bin.app]\nsources = [\"app.cpp\"]\ndeps = [\"engine\"]\n",
+);
+
+const REAL_FILES: &[(&str, &str)] = &[
+    ("core/core.hpp", "int core_value();\n"),
+    (
+        "core/core.cpp",
+        "#include \"core.hpp\"\nint core_value() { return 40; }\n",
+    ),
+    ("engine/engine.hpp", EXPORT_HEADER),
+    (
+        "engine/engine.cpp",
+        "#include \"engine.hpp\"\n#include \"core.hpp\"\nint engine_value() { return core_value() + 2; }\n",
+    ),
+    (
+        "app.cpp",
+        "#include <cstdio>\n#include \"engine.hpp\"\nint main() { std::printf(\"value=%d\\n\", engine_value()); }\n",
+    ),
+];
+
+#[test]
+fn a_bin_calls_a_shared_library_that_links_a_static_one() {
+    with_each_compiler(&manifest(REAL), REAL_FILES, |cxx, f| {
+        build_ok(cxx, f);
+        assert_eq!(run_built(f, "app"), "value=42\n", "{cxx}");
+        // The library is where the spec's table puts it.
+        let windows = cfg!(windows);
+        let lib = f.root.join("build/debug").join(if windows {
+            "bin/engine.dll"
+        } else if cfg!(target_os = "macos") {
+            "lib/libengine.dylib"
+        } else {
+            "lib/libengine.so"
+        });
+        assert!(lib.is_file(), "{cxx}: {}", lib.display());
+        if windows {
+            assert!(f.root.join("build/debug/lib/engine.lib").is_file(), "{cxx}");
+        }
+        // Nothing is rebuilt, and touching the library's source relinks both.
+        let out = f.forge(&["build"]);
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("Build is up to date"),
+            "{cxx}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        f.write(
+            "engine/engine.cpp",
+            "#include \"engine.hpp\"\n#include \"core.hpp\"\nint engine_value() { return core_value() + 3; }\n",
+        );
+        build_ok(cxx, f);
+        assert_eq!(run_built(f, "app"), "value=43\n", "{cxx}");
+    });
+}
+
+#[test]
+fn forge_run_finds_the_shared_library() {
+    with_each_compiler(&manifest(REAL), REAL_FILES, |cxx, f| {
+        let out = f.forge(&["run", "app"]);
+        let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+        assert!(
+            out.status.success() && stdout.contains("value=42"),
+            "{cxx}: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    });
+}
+
+#[test]
+fn a_shared_library_may_use_another_shared_library() {
+    let manifest = manifest(concat!(
+        "[lib.inner]\nkind = \"shared\"\nsources = [\"inner.cpp\"]\ninclude.public = [\"inner\"]\n",
+        "[lib.outer]\nkind = \"shared\"\nsources = [\"outer.cpp\"]\ninclude.public = [\"outer\"]\ndeps = [\"inner\"]\n",
+        "[bin.app]\nsources = [\"app.cpp\"]\ndeps = [\"outer\"]\n",
+    ));
+    let header = |name: &str, upper: &str| {
+        format!(
+            concat!(
+                "#pragma once\n",
+                "#if defined({u}_SHARED) && defined(_WIN32)\n",
+                "#  if defined({u}_BUILDING)\n#    define {u}_API __declspec(dllexport)\n#  else\n#    define {u}_API __declspec(dllimport)\n#  endif\n",
+                "#elif defined({u}_SHARED)\n#  define {u}_API __attribute__((visibility(\"default\")))\n",
+                "#else\n#  define {u}_API\n#endif\n",
+                "{u}_API int {n}_value();\n",
+            ),
+            u = upper,
+            n = name
+        )
+    };
+    let inner_header = header("inner", "INNER");
+    let outer_header = header("outer", "OUTER");
+    let files = [
+        ("inner/inner.hpp", inner_header.as_str()),
+        (
+            "inner.cpp",
+            "#include \"inner.hpp\"\nint inner_value() { return 5; }\n",
+        ),
+        ("outer/outer.hpp", outer_header.as_str()),
+        (
+            "outer.cpp",
+            "#include \"outer.hpp\"\n#include \"inner.hpp\"\nint outer_value() { return inner_value() + 10; }\n",
+        ),
+        (
+            "app.cpp",
+            "#include <cstdio>\n#include \"outer.hpp\"\nint main() { std::printf(\"value=%d\\n\", outer_value()); }\n",
+        ),
+    ];
+    with_each_compiler(&manifest, &files, |cxx, f| {
+        build_ok(cxx, f);
+        assert_eq!(run_built(f, "app"), "value=15\n", "{cxx}");
+    });
+}
