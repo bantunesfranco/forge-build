@@ -79,14 +79,33 @@ enum Commands {
     },
 }
 
-/// Prints what configure had to say, before any command runs.
-fn print_diagnostics(diagnostics: &Diagnostics, locations: &Locations) {
-    for (level, message) in &diagnostics.located(locations) {
-        match level {
-            Level::Warning => eprintln!("warning: {message}"),
-            Level::Info => eprintln!("info: {message}"),
-        }
+/// The lines for the diagnostics after the first `printed` ones, each as
+/// `warning: ...` or `info: ...`, with the manifest location where known.
+fn diagnostic_lines(
+    diagnostics: &Diagnostics,
+    locations: &Locations,
+    printed: usize,
+) -> Vec<String> {
+    diagnostics
+        .located(locations)
+        .into_iter()
+        .skip(printed)
+        .map(|(level, message)| match level {
+            Level::Warning => format!("warning: {message}"),
+            Level::Info => format!("info: {message}"),
+        })
+        .collect()
+}
+
+/// Prints what has been said since the first `printed` diagnostics were
+/// printed, and returns how many have been printed now. Called again after
+/// more work (such as the build-phase dependency preparation) it prints only
+/// what is new.
+fn print_diagnostics(diagnostics: &Diagnostics, locations: &Locations, printed: usize) -> usize {
+    for line in diagnostic_lines(diagnostics, locations, printed) {
+        eprintln!("{line}");
     }
+    diagnostics.items.len().max(printed)
 }
 
 /// Whether a command needs its dependencies fetched and found (spec 11 step
@@ -141,7 +160,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         return update(&manifest, dep.as_deref());
     }
     let mut project: Project = load_project(&manifest, &args, &ProcessExecutor)?;
-    print_diagnostics(&project.diagnostics, &project.locations);
+    let printed = print_diagnostics(&project.diagnostics, &project.locations, 0);
 
     match args.command {
         Some(Commands::Build {
@@ -158,6 +177,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             // local kinds were prepared when the project was loaded.
             prepare_all(&mut project, Phase::Build, &ProcessExecutor, opts.jobs)
                 .map_err(|e| project.locations.locate(e))?;
+            // The build phase may warn too (CMake, system packages).
+            print_diagnostics(&project.diagnostics, &project.locations, printed);
             project.rebuild_targets()?;
 
             let mut graph: Graph = Graph::from_project(&project)?;
@@ -217,7 +238,7 @@ fn update(manifest: &Path, dep: Option<&str>) -> Result<(), Box<dyn std::error::
     };
     let mut diagnostics = Diagnostics::default();
     let result = deps::update(root, &m, dep, &mut diagnostics).map_err(|e| m.locations.locate(e));
-    print_diagnostics(&diagnostics, &m.locations);
+    print_diagnostics(&diagnostics, &m.locations, 0);
     result?;
     Ok(())
 }
@@ -230,6 +251,28 @@ mod tests {
         executor::{CommandSpec, Outcome},
     };
     use std::io;
+
+    #[test]
+    fn diagnostics_are_printed_once_each() {
+        let locations = Locations::default();
+        let mut d = Diagnostics::default();
+        d.warn("from load");
+        d.info("also from load");
+        let lines = diagnostic_lines(&d, &locations, 0);
+        assert_eq!(lines, ["warning: from load", "info: also from load"]);
+        let printed = d.items.len();
+
+        // Nothing new: nothing printed again.
+        assert!(diagnostic_lines(&d, &locations, printed).is_empty());
+
+        // A warning raised by the build phase is printed, and only it.
+        d.warn_in("dependency.cmk", None, "from the build phase");
+        assert_eq!(
+            diagnostic_lines(&d, &locations, printed),
+            ["warning: from the build phase"]
+        );
+        assert_eq!(print_diagnostics(&d, &locations, printed), 3);
+    }
 
     /// Answers every command with a clang `--version`.
     struct Clang;
