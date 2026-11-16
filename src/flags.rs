@@ -11,7 +11,7 @@ use crate::config::{
     vocab::{Compiler, Os},
 };
 use crate::configure::{
-    model::{Configured, ProfileScalars, UnitKind, effective},
+    model::{Configured, ProfileScalars, UnitKind, effective, linked_into_shared},
     system_libs::SystemLib,
 };
 use crate::executor::path_arg;
@@ -180,7 +180,7 @@ pub fn sysroot_arg(c: &Configured) -> Option<String> {
 pub fn compile_args(c: &Configured, unit: usize, lang: Lang) -> Result<Vec<String>, ConfigError> {
     let u = &c.units[unit];
     let own = match u.kind {
-        UnitKind::Lib | UnitKind::Bin => true,
+        UnitKind::Lib | UnitKind::SharedLib | UnitKind::Bin => true,
         UnitKind::Dep(DepKind::Sources) => false,
         UnitKind::InterfaceLib | UnitKind::Dep(_) => {
             return Err(ConfigError::invalid(
@@ -241,6 +241,10 @@ pub fn compile_args(c: &Configured, unit: usize, lang: Lang) -> Result<Vec<Strin
     if scalars.lto {
         args.extend(owned(lto_args(compiler)));
     }
+    // Code that goes into a shared library is position-independent (spec 6.5).
+    if position_independent(c, unit) {
+        args.push("-fPIC".to_string());
+    }
 
     let mut defines: Vec<Define> = if own { Vec::new() } else { profile_defines(c) };
     push_unique(&mut defines, eff.compile.defines.iter().cloned());
@@ -278,6 +282,13 @@ pub fn compile_args(c: &Configured, unit: usize, lang: Lang) -> Result<Vec<Strin
     Ok(args)
 }
 
+/// Whether the unit's objects are compiled `-fPIC`: everything linked into a
+/// shared library, on the targets that need the flag (not Windows, and only
+/// for the compilers that spell it so).
+pub fn position_independent(c: &Configured, unit: usize) -> bool {
+    c.platform.os != Os::Windows && !msvc_like(c.platform.compiler) && linked_into_shared(c, unit)
+}
+
 /// What follows the object files on the link line. For MSVC every argument is
 /// a linker option (the caller puts `/link` in front of them).
 pub fn link_args(
@@ -297,6 +308,8 @@ pub fn link_args(
         args.extend(target_arg(c));
         args.extend(sysroot_arg(c));
     }
+
+    args.extend(shared_link_args(c, unit, artifact));
 
     for lib in &eff.link_units {
         args.push(path_arg(&artifact(*lib)));
@@ -340,6 +353,11 @@ pub fn link_args(
     if msvc && c.profile_scalars.debug_info {
         args.push("/DEBUG".to_string());
     }
+    // A program that reaches a shared library finds it from the build
+    // directory (spec 6.5).
+    if reaches_shared(c, &eff.link_units) {
+        args.extend(run_path_args(c.platform.os));
+    }
     if c.platform.os == Os::Windows
         && u.kind == UnitKind::Bin
         && u.subsystem == Some(Subsystem::Windows)
@@ -356,6 +374,57 @@ pub fn link_args(
         }
     }
     args
+}
+
+/// What makes the link produce a shared library: the library switch, its
+/// identity inside the file, and on Windows the import library.
+fn shared_link_args(
+    c: &Configured,
+    unit: usize,
+    artifact: &dyn Fn(usize) -> PathBuf,
+) -> Vec<String> {
+    let u = &c.units[unit];
+    if u.kind != UnitKind::SharedLib {
+        return Vec::new();
+    }
+    let compiler = c.platform.compiler;
+    let output = &u.output;
+    match c.platform.os {
+        Os::Windows => {
+            let implib = path_arg(&artifact(unit));
+            if msvc_like(compiler) {
+                vec!["/DLL".to_string(), format!("/IMPLIB:{implib}")]
+            } else if compiler == Compiler::Clang {
+                // clang targets windows-msvc here, so the linker is link.exe or lld-link.
+                vec!["-shared".to_string(), format!("-Wl,/IMPLIB:{implib}")]
+            } else {
+                vec!["-shared".to_string(), format!("-Wl,--out-implib,{implib}")]
+            }
+        }
+        Os::Macos => vec![
+            "-dynamiclib".to_string(),
+            "-install_name".to_string(),
+            format!("@rpath/lib{output}.dylib"),
+        ],
+        Os::Linux | Os::Bsd => vec!["-shared".to_string(), format!("-Wl,-soname,lib{output}.so")],
+    }
+}
+
+fn reaches_shared(c: &Configured, link_units: &[usize]) -> bool {
+    link_units
+        .iter()
+        .any(|&u| c.units[u].kind == UnitKind::SharedLib)
+}
+
+/// The run paths of spec 6.5, which are given literally (no shell is involved).
+/// Windows finds a DLL next to the executable and needs none.
+fn run_path_args(os: Os) -> Vec<String> {
+    let (up, here) = match os {
+        Os::Windows => return Vec::new(),
+        Os::Macos => ("@loader_path/../lib", "@loader_path"),
+        Os::Linux | Os::Bsd => ("$ORIGIN/../lib", "$ORIGIN"),
+    };
+    vec![format!("-Wl,-rpath,{up}"), format!("-Wl,-rpath,{here}")]
 }
 
 /// The static-library archiver. An explicit override always wins.
@@ -959,6 +1028,38 @@ system = [\"opengl\"]
     }
 
     #[test]
+    fn shared_lib_macros_reach_the_right_compiles() {
+        let src = "[workspace]\ncxx = \"17\"\n[lib.my-lib]\nkind = \"shared\"\nsources = [\"a.cpp\"]\n[lib.st]\nsources = [\"s.cpp\"]\n[bin.app]\nsources = [\"m.cpp\"]\ndeps = [\"my-lib\", \"st\"]\n";
+        let files = ["a.cpp", "s.cpp", "m.cpp"];
+        for platform in [linux(Compiler::Gcc), windows(Compiler::Msvc)] {
+            let c = build(src, &files, platform, None);
+            let flag = |name: &str| {
+                if platform.compiler == Compiler::Msvc {
+                    format!("/D{name}")
+                } else {
+                    format!("-D{name}")
+                }
+            };
+            let own = compile(&c, "my-lib", Lang::Cxx);
+            assert_eq!(count(&own, &flag("MY_LIB_SHARED")), 1, "{own:?}");
+            assert_eq!(count(&own, &flag("MY_LIB_BUILDING")), 1, "{own:?}");
+            let consumer = compile(&c, "app", Lang::Cxx);
+            assert_eq!(count(&consumer, &flag("MY_LIB_SHARED")), 1, "{consumer:?}");
+            assert_eq!(
+                count(&consumer, &flag("MY_LIB_BUILDING")),
+                0,
+                "{consumer:?}"
+            );
+            let st = compile(&c, "st", Lang::Cxx);
+            assert!(
+                !st.iter()
+                    .any(|a| a.contains("ST_SHARED") || a.contains("ST_BUILDING")),
+                "{st:?}"
+            );
+        }
+    }
+
+    #[test]
     fn link_order_consumer_first() {
         let c = link_fixture(linux(Compiler::Gcc), "");
         let ext = [PathBuf::from("ext/libz.a")];
@@ -1186,5 +1287,231 @@ sources = [\"m.c\"]
         let c = link_fixture(windows(Compiler::Msvc), "subsystem = \"console\"\n");
         let a = link_args(&c, idx(&c, "m"), &artifact_of(&c), &[]);
         assert!(!a.iter().any(|x| x.starts_with("/SUBSYSTEM")));
+    }
+
+    /// A bin `m` that uses shared lib `s`, which uses static lib `a` (system
+    /// lib `m`, link flag `AFLAG`). `st` is a static lib that only `m` uses.
+    /// `bin_extra` goes into the bin's table; `bin_deps` is its `deps`.
+    fn shared_fixture(platform: Platform, bin_deps: &str, bin_extra: &str) -> Configured {
+        let src = format!(
+            "
+[workspace]
+c = \"11\"
+[lib.a]
+sources = [\"a.c\"]
+system = [\"math\"]
+link_flags = [\"AFLAG\"]
+[lib.s]
+kind = \"shared\"
+sources = [\"s.c\"]
+deps = [\"a\"]
+[lib.st]
+sources = [\"t.c\"]
+[bin.m]
+sources = [\"m.c\"]
+deps = [{bin_deps}]
+{bin_extra}"
+        );
+        build(&src, &["a.c", "s.c", "t.c", "m.c"], platform, None)
+    }
+
+    /// The link arguments of unit `name`, with the library files the project
+    /// would name: the import library of a shared library on Windows.
+    fn shared_link(c: &Configured, name: &str) -> Vec<String> {
+        let windows = c.platform.os == Os::Windows;
+        let artifact = |u: usize| {
+            let n = &c.units[u].name;
+            PathBuf::from(match (c.units[u].kind, windows) {
+                (UnitKind::SharedLib, true) => format!("lib/{n}.lib"),
+                (UnitKind::SharedLib, false) => format!("lib/lib{n}.so"),
+                _ => format!("lib/lib{n}.a"),
+            })
+        };
+        link_args(c, idx(c, name), &artifact, &[])
+    }
+
+    #[test]
+    fn a_shared_library_link_makes_a_dll_with_an_import_library() {
+        let link = |compiler| shared_link(&shared_fixture(windows(compiler), "", ""), "s");
+        for compiler in [Compiler::Msvc, Compiler::ClangCl] {
+            assert_eq!(
+                link(compiler),
+                strs(&["/DLL", "/IMPLIB:lib/s.lib", "lib/liba.a", "AFLAG", "/DEBUG"]),
+                "{compiler:?}"
+            );
+        }
+        // clang on Windows targets windows-msvc: the options go to the MSVC linker.
+        let clang = link(Compiler::Clang);
+        assert_eq!(
+            &clang[..2],
+            ["-shared", "-Wl,/IMPLIB:lib/s.lib"],
+            "{clang:?}"
+        );
+        // gcc on Windows is mingw-style.
+        let gcc = link(Compiler::Gcc);
+        assert_eq!(
+            &gcc[..2],
+            ["-shared", "-Wl,--out-implib,lib/s.lib"],
+            "{gcc:?}"
+        );
+    }
+
+    #[test]
+    fn a_shared_library_link_sets_its_soname_or_install_name() {
+        for os in [Os::Linux, Os::Bsd] {
+            for compiler in [Compiler::Gcc, Compiler::Clang] {
+                let l = shared_link(&shared_fixture(plat(os, compiler), "", ""), "s");
+                assert_eq!(&l[..2], ["-shared", "-Wl,-soname,libs.so"], "{l:?}");
+                // It reaches no shared library, so there is no run path.
+                assert!(!l.iter().any(|x| x.contains("rpath")), "{l:?}");
+            }
+        }
+        let c = shared_fixture(plat(Os::Macos, Compiler::AppleClang), "", "");
+        let mac = shared_link(&c, "s");
+        assert_eq!(
+            &mac[..3],
+            ["-dynamiclib", "-install_name", "@rpath/libs.dylib"],
+            "{mac:?}"
+        );
+        // Its own link takes what is inside it.
+        assert!(mac.contains(&"lib/liba.a".to_string()), "{mac:?}");
+        assert!(mac.contains(&"AFLAG".to_string()), "{mac:?}");
+        let linux = shared_link(&shared_fixture(linux(Compiler::Gcc), "", ""), "s");
+        assert!(linux.contains(&"-lm".to_string()), "{linux:?}");
+    }
+
+    #[test]
+    fn soname_and_install_name_use_the_output_name() {
+        let src = "[workspace]\nc = \"11\"\n[lib.s]\nkind = \"shared\"\noutput = \"other\"\nsources = [\"s.c\"]\n";
+        let c = build(src, &["s.c"], linux(Compiler::Gcc), None);
+        assert_eq!(
+            shared_link(&c, "s"),
+            strs(&["-shared", "-Wl,-soname,libother.so"])
+        );
+        let c = build(src, &["s.c"], plat(Os::Macos, Compiler::AppleClang), None);
+        assert_eq!(
+            shared_link(&c, "s"),
+            strs(&["-dynamiclib", "-install_name", "@rpath/libother.dylib"])
+        );
+    }
+
+    #[test]
+    fn a_consumer_links_the_shared_library_and_gets_run_paths() {
+        let origin = ["-Wl,-rpath,$ORIGIN/../lib", "-Wl,-rpath,$ORIGIN"];
+        for (os, compiler) in [
+            (Os::Linux, Compiler::Gcc),
+            (Os::Linux, Compiler::Clang),
+            (Os::Bsd, Compiler::Clang),
+        ] {
+            let c = shared_fixture(plat(os, compiler), "\"s\", \"st\"", "");
+            let l = shared_link(&c, "m");
+            // Both libraries, in some order, then the run paths.
+            let (libs, paths) = l.split_at(2);
+            assert!(libs.contains(&"lib/libs.so".to_string()), "{l:?}");
+            assert!(libs.contains(&"lib/libst.a".to_string()), "{l:?}");
+            assert_eq!(paths, origin, "{l:?}");
+        }
+        let c = shared_fixture(plat(Os::Macos, Compiler::AppleClang), "\"s\", \"st\"", "");
+        let l = shared_link(&c, "m");
+        assert_eq!(
+            &l[2..],
+            ["-Wl,-rpath,@loader_path/../lib", "-Wl,-rpath,@loader_path"],
+            "{l:?}"
+        );
+        assert!(l.contains(&"lib/libs.so".to_string()), "{l:?}");
+        // Windows finds the DLL next to the program: the import library is all it names.
+        for compiler in [Compiler::Msvc, Compiler::ClangCl] {
+            let c = shared_fixture(windows(compiler), "\"s\", \"st\"", "");
+            let l = shared_link(&c, "m");
+            assert!(l.contains(&"lib/s.lib".to_string()), "{l:?}");
+            assert!(l.contains(&"lib/libst.a".to_string()), "{l:?}");
+            assert!(!l.iter().any(|x| x.contains("rpath")), "{l:?}");
+        }
+    }
+
+    #[test]
+    fn a_shared_library_that_reaches_a_shared_library_gets_run_paths_too() {
+        let src = "[workspace]\nc = \"11\"\n[lib.inner]\nkind = \"shared\"\nsources = [\"i.c\"]\n[lib.outer]\nkind = \"shared\"\nsources = [\"o.c\"]\ndeps = [\"inner\"]\n[bin.m]\nsources = [\"m.c\"]\ndeps = [\"outer\"]\n";
+        let c = build(src, &["i.c", "o.c", "m.c"], linux(Compiler::Gcc), None);
+        let outer = shared_link(&c, "outer");
+        assert_eq!(
+            outer,
+            strs(&[
+                "-shared",
+                "-Wl,-soname,libouter.so",
+                "lib/libinner.so",
+                "-Wl,-rpath,$ORIGIN/../lib",
+                "-Wl,-rpath,$ORIGIN"
+            ])
+        );
+        // The bin links the outer one only: the inner one is behind it.
+        let bin = shared_link(&c, "m");
+        assert_eq!(
+            bin,
+            strs(&[
+                "lib/libouter.so",
+                "-Wl,-rpath,$ORIGIN/../lib",
+                "-Wl,-rpath,$ORIGIN"
+            ])
+        );
+    }
+
+    #[test]
+    fn a_program_without_a_shared_library_has_no_run_path() {
+        let src = "[workspace]\nc = \"11\"\n[lib.a]\nsources = [\"a.c\"]\n[bin.m]\nsources = [\"m.c\"]\ndeps = [\"a\"]\n";
+        for p in [linux(Compiler::Gcc), plat(Os::Macos, Compiler::AppleClang)] {
+            let c = build(src, &["a.c", "m.c"], p, None);
+            assert_eq!(shared_link(&c, "m"), strs(&["lib/liba.a"]));
+        }
+    }
+
+    #[test]
+    fn what_is_inside_a_shared_library_stops_there() {
+        // `a` is inside `s`, with its `m` library and link flag.
+        let c = shared_fixture(linux(Compiler::Gcc), "\"s\"", "system = [\"opengl\"]\n");
+        let l = shared_link(&c, "m");
+        for inside in ["lib/liba.a", "-lm", "AFLAG"] {
+            assert!(!l.contains(&inside.to_string()), "{inside} in {l:?}");
+        }
+        // The bin's own libraries still count.
+        assert!(l.contains(&"-lGL".to_string()), "{l:?}");
+        // Through a direct dependency on `a` they are the bin's too.
+        let c = shared_fixture(linux(Compiler::Gcc), "\"s\", \"a\"", "");
+        let l = shared_link(&c, "m");
+        for direct in ["lib/liba.a", "-lm", "AFLAG"] {
+            assert!(l.contains(&direct.to_string()), "{direct} not in {l:?}");
+        }
+    }
+
+    #[test]
+    fn code_that_goes_into_a_shared_library_is_position_independent() {
+        let fpic = |platform: Platform, name: &str| {
+            let c = shared_fixture(platform, "\"s\", \"st\"", "");
+            count(&compile(&c, name, Lang::C), "-fPIC")
+        };
+        for (os, compiler) in [
+            (Os::Linux, Compiler::Gcc),
+            (Os::Linux, Compiler::Clang),
+            (Os::Macos, Compiler::AppleClang),
+        ] {
+            let p = plat(os, compiler);
+            // The library, and a static library that it links.
+            assert_eq!(fpic(p, "s"), 1, "{p:?}");
+            assert_eq!(fpic(p, "a"), 1, "{p:?}");
+            // A static library no shared library takes in, and a bin.
+            assert_eq!(fpic(p, "st"), 0, "{p:?}");
+            assert_eq!(fpic(p, "m"), 0, "{p:?}");
+        }
+        // Not on Windows, whatever the compiler.
+        for compiler in [
+            Compiler::Msvc,
+            Compiler::ClangCl,
+            Compiler::Clang,
+            Compiler::Gcc,
+        ] {
+            for name in ["s", "a"] {
+                assert_eq!(fpic(windows(compiler), name), 0, "{compiler:?} {name}");
+            }
+        }
     }
 }

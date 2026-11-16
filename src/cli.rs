@@ -366,7 +366,7 @@ fn select_bin<'a>(project: &'a Project, name: Option<&str>) -> Result<&'a str, S
         return Ok(bin);
     }
     let what = match units.iter().find(|u| u.name == name).map(|u| u.kind) {
-        Some(UnitKind::Lib | UnitKind::InterfaceLib) => "a lib",
+        Some(UnitKind::Lib | UnitKind::SharedLib | UnitKind::InterfaceLib) => "a lib",
         Some(UnitKind::Dep(_)) => "a dependency",
         _ => return Err(format!("unknown bin `{name}`")),
     };

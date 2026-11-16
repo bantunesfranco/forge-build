@@ -1,20 +1,17 @@
-# Manifest Spec (draft 0.3)
+# Manifest Spec (draft 0.4)
 
 A declarative build manifest for native C/C++ projects. It targets multiple
 operating systems, compilers and architectures without conditionals,
 expressions, or scripting.
 
-## Changes from 0.2
+## Changes from 0.3
 
-| Area          | Change                                                                                                                                                                    |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Lookups       | `${compiler}` added. Lookup set is now `${option.*}`, `${os}`, `${arch}`, `${compiler}`, `${profile}`, `${triplet}` (4.5)                                                 |
-| Compatibility | Dependencies accept `alias`, a static per-component renaming of `os`, `arch` and `compiler` for lookups inside that dependency (4.6, 10.3)                                |
-| `${triplet}`  | Shape stays `<arch>-<os>-<compiler>`. Each component is aliased when it expands (4.5, 4.6)                                                                                |
-| Paths         | Every `path` is relative to the manifest file's directory. `root` on a dependency changes the base for its `files`, `include` and `lib_dir`, never for `path` (6.2, 10.2) |
-| Validation    | Alias errors, unresolved prebuilt path error that prints the resolved path (12)                                                                                           |
-| Section 15    | Renamed "Deferred". No unresolved question blocks implementation                                                                                                          |
-| Guardrails    | 5 updated for the new lookup set. New guardrail 13 covers aliases                                                                                                         |
+| Area             | Change                                                                                                     |
+| ---------------- | ---------------------------------------------------------------------------------------------------------- |
+| Shared libraries | `lib` accepts `kind = "static" \| "shared"` (default `static`). Outputs, exports, linking and run-time lookup are defined in 6.5 |
+| Removal          | `remove.*` in `workspace` or a profile skips targets that do not have the value (4.4)                      |
+| Validation       | Rows for `kind` and for a static library linked both directly and through a shared library (12)            |
+| Deferred         | Shared dependencies (`cmake` shared targets, prebuilt shared libraries) and library versioning (15)        |
 
 ## 1. Goals and non-goals
 
@@ -55,7 +52,7 @@ silently ignored.
 | Concept       | Meaning                                                                       |
 | ------------- | ----------------------------------------------------------------------------- |
 | `workspace`   | Project metadata and defaults inherited by every `lib` and `bin`              |
-| `lib` / `bin` | A buildable target (static library / executable)                              |
+| `lib` / `bin` | A buildable target (static or shared library / executable)                    |
 | `dependency`  | External code, fetched and exposed to targets                                 |
 | `option`      | A typed, user-selectable setting (CLI or cache)                               |
 | `feature`     | A named bundle of defines, flags and libs, applied to targets or dependencies |
@@ -260,6 +257,10 @@ defines.public = ["GLM_FORCE_INLINE", "GLM_ENABLE_EXPERIMENTAL"]
 | `opt`                | enum        | no         | Overrides the profile's optimization level for this target's own sources  |
 | `output`             | string      | no         | Output name (default: target name)                                        |
 
+`lib` additionally accepts `kind = "static" | "shared"` (default `static`, no
+visibility or condition suffix, lookups allowed: `kind = "${option.lib_kind}"`).
+See 6.5.
+
 `bin` additionally accepts `subsystem = "console" | "windows"` (Windows only,
 ignored elsewhere).
 
@@ -295,6 +296,79 @@ appear in the manifest.
 
 `warnings` and `warnings_as_errors` apply to **the target's own sources only**
 and never propagate to consumers or dependencies.
+
+### 6.5 Shared libraries
+
+```toml
+[lib.engine]
+kind           = "shared"
+sources        = ["srcs/**/*.cpp"]
+include.public = ["incs"]
+```
+
+**Outputs.** `<name>` is `output`, or the target name.
+
+| Target OS | Library                    | Also produced                          | Directory      |
+| --------- | -------------------------- | -------------------------------------- | -------------- |
+| Windows   | `<name>.dll`               | import library `<name>.lib` (in `lib/`) | `bin/`         |
+| Linux/BSD | `lib<name>.so`             | (soname `lib<name>.so`)                | `lib/`         |
+| macOS     | `lib<name>.dylib`          | (install name `@rpath/lib<name>.dylib`) | `lib/`         |
+
+**Exports.** Symbols are not exported automatically. The tool defines two
+macros from the target name, upper-cased with every character that is not a
+letter or digit replaced by `_` (`my-lib` gives `MY_LIB`):
+
+| Macro            | Defined                                                       |
+| ---------------- | ------------------------------------------------------------- |
+| `<NAME>_SHARED`  | Public: for the library's own sources and every consumer      |
+| `<NAME>_BUILDING`| Private: only for the library's own sources                   |
+
+The library's header defines its export macro from them, for example:
+
+```c
+#if defined(ENGINE_SHARED) && defined(_WIN32)
+#  if defined(ENGINE_BUILDING)
+#    define ENGINE_API __declspec(dllexport)
+#  else
+#    define ENGINE_API __declspec(dllimport)
+#  endif
+#elif defined(ENGINE_SHARED)
+#  define ENGINE_API __attribute__((visibility("default")))
+#else
+#  define ENGINE_API
+#endif
+```
+
+Neither macro is defined for a static library, so the same header builds both
+kinds.
+
+**Linking.**
+
+- A shared library is linked like a `bin`: its own objects, every static
+  library and `sources` dependency it reaches, their libraries, `system`
+  libraries and `link_flags`.
+- A consumer links the shared library (the import library on Windows) and not
+  the static code inside it. The shared library's public compile interface
+  (`include`, `defines`, `flags`, public `deps`) still reaches the consumer.
+- Link-side keys of what is inside a shared library (`system`, `link_flags`,
+  library files) stop at the shared library.
+- A static library that a `bin` reaches both directly and through a shared
+  library is linked into both. Its global state then exists twice: a warning.
+
+**Position-independent code.** On targets other than Windows, every static
+library and `sources` dependency whose code is linked into a shared library is
+compiled position-independent (`-fPIC`). A `cmake` dependency linked into a
+shared library is configured with `CMAKE_POSITION_INDEPENDENT_CODE=ON`. A
+`prebuilt` static library must already be position-independent.
+
+**Finding libraries at run time.** A program built by the tool runs from the
+build directory without setup:
+
+| Target OS | Mechanism                                                                         |
+| --------- | --------------------------------------------------------------------------------- |
+| Windows   | Shared libraries are written to `bin/`, next to the executables                   |
+| Linux/BSD | Executables and shared libraries get the run path `$ORIGIN/../lib` and `$ORIGIN`  |
+| macOS     | Run path `@loader_path/../lib` and `@loader_path`; install names use `@rpath`     |
 
 ## 7. Options and features
 
@@ -626,6 +700,7 @@ after aliasing. This replaces the need to mentally assemble the manifest.
 | Unknown logical `system` name                                                          | Error                                       |
 | Logical system name placed in `deps`                                                   | Error                                       |
 | Non-header-only target without `sources`                                               | Error                                       |
+| `kind` other than `static` / `shared`, or `kind` on a header-only `lib`                | Error                                       |
 | Impossible `--target` and compiler combination                                         | Error                                       |
 | `alias` key other than `os`, `arch`, `compiler`                                        | Error                                       |
 | `alias` source name outside the 4.2 vocabulary (typo such as `x86-64`) or a group name | Error                                       |
@@ -635,6 +710,7 @@ after aliasing. This replaces the need to mentally assemble the manifest.
 | Private feature part on a `header-only`, `cmake` or `prebuilt` dependency              | Warning                                     |
 | `private` ABI-affecting flag on a library                                              | Warning                                     |
 | `alias` declared but no lookup in the dependency uses it                               | Warning                                     |
+| A static library linked into a `bin` both directly and through a shared library        | Warning                                     |
 | `master` / branch ref without a lockfile entry                                         | Info (will pin)                             |
 
 ## 13. Full example
@@ -810,6 +886,12 @@ they are not reopened by accident.
   `"llvm"` would save retyping common renamings. They would be data tables
   shipped with the tool, overridden by explicit `alias` entries. Add them once
   real manifests show which mappings repeat.
+- **Shared dependencies.** `cmake` dependencies that expose a shared target and
+  `prebuilt` shared libraries need their run-time files copied or found
+  (6.5). Until then a shared `cmake` target is an error and a `prebuilt`
+  dependency links static libraries.
+- **Library versioning.** Versioned file names (`libfoo.so.1`), soname
+  versions and macOS compatibility versions.
 - **`${profile}` aliasing.** Prebuilt layouts that capitalize `Debug` and
   `Release` cannot be matched by aliases today. Add a `profile` alias key if
   real layouts need it.

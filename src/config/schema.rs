@@ -244,7 +244,7 @@ const LIB_RULES: Rules = Rules {
     vis_lists: VIS_LISTS,
     cond_lists: TARGET_LISTS_NOVIS,
     cond_scalars: TARGET_SCALARS,
-    plain: &["root"],
+    plain: &["root", "kind"],
 };
 const BIN_RULES: Rules = Rules {
     vis_lists: VIS_LISTS,
@@ -1086,6 +1086,27 @@ mod tests {
     #[test]
     fn feature_rejects_scalars() {
         assert!(err("[feature.f]\nwarnings=\"high\"\n").contains("warnings"));
+    }
+
+    #[test]
+    fn lib_takes_kind_with_no_suffix_and_nothing_else_does() {
+        m("[lib.a]\nkind = \"shared\"\n").unwrap();
+        m("[lib.a]\nkind = \"${option.k}\"\n").unwrap();
+        let rejects = |src: &str, what: &str| assert!(err(src).contains(what), "{src}");
+        rejects(
+            "[lib.a]\nkind.windows = \"shared\"\n",
+            "does not accept a condition",
+        );
+        rejects(
+            "[lib.a]\nkind.public = \"shared\"\n",
+            "does not accept visibility",
+        );
+        for table in ["bin.a", "workspace", "feature.f", "profile.p"] {
+            rejects(
+                &format!("[{table}]\nkind = \"shared\"\n"),
+                "unknown key `kind`",
+            );
+        }
     }
 
     #[test]

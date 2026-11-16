@@ -149,7 +149,7 @@ pub fn explain_arg(
 /// `lib`, `bin` or `dependency`: the table a unit is written in.
 fn table_name(unit: &Unit) -> &'static str {
     match unit.kind {
-        UnitKind::Lib | UnitKind::InterfaceLib => "lib",
+        UnitKind::Lib | UnitKind::SharedLib | UnitKind::InterfaceLib => "lib",
         UnitKind::Bin => "bin",
         UnitKind::Dep(_) => "dependency",
     }
@@ -291,6 +291,7 @@ pub fn explain_config(project: &Project, name: &str) -> Result<String, ExplainEr
 
     let kind = match unit.kind {
         UnitKind::Lib => "lib".to_string(),
+        UnitKind::SharedLib => "lib, shared".to_string(),
         UnitKind::InterfaceLib => "lib, header-only".to_string(),
         UnitKind::Bin => "bin".to_string(),
         UnitKind::Dep(kind) => kind.as_str().to_string(),

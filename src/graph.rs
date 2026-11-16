@@ -106,6 +106,14 @@ impl Graph {
             .map(|(i, t)| (t.name.as_str(), i))
             .collect();
         let output = |i: usize| project.target_output_path(&project.targets[i]);
+        // What a link names for a library: the import library of a DLL.
+        let link_file = |i: usize| project.target_link_path(&project.targets[i]);
+        // Every file a target's task writes: the primary output first.
+        let outputs = |i: usize| {
+            let mut files = vec![output(i)];
+            files.extend(project.import_library_path(&project.targets[i]));
+            files
+        };
 
         let mut objects: Vec<Vec<PathBuf>> = vec![Vec::new(); project.targets.len()];
         for (ti, target) in project.targets.iter().enumerate() {
@@ -129,13 +137,18 @@ impl Graph {
                     .iter()
                     .any(|s| Lang::from_path(s) == Some(Lang::Cxx))
             };
-            // The static libraries this target links, which are what its link
-            // (or archive) has to wait for.
+            // The libraries this target links, which are what its link (or
+            // archive) has to wait for.
             let libs: Vec<usize> = target
                 .deps
                 .iter()
                 .filter_map(|d| index.get(d.as_str()).copied())
-                .filter(|&i| project.targets[i].kind == BuildTargetKind::StaticLibrary)
+                .filter(|&i| {
+                    matches!(
+                        project.targets[i].kind,
+                        BuildTargetKind::StaticLibrary | BuildTargetKind::SharedLibrary
+                    )
+                })
                 .collect();
             match target.kind {
                 // Header-only: consumers compile it, nothing is built for it.
@@ -152,14 +165,14 @@ impl Graph {
                         outputs: vec![output(ti)],
                     });
                 }
-                BuildTargetKind::Binary => {
+                BuildTargetKind::Binary | BuildTargetKind::SharedLibrary => {
                     // `libstdc++` has to be linked if any C++ object goes in.
                     let any_cxx =
                         has_cxx(target) || libs.iter().any(|&i| has_cxx(&project.targets[i]));
                     // The libraries are on the command line through the link
                     // arguments, so they are implicit inputs here, not inputs.
                     let mut implicit_inputs: Vec<PathBuf> =
-                        libs.iter().map(|&i| output(i)).collect();
+                        libs.iter().map(|&i| link_file(i)).collect();
                     implicit_inputs.extend(target.link_inputs.iter().cloned());
                     tasks.push(Task {
                         kind: TaskKind::Link,
@@ -167,7 +180,7 @@ impl Graph {
                         lang: if any_cxx { Lang::Cxx } else { Lang::C },
                         inputs: objects[ti].clone(),
                         implicit_inputs,
-                        outputs: vec![output(ti)],
+                        outputs: outputs(ti),
                     });
                 }
             }

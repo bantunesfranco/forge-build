@@ -1,0 +1,40 @@
+# A shared library that links a static one, and a program that uses it.
+# Try: forge --opt lib_kind=static build    (the same code, built as a static library)
+
+[workspace]
+name = "shared-library"
+version = "0.1.0"
+cxx  = "17"
+
+[profile.debug]
+opt        = "none"
+debug_info = true
+
+[profile.release]
+opt        = "speed"
+debug_info = false
+
+[option.lib_kind]
+type    = "enum"
+values  = ["shared", "static"]
+default = "shared"
+doc     = "Build the geometry library as a shared or a static library."
+
+# Static, and linked into `geometry`. Because `geometry` is shared, forge
+# compiles it position-independent. A consumer of `geometry` never links it.
+[lib.vec]
+sources        = ["vec/src/vec.cpp"]
+include.public = ["vec/include"]
+
+# <NAME>_SHARED (public) and <NAME>_BUILDING (private) are defined for the
+# header's export macro: GEOMETRY_SHARED and GEOMETRY_BUILDING here.
+[lib.geometry]
+kind           = "${option.lib_kind}"
+sources        = ["src/geometry.cpp"]
+include.public = ["include"]
+deps           = ["vec"]
+
+[bin.shared-library]
+sources = ["src/main.cpp"]
+deps    = ["geometry"]
+defines = ["LIB_KIND=\"${option.lib_kind}\""]

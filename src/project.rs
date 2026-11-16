@@ -16,7 +16,7 @@ use crate::{
     },
     configure::{
         configure,
-        model::{Configured, Invocation, UnitKind, effective, reachable},
+        model::{Configured, Invocation, UnitKind, effective, link_reach},
         options::{cache_path, load_cache},
     },
     deps::{Phase, Prepared, prepare_all, reached},
@@ -54,6 +54,8 @@ pub struct Project {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuildTargetKind {
     StaticLibrary,
+    /// A `lib` with `kind = "shared"`: linked like a binary.
+    SharedLibrary,
     Binary,
     /// A header-only library: nothing to compile, archive or link.
     Interface,
@@ -71,12 +73,13 @@ pub struct BuildTarget {
     pub compile_c: Vec<String>,
     /// Compile arguments for this target's C++ sources (empty without any).
     pub compile_cxx: Vec<String>,
-    /// What follows the object files on the link line (binaries only).
+    /// What follows the object files on the link line (binaries and shared
+    /// libraries only).
     pub link: Vec<String>,
     /// Library files that are linked but not built here; they are implicit
     /// inputs of the link.
     pub link_inputs: Vec<PathBuf>,
-    /// The static-library targets that get linked, in link order.
+    /// The static- and shared-library targets that get linked, in link order.
     pub deps: Vec<String>,
 }
 
@@ -308,6 +311,7 @@ impl Project {
         for (index, unit) in c.units.iter().enumerate() {
             let kind = match unit.kind {
                 UnitKind::Lib => BuildTargetKind::StaticLibrary,
+                UnitKind::SharedLib => BuildTargetKind::SharedLibrary,
                 UnitKind::Bin => BuildTargetKind::Binary,
                 UnitKind::InterfaceLib => BuildTargetKind::Interface,
                 UnitKind::Dep(DepKind::Sources) if used.contains(&index) => {
@@ -333,12 +337,13 @@ impl Project {
         }
 
         // Output paths only depend on names, so the link arguments can ask for
-        // any library's file while the targets are being filled in.
+        // any library's file while the targets are being filled in. It is the
+        // file a link names: for a shared library on Windows the import library.
         let artifact = |unit: usize| {
             targets
                 .iter()
                 .find(|t| t.unit == unit)
-                .map(|t| self.target_output_path(t))
+                .map(|t| self.target_link_path(t))
                 .unwrap_or_else(|| PathBuf::from(&c.units[unit].name))
         };
         let mut filled = Vec::new();
@@ -359,12 +364,16 @@ impl Project {
             } else {
                 Vec::new()
             };
-            let external = if target.kind == BuildTargetKind::Binary {
+            let linked = matches!(
+                target.kind,
+                BuildTargetKind::Binary | BuildTargetKind::SharedLibrary
+            );
+            let external = if linked {
                 self.external_libs(target.unit)
             } else {
                 Vec::new()
             };
-            let link = if target.kind == BuildTargetKind::Binary {
+            let link = if linked {
                 flags::link_args(c, target.unit, &artifact, &external)
             } else {
                 Vec::new()
@@ -380,11 +389,12 @@ impl Project {
         Ok(targets)
     }
 
-    /// The library files of every prebuilt dependency that `unit` reaches,
-    /// consumers first and each once. They are linked, not built here.
+    /// The library files of every prebuilt dependency that `unit`'s link
+    /// reaches (not those behind a shared library), consumers first and each
+    /// once. They are linked, not built here.
     fn external_libs(&self, unit: usize) -> Vec<PathBuf> {
         let mut files: Vec<PathBuf> = Vec::new();
-        for dep in reachable(&self.configured, unit) {
+        for dep in link_reach(&self.configured, unit) {
             for file in self.prepared.get(&dep).map_or(&[][..], |p| &p.lib_files) {
                 if !files.contains(file) {
                     files.push(file.clone());
@@ -468,6 +478,15 @@ impl Project {
                 };
                 self.build_dir().join("bin").join(name)
             }
+            // The import library on Windows is `import_library_path`.
+            BuildTargetKind::SharedLibrary => {
+                let (dir, name) = match self.platform.os {
+                    Os::Windows => ("bin", format!("{output}.dll")),
+                    Os::Macos => ("lib", format!("lib{output}.dylib")),
+                    Os::Linux | Os::Bsd => ("lib", format!("lib{output}.so")),
+                };
+                self.build_dir().join(dir).join(name)
+            }
             // An interface library has no file; this is where its archive would be.
             BuildTargetKind::StaticLibrary | BuildTargetKind::Interface => {
                 self.build_dir().join("lib").join(if self.uses_msvc() {
@@ -477,6 +496,24 @@ impl Project {
                 })
             }
         }
+    }
+
+    /// The extra file the link of a shared library writes: its import library,
+    /// on Windows only (spec 6.5).
+    pub fn import_library_path(&self, target: &BuildTarget) -> Option<PathBuf> {
+        (target.kind == BuildTargetKind::SharedLibrary && self.platform.os == Os::Windows).then(
+            || {
+                let output = &self.configured.units[target.unit].output;
+                self.build_dir().join("lib").join(format!("{output}.lib"))
+            },
+        )
+    }
+
+    /// The file a consumer's link line names: the import library of a shared
+    /// library on Windows, otherwise the output.
+    pub fn target_link_path(&self, target: &BuildTarget) -> PathBuf {
+        self.import_library_path(target)
+            .unwrap_or_else(|| self.target_output_path(target))
     }
 }
 
@@ -501,7 +538,7 @@ fn check_platform(platform: &Platform) -> Result<(), ConfigError> {
 fn any_source(c: &Configured, lang: Lang) -> bool {
     c.units
         .iter()
-        .filter(|u| matches!(u.kind, UnitKind::Lib | UnitKind::Bin))
+        .filter(|u| matches!(u.kind, UnitKind::Lib | UnitKind::SharedLib | UnitKind::Bin))
         .flat_map(|u| &u.sources)
         .any(|s| Lang::from_path(s) == Some(lang))
 }
@@ -511,7 +548,7 @@ fn check_standards(c: &Configured) -> Result<(), ConfigError> {
     for unit in c
         .units
         .iter()
-        .filter(|u| matches!(u.kind, UnitKind::Lib | UnitKind::Bin))
+        .filter(|u| matches!(u.kind, UnitKind::Lib | UnitKind::SharedLib | UnitKind::Bin))
     {
         for (lang, key, std) in [(Lang::C, "c", &c.c_std), (Lang::Cxx, "cxx", &c.cxx_std)] {
             let Some(src) = unit

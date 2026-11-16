@@ -653,3 +653,51 @@ fn rebuilding_a_prebuilt_library_relinks_and_nothing_else() {
     go(&exec);
     assert!(exec.runs().is_empty(), "{:?}", exec.runs());
 }
+
+#[test]
+fn libraries_behind_a_shared_library_are_not_linked_by_its_consumer() {
+    // `engine` is shared and uses a prebuilt library and a `sources`
+    // dependency with a link flag; the app only uses `engine`.
+    let f = Fixture::new(&manifest(&format!(
+        concat!(
+            "{}",
+            "[dependency.mid]\npath = \"vendor/mid\"\nkind = \"sources\"\nfiles = [\"a.c\"]\nlink_flags = [\"-Wl,--mid-flag\"]\ndeps = [\"foo\"]\n",
+            "[lib.engine]\nkind = \"shared\"\nsources = [\"e.c\"]\ndeps = [\"mid\"]\n",
+            "[bin.app]\nsources = [\"main.c\"]\ndeps = [\"engine\"]\n",
+        ),
+        FOO_DEP
+    )));
+    for file in ["main.c", "e.c", "vendor/mid/a.c"] {
+        f.touch(file);
+    }
+    let foo = format!("vendor/foo/{}/libfoo.a", host_lib_dir());
+    f.touch(&foo);
+    let project = f.load().unwrap();
+    let graph = Graph::from_project(&project).unwrap();
+    let engine = project.targets.iter().find(|t| t.name == "engine").unwrap();
+    let engine_link = graph
+        .tasks
+        .iter()
+        .find(|t| t.outputs[0] == project.target_output_path(engine))
+        .unwrap();
+    let engine_args = command_for(engine_link, &project).args;
+    assert!(has(&engine_args, &foo), "{engine_args:?}");
+    assert!(has(&engine_args, "-Wl,--mid-flag"), "{engine_args:?}");
+    assert!(engine_link.implicit_inputs.contains(&PathBuf::from(&foo)));
+
+    let app = task_of(&graph, &format!("build/debug/bin/{}", exe("app")));
+    let app_args = command_for(app, &project).args;
+    assert!(!has(&app_args, &foo), "{app_args:?}");
+    assert!(!has(&app_args, "-Wl,--mid-flag"), "{app_args:?}");
+    assert!(
+        !app_args.iter().any(|a| a.ends_with("libmid.a")),
+        "{app_args:?}"
+    );
+    assert!(
+        !app.implicit_inputs.contains(&PathBuf::from(&foo)),
+        "{app:?}"
+    );
+    let targets = &project.targets;
+    let app_target = targets.iter().find(|t| t.name == "app").unwrap();
+    assert!(app_target.link_inputs.is_empty(), "{app_target:?}");
+}

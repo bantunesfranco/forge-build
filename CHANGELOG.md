@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.0
+
+Second test release. Adds shared libraries; manifests written for 0.1.0 keep working unchanged (libraries stay static unless they say `kind = "shared"`).
+
+Also on crates.io from this release: `cargo install forge-build`.
+
+### Added
+
+- **Shared libraries:** `kind = "shared"` on a `lib` builds a `.dll` (with its import library) on Windows, a `.so` on Linux and BSD and a `.dylib` on macOS. `kind` may be a lookup such as `"${option.lib_kind}"`. See section 6.5 of the manifest specification (draft 0.4) and `examples/shared-library`.
+  - forge defines `<NAME>_SHARED` (public) and `<NAME>_BUILDING` (private) so a header can pick `dllexport`, `dllimport` or default visibility.
+  - A shared library links the static libraries and `sources` dependencies it reaches; consumers link only the shared library. Link-side settings (`system`, `link_flags`, library files) of what is inside it stop at the library.
+  - Static libraries, `sources` dependencies and `cmake` dependencies that go into a shared library are built position-independent (not on Windows).
+  - Programs run from the build directory without setup: DLLs sit next to the executables on Windows, and executables and shared libraries get `$ORIGIN` or `@loader_path` run paths elsewhere.
+  - Spec draft 0.4.
+
+### Known limitations
+
+- Shared libraries from dependencies (a `cmake` shared target, a prebuilt `.so`/`.dll`) are not supported yet, and libraries have no version in their file names (`libfoo.so.1`).
+- The warning for a static library linked both directly and through a shared library covers your own libraries and `sources` dependencies only.
+- `output` names get `.dll` appended on Windows even when they already end in `.dll`.
+
 ## 0.1.0
 
 First test release. The manifest format ([spec draft 0.3](docs/manifest-spec.md)) may still change between 0.x releases.
