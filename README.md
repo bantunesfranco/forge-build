@@ -1,6 +1,6 @@
 # Forge
 
-[![CI](https://github.com/OWNER/REPO/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/ci.yml)
+[![CI](https://github.com/bantunesfranco/forge-build/actions/workflows/ci.yml/badge.svg)](https://github.com/bantunesfranco/forge-build/actions/workflows/ci.yml)
 
 **Forge** is a small incremental C/C++ build system written in Rust. It explores
 dependency tracking, reliable rebuild decisions, parallel task scheduling, and
@@ -24,12 +24,21 @@ plan without running anything.
 - `explain`: the merged configuration of a target with the origin of every value, and the planner's decision and reason for every task.
 - Failures never look like successes: a failed task is never recorded as up to date.
 
-## Quick start
+## Install
 
-Requirements: a Rust toolchain and a C/C++ compiler (`gcc`, `clang`, Apple clang, MSVC `cl` or `clang-cl`).
+Download the archive for your platform from the [releases page](https://github.com/bantunesfranco/forge-build/releases), unpack it and put `forge` on your `PATH`. Or build it from source with a Rust toolchain (1.89 or newer):
 
 ```text
-cargo install --path .
+cargo install --git https://github.com/bantunesfranco/forge-build
+```
+
+Both install two identical programs, `forge` and `forge-build`. Use `forge-build` if another `forge` (for example Foundry's) is already on your `PATH`. The 0.x releases are test releases: the manifest format may still change. See [CHANGELOG.md](CHANGELOG.md).
+
+## Quick start
+
+Requirements: forge and a C/C++ compiler (`gcc`, `clang`, Apple clang, MSVC `cl` or `clang-cl`).
+
+```text
 cd examples/cpp-profiles
 forge build
 ./build/debug/bin/cpp-profiles
