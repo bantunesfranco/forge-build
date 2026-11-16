@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    build::{BuildOptions, build},
+    build::{BuildOptions, Stream, build},
     compdb,
     config::{self, ConfigError, Diagnostics, Level, find_manifest, flat::Locations},
     configure::{
@@ -193,6 +193,7 @@ pub fn run() -> Result<i32, Box<dyn std::error::Error>> {
             let opts = BuildOptions {
                 jobs: jobs.map_or_else(|| BuildOptions::default().jobs, |j| j.get()),
                 verbose,
+                ..BuildOptions::default()
             };
 
             build_project(&mut project, target.as_deref(), opts, printed)?;
@@ -207,6 +208,8 @@ pub fn run() -> Result<i32, Box<dyn std::error::Error>> {
             let opts = BuildOptions {
                 jobs: jobs.map_or_else(|| BuildOptions::default().jobs, |j| j.get()),
                 verbose,
+                // the program's stdout is the command's stdout
+                progress: Stream::Stderr,
             };
             let name = select_bin(&project, bin.as_deref())?.to_string();
             build_project(&mut project, Some(&name), opts, printed)?;

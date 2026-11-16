@@ -41,7 +41,7 @@ fn text(out: &Output) -> (String, String) {
     )
 }
 
-/// The lines the program printed (the build prints to stdout as well).
+/// The lines the program printed, from the stdout of a run.
 fn program_lines(stdout: &str) -> Vec<&str> {
     stdout
         .lines()
@@ -58,14 +58,14 @@ fn run_builds_then_runs_with_the_arguments_and_the_exit_code() {
     let out = f.forge(&["run", "app", "--", "a", "b c", "--flag"]);
     let (stdout, stderr) = text(&out);
     assert_eq!(out.status.code(), Some(7), "{stdout}{stderr}");
+    // stdout is the program's output and nothing else, though this run built;
+    // the progress lines are on stderr
     assert_eq!(
-        program_lines(&stdout),
-        ["arg=[a]", "arg=[b c]", "arg=[--flag]", "marker=no"],
-        "{stdout}"
+        stdout.replace("\r\n", "\n"),
+        "arg=[a]\narg=[b c]\narg=[--flag]\nmarker=no\n"
     );
-    assert!(stdout.contains("Compiling"), "{stdout}");
-    assert!(!stdout.contains("Build successful"), "{stdout}");
-    assert!(!stdout.contains("Running"), "{stdout}");
+    assert!(stderr.contains("Compiling"), "{stderr}");
+    assert!(stderr.contains("Linking"), "{stderr}");
     // The notice goes to stderr before the program's own stderr.
     let path = ["build", "debug", "bin"]
         .iter()
@@ -90,8 +90,13 @@ fn run_without_a_name_runs_the_only_bin_and_skips_an_up_to_date_build() {
     let out = f.forge(&["run", "--", "x"]);
     let (stdout, stderr) = text(&out);
     assert_eq!(out.status.code(), Some(7), "{stdout}{stderr}");
-    assert!(!stdout.contains("Compiling"), "{stdout}");
-    assert_eq!(program_lines(&stdout), ["arg=[x]", "marker=no"], "{stdout}");
+    assert_eq!(
+        stdout.replace("\r\n", "\n"),
+        "arg=[x]\nmarker=no\n",
+        "{stderr}"
+    );
+    assert!(stderr.contains("Build is up to date"), "{stderr}");
+    assert!(!stderr.contains("Compiling"), "{stderr}");
 }
 
 #[test]

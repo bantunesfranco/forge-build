@@ -148,5 +148,6 @@ pub fn jobs(n: usize) -> BuildOptions {
     BuildOptions {
         jobs: n,
         verbose: false,
+        ..BuildOptions::default()
     }
 }
