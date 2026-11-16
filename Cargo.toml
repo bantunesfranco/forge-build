@@ -11,8 +11,18 @@ homepage = "https://github.com/bantunesfranco/forge-build"
 categories = ["development-tools::build-utils"]
 keywords = ["build-system", "c", "cpp", "incremental", "make"]
 readme = "README.md"
-exclude = ["/.github"]
-publish = false         # keep until ready to publish to crates.io
+# Only what `cargo install` needs and the license texts; tests, examples and
+# docs stay in the repository.
+include = [
+    "/src/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+    "/THIRD-PARTY-NOTICES.md",
+]
 
 [[bin]]
 name = "forge"
