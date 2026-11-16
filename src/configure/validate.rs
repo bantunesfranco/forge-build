@@ -81,15 +81,20 @@ impl Names<'_> {
 
         if !LIST_KEYS.contains(&key) {
             if e.value.is_array() {
-                return Err(ConfigError::invalid(
+                return Err(ConfigError::at_key(
                     &table.origin,
+                    &e.raw_key,
                     format!("`{}` is not a list and cannot be an array", e.raw_key),
                 ));
             }
             return scalar(&sourced(&e.value), key);
         }
         let items = e.value.as_array().ok_or_else(|| {
-            ConfigError::invalid(&table.origin, format!("`{}` must be an array", e.raw_key))
+            ConfigError::at_key(
+                &table.origin,
+                &e.raw_key,
+                format!("`{}` must be an array", e.raw_key),
+            )
         })?;
         for item in items {
             let s = sourced(item);
@@ -103,15 +108,17 @@ impl Names<'_> {
                         .map_err(|message: String| invalid(&s, message))?;
                 }
                 "flags" | "link_flags" => {
-                    crate::config::types::check_flag(&format!("{}.{}", s.origin, s.raw_key), text)?;
+                    crate::config::types::check_flag(&format!("{}.{}", s.origin, s.raw_key), text)
+                        .map_err(|e| e.in_key(&s.origin, &s.raw_key))?;
                 }
                 "deps" => self.dependency(&s, text)?,
                 "features" => {
                     if !self.m.features.contains_key(text) {
                         let declared: Vec<&str> =
                             self.m.features.keys().map(String::as_str).collect();
-                        return Err(ConfigError::invalid(
+                        return Err(ConfigError::at_key(
                             &s.origin,
+                            &s.raw_key,
                             unknown_feature_message(text, &declared),
                         ));
                     }
@@ -147,7 +154,11 @@ impl Names<'_> {
     fn lookups(&self, table: &Table, e: &crate::config::schema::Entry) -> Result<(), ConfigError> {
         let ctx = self.dummy_ctx();
         check_strings(&e.value, &ctx).map_err(|message| {
-            ConfigError::invalid(&table.origin, format!("`{}`: {message}", e.raw_key))
+            ConfigError::at_key(
+                &table.origin,
+                &e.raw_key,
+                format!("`{}`: {message}", e.raw_key),
+            )
         })
     }
 
@@ -167,8 +178,9 @@ impl Names<'_> {
             .into_iter()
             .chain(dep.find.as_deref().map(|f| ("find", f)))
         {
-            expand(text, &ctx)
-                .map_err(|message| ConfigError::invalid(origin, format!("`{field}`: {message}")))?;
+            expand(text, &ctx).map_err(|message| {
+                ConfigError::at_key(origin, field, format!("`{field}`: {message}"))
+            })?;
         }
         Ok(())
     }
@@ -176,9 +188,11 @@ impl Names<'_> {
     fn dependency(&self, s: &Sourced, dep: &str) -> Result<(), ConfigError> {
         if let Some(target) = self.m.targets.get(dep) {
             return match target.kind {
-                TargetKind::Bin => {
-                    Err(ConfigError::invalid(&s.origin, exe_dependency_message(dep)))
-                }
+                TargetKind::Bin => Err(ConfigError::at_key(
+                    &s.origin,
+                    &s.raw_key,
+                    exe_dependency_message(dep),
+                )),
                 TargetKind::Lib => Ok(()),
             };
         }
@@ -190,7 +204,7 @@ impl Names<'_> {
         } else {
             unknown_dependency_message(dep)
         };
-        Err(ConfigError::invalid(&s.origin, message))
+        Err(ConfigError::at_key(&s.origin, &s.raw_key, message))
     }
 }
 
@@ -218,7 +232,7 @@ fn scalar(s: &Sourced, key: &str) -> Result<(), ConfigError> {
         "output" | "root" | "lib_dir" => {
             let text = want_str(s)?;
             if key == "output" && !is_template(text) {
-                check_output(&s.origin, text.to_string())?;
+                check_output(s, text.to_string())?;
             }
         }
         "options" if !s.value.is_table() => return Err(wrong_type(s, "a table")),

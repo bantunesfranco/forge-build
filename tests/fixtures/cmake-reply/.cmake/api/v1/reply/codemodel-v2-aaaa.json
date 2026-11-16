@@ -7,7 +7,8 @@
       "targets": [
         { "name": "glfw", "id": "glfw::@a", "jsonFile": "target-glfw-Debug-1111.json" },
         { "name": "glfw_util", "id": "glfw_util::@a", "jsonFile": "target-glfw_util-Debug-2222.json" },
-        { "name": "glfw_shared", "id": "glfw_shared::@a", "jsonFile": "target-glfw_shared-Debug-3333.json" }
+        { "name": "glfw_shared", "id": "glfw_shared::@a", "jsonFile": "target-glfw_shared-Debug-3333.json" },
+        { "name": "forge_probe", "id": "forge_probe::@a", "jsonFile": "target-forge_probe-Debug-4444.json" }
       ]
     },
     {

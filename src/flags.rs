@@ -163,6 +163,18 @@ pub fn target_arg(c: &Configured) -> Option<String> {
     }
 }
 
+/// `--sysroot=<dir>` for gcc, clang and Apple clang when the toolchain file
+/// names a `sysroot`, cross build or not. MSVC-like compilers have no such
+/// flag.
+pub fn sysroot_arg(c: &Configured) -> Option<String> {
+    if msvc_like(c.platform.compiler) {
+        return None;
+    }
+    c.sysroot
+        .as_ref()
+        .map(|dir| format!("--sysroot={}", path_arg(dir)))
+}
+
 /// Compile arguments for a lib, a bin, or a `sources` dependency, in the one
 /// fixed order that keeps command hashes stable.
 pub fn compile_args(c: &Configured, unit: usize, lang: Lang) -> Result<Vec<String>, ConfigError> {
@@ -183,21 +195,27 @@ pub fn compile_args(c: &Configured, unit: usize, lang: Lang) -> Result<Vec<Strin
     let scalars = &c.profile_scalars;
     let mut args: Vec<String> = Vec::new();
     args.extend(target_arg(c));
+    args.extend(sysroot_arg(c));
 
     let (key, std) = match lang {
         Lang::C => ("c", c.c_std.as_deref()),
         Lang::Cxx => ("cxx", c.cxx_std.as_deref()),
     };
     let std = std.ok_or_else(|| {
-        ConfigError::invalid(
+        ConfigError::at(
             key,
+            "workspace",
+            Some(key),
             format!(
                 "no {} standard is set; add `{key} = \"<standard>\"` to [workspace]",
                 lang.name()
             ),
         )
     })?;
-    args.push(std_flag(compiler, lang, std).map_err(|e| ConfigError::invalid(key, e))?);
+    args.push(
+        std_flag(compiler, lang, std)
+            .map_err(|e| ConfigError::at(key, "workspace", Some(key), e))?,
+    );
     if msvc && lang == Lang::Cxx {
         args.push("/permissive-".to_string());
         args.push("/EHsc".to_string());
@@ -277,6 +295,7 @@ pub fn link_args(
     // triple does not belong: `build::command_for` puts it before `/link`.
     if !msvc {
         args.extend(target_arg(c));
+        args.extend(sysroot_arg(c));
     }
 
     for lib in &eff.link_units {
@@ -375,6 +394,7 @@ pub fn profile_args(c: &Configured, _lang: Lang) -> Vec<String> {
     let scalars = &c.profile_scalars;
     let mut args: Vec<String> = Vec::new();
     args.extend(target_arg(c));
+    args.extend(sysroot_arg(c));
     args.extend(owned(opt_args(msvc, scalars.opt)));
     if scalars.debug_info {
         args.push(debug_arg(msvc).to_string());
@@ -1079,6 +1099,54 @@ sources = [\"m.c\"]
         let mut c = cross(linux(Compiler::Clang));
         c.cross_triple = None;
         assert!(target_arg(&c).is_none());
+    }
+
+    #[test]
+    fn sysroot_is_passed_to_gcc_and_the_clang_family_but_not_msvc() {
+        let src = "[workspace]\nc = \"11\"\n[bin.m]\nsources = [\"m.c\"]\n";
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().canonicalize().unwrap();
+        std::fs::write(root.join("m.c"), "").unwrap();
+        let m = parse_manifest(parse_flat(src).unwrap()).unwrap();
+        let with_sysroot = |platform: Platform| {
+            let mut c = configure(
+                &m,
+                &root,
+                &Invocation::default(),
+                platform,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            c.sysroot = Some(PathBuf::from("/opt/sysroot"));
+            c
+        };
+        let want = "--sysroot=/opt/sysroot".to_string();
+        for (platform, expect) in [
+            (linux(Compiler::Gcc), true),
+            (linux(Compiler::Clang), true),
+            (plat(Os::Macos, Compiler::AppleClang), true),
+            (windows(Compiler::Msvc), false),
+            (windows(Compiler::ClangCl), false),
+        ] {
+            let c = with_sysroot(platform);
+            let m = idx(&c, "m");
+            let compile = compile_args(&c, m, Lang::C).unwrap();
+            let link = link_args(&c, m, &artifact_of(&c), &[]);
+            let profile = profile_args(&c, Lang::C);
+            assert_eq!(compile.contains(&want), expect, "{platform:?}: {compile:?}");
+            assert_eq!(link.contains(&want), expect, "{platform:?}: {link:?}");
+            assert_eq!(profile.contains(&want), expect, "{platform:?}: {profile:?}");
+        }
+        // No sysroot, no flag.
+        let mut c = with_sysroot(linux(Compiler::Gcc));
+        c.sysroot = None;
+        let m = idx(&c, "m");
+        assert!(
+            !compile_args(&c, m, Lang::C)
+                .unwrap()
+                .iter()
+                .any(|a| a.starts_with("--sysroot"))
+        );
     }
 
     #[test]

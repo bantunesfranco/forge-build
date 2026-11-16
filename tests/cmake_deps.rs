@@ -310,3 +310,71 @@ fn release_profile_builds_and_links_a_cmake_dependency() {
     build(&p, &g, &ProcessExecutor, jobs(2)).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(run_app(&f, "release"), Some(7));
 }
+
+/// A CMake dependency whose static library needs one system library of the
+/// host, and the source that cannot link without it. The function it defines
+/// returns 7.
+fn system_lib_dependency() -> (&'static str, &'static str, &'static str) {
+    if cfg!(windows) {
+        (
+            "ws2_32",
+            "#include <winsock2.h>\nint m_value(void) { WSASetLastError(7); return WSAGetLastError(); }\n",
+            "ws2_32",
+        )
+    } else if cfg!(target_os = "macos") {
+        (
+            "\"-framework CoreFoundation\"",
+            "#include <CoreFoundation/CoreFoundation.h>\nint m_value(void) { return CFAbsoluteTimeGetCurrent() > 0 ? 7 : 0; }\n",
+            "framework CoreFoundation",
+        )
+    } else {
+        (
+            "m",
+            "#include <math.h>\nint m_value(void) { volatile double x = 49.0; return (int)(sqrt(x) + 0.5); }\n",
+            "m",
+        )
+    }
+}
+
+#[test]
+fn a_static_library_links_the_system_libraries_it_needs() {
+    if !usable("cmake") {
+        eprintln!("skipped: cmake is not installed");
+        return;
+    }
+    let (Some(cc), Some(cxx)) = (real_cc(), real_cxx()) else {
+        eprintln!("skipped: no C and C++ compiler can be run");
+        return;
+    };
+    let (link, source, shown) = system_lib_dependency();
+    // No `system` key anywhere in the manifest. The CMake target is not
+    // called `m`: on Linux it links libm, and `target_link_libraries(m PUBLIC
+    // m)` would make CMake read it as the target linking to itself.
+    let manifest = MANIFEST
+        .replace("options = { M_RESULT = 7 }\n", "")
+        .replace("target = \"m\"", "target = \"mlib\"");
+    assert!(!manifest.contains("system"));
+    let f = Fixture::with_toolchain(&manifest, &cc, &cxx);
+    f.write(
+        "vendor/m/CMakeLists.txt",
+        &format!(
+            "cmake_minimum_required(VERSION 3.10)\nproject(m C)\nadd_library(mlib STATIC m.c)\ntarget_link_libraries(mlib PUBLIC {link})\n"
+        ),
+    );
+    f.write("vendor/m/m.c", source);
+    f.write(
+        "main.c",
+        "int m_value(void);\nint main(void) { return m_value(); }\n",
+    );
+
+    build_all(&f);
+    assert_eq!(run_app(&f, "debug"), Some(7));
+
+    // `explain` lists what was detected.
+    let p = load_and_prepare(&f);
+    let text = forge_build::explain::explain_config(&p, "m").unwrap();
+    assert!(
+        text.contains("built:") && text.contains(&format!("system    {shown}")),
+        "{text}"
+    );
+}

@@ -175,6 +175,26 @@ pub fn llvm_triple(os: Os, arch: Arch) -> String {
     format!("{arch_part}-{os_part}")
 }
 
+/// The GNU-style triple of a platform, the prefix of cross tools
+/// (`aarch64-linux-gnu-pkg-config`) and a directory name in a sysroot.
+pub fn gnu_triple(os: Os, arch: Arch) -> String {
+    let arch_part = match (arch, os) {
+        (Arch::X86_64, _) => "x86_64",
+        (Arch::X86, _) => "i686",
+        (Arch::Arm64, _) => "aarch64",
+        (Arch::Arm, Os::Linux | Os::Macos) => "arm",
+        (Arch::Arm, _) => "armv7",
+    };
+    let os_part = match os {
+        Os::Windows => "w64-mingw32",
+        Os::Linux if arch == Arch::Arm => "linux-gnueabihf",
+        Os::Linux => "linux-gnu",
+        Os::Macos => "apple-darwin",
+        Os::Bsd => "unknown-freebsd",
+    };
+    format!("{arch_part}-{os_part}")
+}
+
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct UserToolchainFile {
@@ -188,6 +208,25 @@ pub struct UserToolchain {
     pub c: Option<String>,
     pub cxx: Option<String>,
     pub ar: Option<String>,
+    /// The `pkg-config` that finds `system` dependencies when cross-compiling.
+    pub pkg_config: Option<String>,
+    /// The target's root directory: `--sysroot` for the compilers, and where
+    /// the `pkg-config` of a cross build looks for packages. A relative path is
+    /// taken from the directory of the file that names it.
+    pub sysroot: Option<PathBuf>,
+}
+
+impl UserToolchain {
+    /// Makes a relative `sysroot` absolute against the directory of `file`:
+    /// compilers run with the project root as their working directory.
+    fn resolve_paths(mut self, file: &Path) -> Self {
+        if let Some(sysroot) = self.sysroot.take() {
+            let dir = file.parent().unwrap_or(Path::new(""));
+            let joined = dir.join(sysroot);
+            self.sysroot = Some(std::path::absolute(&joined).unwrap_or(joined));
+        }
+        self
+    }
 }
 
 pub fn load_user_toolchain() -> Result<UserToolchain, String> {
@@ -209,7 +248,7 @@ pub fn load_user_toolchain() -> Result<UserToolchain, String> {
     };
     match std::fs::read_to_string(&path) {
         Ok(contents) => toml::from_str::<UserToolchainFile>(&contents)
-            .map(|file| file.toolchain)
+            .map(|file| file.toolchain.resolve_paths(&path))
             .map_err(|e| format!("invalid user toolchain file {}: {e}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(UserToolchain::default()),
         Err(e) => Err(format!(
@@ -225,6 +264,9 @@ pub struct Toolchains {
     pub c: String,
     pub cxx: String,
     pub ar: Option<String>,
+    pub pkg_config: Option<String>,
+    /// Absolute.
+    pub sysroot: Option<PathBuf>,
 }
 
 impl Toolchains {
@@ -280,6 +322,8 @@ fn pick_toolchains(
             .or(user.cxx)
             .unwrap_or_else(|| default_cxx.into()),
         ar: explicit.ar.or_else(|| env("AR")).or(user.ar),
+        pkg_config: explicit.pkg_config.or(user.pkg_config),
+        sysroot: explicit.sysroot.or(user.sysroot),
     }
 }
 
@@ -292,7 +336,7 @@ fn read_toolchain_file(path: &Path) -> Result<UserToolchain, ConfigError> {
         )
     })?;
     toml::from_str::<UserToolchainFile>(&text)
-        .map(|file| file.toolchain)
+        .map(|file| file.toolchain.resolve_paths(path))
         .map_err(|e| {
             ConfigError::invalid(
                 "--toolchain",
@@ -418,6 +462,18 @@ mod tests {
     }
 
     #[test]
+    fn gnu_triples() {
+        assert_eq!(gnu_triple(Os::Linux, Arch::Arm64), "aarch64-linux-gnu");
+        assert_eq!(gnu_triple(Os::Linux, Arch::X86_64), "x86_64-linux-gnu");
+        assert_eq!(gnu_triple(Os::Linux, Arch::X86), "i686-linux-gnu");
+        assert_eq!(gnu_triple(Os::Linux, Arch::Arm), "arm-linux-gnueabihf");
+        assert_eq!(gnu_triple(Os::Windows, Arch::X86_64), "x86_64-w64-mingw32");
+        assert_eq!(gnu_triple(Os::Windows, Arch::X86), "i686-w64-mingw32");
+        assert_eq!(gnu_triple(Os::Macos, Arch::Arm64), "aarch64-apple-darwin");
+        assert_eq!(gnu_triple(Os::Bsd, Arch::X86_64), "x86_64-unknown-freebsd");
+    }
+
+    #[test]
     fn host_is_detected() {
         assert!(host_os_arch().is_ok());
     }
@@ -427,7 +483,57 @@ mod tests {
             c: c.map(Into::into),
             cxx: cxx.map(Into::into),
             ar: ar.map(Into::into),
+            ..UserToolchain::default()
         }
+    }
+
+    #[test]
+    fn pkg_config_and_sysroot_come_from_the_file_and_the_user_file() {
+        let file = UserToolchain {
+            pkg_config: Some("file-pkg-config".into()),
+            sysroot: Some(PathBuf::from("/file/sysroot")),
+            ..UserToolchain::default()
+        };
+        let user_file = UserToolchain {
+            pkg_config: Some("user-pkg-config".into()),
+            sysroot: Some(PathBuf::from("/user/sysroot")),
+            ..UserToolchain::default()
+        };
+        let t = pick_toolchains(Some(file), &|_| None, user_file);
+        assert_eq!(t.pkg_config.as_deref(), Some("file-pkg-config"));
+        assert_eq!(t.sysroot, Some(PathBuf::from("/file/sysroot")));
+        let user_file = UserToolchain {
+            pkg_config: Some("user-pkg-config".into()),
+            ..UserToolchain::default()
+        };
+        let t = pick_toolchains(None, &|_| None, user_file);
+        assert_eq!(t.pkg_config.as_deref(), Some("user-pkg-config"));
+        assert_eq!(t.sysroot, None);
+    }
+
+    #[test]
+    fn toolchain_file_reads_pkg_config_and_sysroot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("toolchain.toml");
+        let sysroot = dir.path().join("elsewhere").join("sysroot");
+        let text = format!(
+            "[toolchain]\npkg_config = \"my-pkg-config\"\nsysroot = '{}'\n",
+            sysroot.display()
+        );
+        std::fs::write(&path, text).unwrap();
+        let t = read_toolchain_file(&path).unwrap();
+        assert_eq!(t.pkg_config.as_deref(), Some("my-pkg-config"));
+        assert_eq!(t.sysroot, Some(sysroot));
+        assert_eq!(t.c, None);
+    }
+
+    #[test]
+    fn a_relative_sysroot_is_taken_from_the_toolchain_files_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("toolchain.toml");
+        std::fs::write(&path, "[toolchain]\nsysroot = \"sysroots/arm\"\n").unwrap();
+        let t = read_toolchain_file(&path).unwrap();
+        assert_eq!(t.sysroot, Some(dir.path().join("sysroots/arm")));
     }
 
     #[test]

@@ -159,13 +159,25 @@ fn prepare_cmake(
         unit,
         &project.toolchains,
         jobs,
+        &mut project.diagnostics,
     )
     .map_err(|message| ConfigError::invalid(field, message))?;
-    // CMake's own include directories reach the consumers like `include` keys.
-    let public = &mut project.configured.units[unit].public.include;
+    // CMake's own include directories reach the consumers like `include` keys,
+    // and the system libraries its targets link like `system` keys.
+    let public = &mut project.configured.units[unit].public;
     for dir in &prepared.include {
-        if !public.contains(dir) {
-            public.push(dir.clone());
+        if !public.include.contains(dir) {
+            public.include.push(dir.clone());
+        }
+    }
+    for flag in &prepared.extra.link_flags {
+        if !public.link_flags.contains(flag) {
+            public.link_flags.push(flag.clone());
+        }
+    }
+    for lib in &prepared.extra.system {
+        if !public.system.contains(lib) {
+            public.system.push(lib.clone());
         }
     }
     Ok(prepared)

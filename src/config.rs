@@ -4,7 +4,10 @@ pub mod schema;
 pub mod types;
 pub mod vocab;
 
+use std::fmt;
 use std::path::{Path, PathBuf};
+
+use flat::Locations;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -18,19 +21,164 @@ pub enum ConfigError {
         path: PathBuf,
         source: toml::de::Error,
     },
-    #[error("{field}: {message}")]
-    Invalid { field: String, message: String },
+    #[error("{}{}{message}", prefix(.at), label(.field))]
+    Invalid {
+        /// The table (`lib.engine`) or option (`--target`) the message is about.
+        field: String,
+        /// The table and key of the manifest that `field` and the message are
+        /// about, when that is not just the table `field` (see [`ConfigError::at_key`]).
+        place: Option<Box<Place>>,
+        message: String,
+        /// Where in the manifest the place is; filled in by [`Locations::locate`].
+        at: Option<Location>,
+    },
     #[error("could not find project.toml in {} or any parent directory", start.display())]
     NotFound { start: PathBuf },
 }
 
+/// A table of the manifest, or one of its keys as written (`defines.public.windows`).
+/// The table is `""` for a key above the first header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Place {
+    pub table: String,
+    pub key: Option<String>,
+}
+
+/// A line of a manifest file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Location {
+    pub path: PathBuf,
+    pub line: usize,
+}
+
+impl fmt::Display for Location {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.path.display(), self.line)
+    }
+}
+
+fn prefix(at: &Option<Location>) -> String {
+    at.as_ref().map_or_else(String::new, |l| format!("{l}: "))
+}
+
+fn label(field: &str) -> String {
+    if field.is_empty() {
+        String::new()
+    } else {
+        format!("{field}: ")
+    }
+}
+
 impl ConfigError {
+    /// A message about `field`: a table of the manifest such as `lib.engine`
+    /// (it then gets the line of its header), or something else, such as `--target`.
     pub fn invalid(field: impl Into<String>, message: impl Into<String>) -> Self {
         ConfigError::Invalid {
             field: field.into(),
+            place: None,
             message: message.into(),
+            at: None,
         }
     }
+
+    /// A message labelled `field` that is about `table` (and its key `raw_key`, if
+    /// given) rather than about the table named `field`. The table is `""` for a
+    /// key above the first header.
+    pub fn at(
+        field: impl Into<String>,
+        table: impl Into<String>,
+        raw_key: Option<&str>,
+        message: impl Into<String>,
+    ) -> Self {
+        ConfigError::Invalid {
+            field: field.into(),
+            place: Some(Box::new(Place {
+                table: table.into(),
+                key: raw_key.map(str::to_owned),
+            })),
+            message: message.into(),
+            at: None,
+        }
+    }
+
+    /// Says that this error is about the key `raw_key` of `table`, unless it
+    /// already says what it is about.
+    pub fn in_key(self, table: &str, raw_key: &str) -> Self {
+        match self {
+            ConfigError::Invalid {
+                field,
+                place: None,
+                message,
+                at,
+            } => ConfigError::Invalid {
+                field,
+                place: Some(Box::new(Place {
+                    table: table.to_owned(),
+                    key: Some(raw_key.to_owned()),
+                })),
+                message,
+                at,
+            },
+            other => other,
+        }
+    }
+
+    /// A message about the key `raw_key` of the table `table`, as the key is
+    /// written in the manifest (`defines.public.windows`). It gets the line of
+    /// the key, or of the table when the key is not found.
+    pub fn at_key(
+        table: impl Into<String>,
+        raw_key: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        let table = table.into();
+        let raw_key = raw_key.into();
+        ConfigError::at(table.clone(), table, Some(&raw_key), message)
+    }
+}
+
+impl Locations {
+    /// Adds the file and line to an error about a table or key of this manifest.
+    pub fn locate(&self, error: ConfigError) -> ConfigError {
+        match error {
+            ConfigError::Invalid {
+                field,
+                place,
+                message,
+                at: None,
+            } => {
+                let line = match place.as_deref() {
+                    Some(p) if p.table.is_empty() => p.key.as_deref().and_then(|k| self.key("", k)),
+                    Some(p) => self.line(&p.table, p.key.as_deref()),
+                    None => self.table(&field),
+                };
+                let at = line.map(|line| Location {
+                    path: self.file().to_path_buf(),
+                    line,
+                });
+                ConfigError::Invalid {
+                    field,
+                    place,
+                    message,
+                    at,
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+/// `path` as the user would type it: relative to the working directory when it
+/// is inside it, else as given.
+fn display_path(path: &Path) -> PathBuf {
+    if path.is_absolute()
+        && let Ok(cwd) = std::env::current_dir()
+        && let Ok(rel) = path.strip_prefix(&cwd)
+        && !rel.as_os_str().is_empty()
+    {
+        return rel.to_path_buf();
+    }
+    path.to_path_buf()
 }
 
 const MANIFEST_NAME: &str = "project.toml";
@@ -79,9 +227,20 @@ pub fn load(path: &Path) -> Result<schema::Manifest, ConfigError> {
         path: path.into(),
         source,
     })?;
-    let table = flat::parse_flat(&text)
-        .map_err(|e| ConfigError::invalid(format!("{}:{}", path.display(), e.line), e.message))?;
-    schema::parse_manifest(table)
+    let file = display_path(path);
+    let (table, locations) = flat::parse_located(&text).map_err(|e| ConfigError::Invalid {
+        field: String::new(),
+        place: None,
+        message: e.message,
+        at: Some(Location {
+            path: file.clone(),
+            line: e.line,
+        }),
+    })?;
+    let locations = locations.with_file(file);
+    let mut manifest = schema::parse_manifest(table).map_err(|e| locations.locate(e))?;
+    manifest.locations = locations;
+    Ok(manifest)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,11 +254,43 @@ pub enum Level {
 #[derive(Debug, Default)]
 pub struct Diagnostics {
     pub items: Vec<(Level, String)>,
+    /// For items about a table or key of the manifest: the item's index, the
+    /// table and the key. `located` turns them into `path:line:` prefixes.
+    at: Vec<(usize, String, Option<String>)>,
 }
 
 impl Diagnostics {
     pub fn warn(&mut self, message: impl Into<String>) {
         self.items.push((Level::Warning, message.into()));
+    }
+
+    /// A warning about `table` (`dependency.glm`), or about its key `raw_key`
+    /// as written in the manifest. The text reads `table: message`.
+    pub fn warn_at(&mut self, table: &str, raw_key: Option<&str>, message: impl fmt::Display) {
+        self.warn_in(table, raw_key, format!("{table}: {message}"));
+    }
+
+    /// A warning with the whole `text` that is about `table`, or its key `raw_key`.
+    pub fn warn_in(&mut self, table: &str, raw_key: Option<&str>, text: impl Into<String>) {
+        self.at.push((
+            self.items.len(),
+            table.to_owned(),
+            raw_key.map(str::to_owned),
+        ));
+        self.warn(text);
+    }
+
+    /// The items with `path:line: ` in front of those whose table or key is in `locations`.
+    pub fn located(&self, locations: &Locations) -> Vec<(Level, String)> {
+        let mut items = self.items.clone();
+        for (index, table, key) in &self.at {
+            if let Some(line) = locations.line(table, key.as_deref())
+                && let Some((_, text)) = items.get_mut(*index)
+            {
+                *text = format!("{}:{line}: {text}", locations.file().display());
+            }
+        }
+        items
     }
 
     pub fn info(&mut self, message: impl Into<String>) {
@@ -144,6 +335,76 @@ mod tests {
                 (Level::Info, "i".to_string())
             ]
         );
+    }
+
+    fn locations(src: &str) -> Locations {
+        flat::parse_located(src)
+            .unwrap()
+            .1
+            .with_file(PathBuf::from("project.toml"))
+    }
+
+    #[test]
+    fn locate_prefers_the_key_then_the_table() {
+        let l = locations("[lib.a]\nsources = []\n");
+        let key = l.locate(ConfigError::at_key("lib.a", "sources", "bad"));
+        assert_eq!(key.to_string(), "project.toml:2: lib.a: bad");
+        let missing = l.locate(ConfigError::at_key("lib.a", "nope", "bad"));
+        assert_eq!(missing.to_string(), "project.toml:1: lib.a: bad");
+        let table = l.locate(ConfigError::invalid("lib.a", "bad"));
+        assert_eq!(table.to_string(), "project.toml:1: lib.a: bad");
+    }
+
+    #[test]
+    fn locate_leaves_other_fields_alone() {
+        let l = locations("[lib.a]\n");
+        let e = l.locate(ConfigError::invalid("--target", "bad"));
+        assert_eq!(e.to_string(), "--target: bad");
+        let implicit = l.locate(ConfigError::invalid("profile.release (built-in)", "bad"));
+        assert_eq!(implicit.to_string(), "profile.release (built-in): bad");
+    }
+
+    #[test]
+    fn locate_finds_keys_above_the_first_header() {
+        let l = locations("name = 1\n[lib.a]\n");
+        let e = l.locate(ConfigError::at("manifest", "", Some("name"), "stray"));
+        assert_eq!(e.to_string(), "project.toml:1: manifest: stray");
+    }
+
+    #[test]
+    fn located_diagnostics_get_a_prefix_only_where_known() {
+        let l = locations("[dependency.d]\npath = \"x\"\nlibs = []\n");
+        let mut d = Diagnostics::default();
+        d.warn_at("dependency.d", Some("libs"), "no effect");
+        d.warn_at("dependency.other", None, "unknown table");
+        d.warn("plain");
+        let texts: Vec<String> = d.located(&l).into_iter().map(|(_, t)| t).collect();
+        assert_eq!(
+            texts,
+            [
+                "project.toml:3: dependency.d: no effect",
+                "dependency.other: unknown table",
+                "plain"
+            ]
+        );
+        // The stored items stay as they were.
+        assert_eq!(d.items[0].1, "dependency.d: no effect");
+    }
+
+    #[test]
+    fn display_path_is_relative_inside_the_working_directory() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            display_path(&cwd.join("sub").join("project.toml")),
+            Path::new("sub").join("project.toml")
+        );
+        assert_eq!(
+            display_path(Path::new("rel/project.toml")),
+            Path::new("rel/project.toml")
+        );
+        let outside = tempfile::tempdir().unwrap();
+        let file = outside.path().join("project.toml");
+        assert_eq!(display_path(&file), file);
     }
 
     fn tree() -> (tempfile::TempDir, PathBuf) {

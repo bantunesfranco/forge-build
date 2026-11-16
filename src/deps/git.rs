@@ -169,14 +169,43 @@ pub fn head_commit(dir: &Path) -> Result<String, String> {
     git(&["rev-parse", "HEAD"], dir)
 }
 
+/// Whether the work tree at `dir` has no submodule to fetch: it declares none,
+/// or each one is initialised and at the commit the work tree records.
+fn submodules_current(dir: &Path) -> bool {
+    if !dir.join(".gitmodules").is_file() {
+        return true;
+    }
+    // A leading `-` is a submodule that is not initialised, `+` one at another
+    // commit and `U` one with merge conflicts.
+    git(&["submodule", "status", "--recursive"], dir)
+        .is_ok_and(|status| !status.lines().any(|line| line.starts_with(['-', '+', 'U'])))
+}
+
+/// Fetches the submodules of the work tree at `dir`, at the commits it
+/// records. Not shallow: such a commit need not be the tip of a branch.
+fn update_submodules(name: &str, dir: &Path) -> Result<(), String> {
+    if submodules_current(dir) {
+        return Ok(());
+    }
+    let fetch = || {
+        git(&["submodule", "sync", "--recursive"], dir)?;
+        git(&["submodule", "update", "--init", "--recursive"], dir)
+    };
+    fetch()
+        .map(drop)
+        .map_err(|e| format!("cannot fetch the submodules of dependency `{name}`: {e}"))
+}
+
 /// Checks out `commit` of `url` into `build/deps/<name>/source` and returns
-/// that directory. A checkout that is already at `commit` is left alone and
-/// nothing is fetched, so a locked build works offline.
+/// that directory, submodules included. A checkout that is already at
+/// `commit`, submodules and all, is left alone and nothing is fetched, so a
+/// locked build works offline.
 pub fn checkout(root: &Path, name: &str, url: &str, commit: &str) -> Result<PathBuf, String> {
     let located = locate(root, url);
     let url = located.as_str();
     let dir = source_dir(root, name);
     if is_at(&dir, url, commit) {
+        update_submodules(name, &dir)?;
         return Ok(dir);
     }
     ensure_clone(&dir, url)?;
@@ -189,6 +218,7 @@ pub fn checkout(root: &Path, name: &str, url: &str, commit: &str) -> Result<Path
         git(&["fetch", "--tags", "origin"], &dir)?;
         git(&["checkout", "--force", commit], &dir)?;
     }
+    update_submodules(name, &dir)?;
     Ok(dir)
 }
 
@@ -212,7 +242,7 @@ pub fn pin(
         return Ok(entry.commit.clone());
     }
     let commit = resolve_rev(root, name, url, rev)
-        .map_err(|message| ConfigError::invalid(format!("dependency.{name}"), message))?;
+        .map_err(|message| ConfigError::at_key(format!("dependency.{name}"), "rev", message))?;
     let short = &commit[..commit.len().min(12)];
     diags.info(format!("pinned {name} {rev} -> {short}"));
     lock.entries.insert(

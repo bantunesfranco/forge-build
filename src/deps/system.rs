@@ -7,10 +7,15 @@ use std::{
 };
 
 use crate::{
-    config::{ConfigError, Diagnostics, types::Define, vocab::Compiler},
+    config::{
+        ConfigError, Diagnostics,
+        types::Define,
+        vocab::{Arch, Compiler, Os},
+    },
     configure::{model::IncludeDir, system_libs::SystemLib},
     deps::Prepared,
     executor::path_arg,
+    platform::gnu_triple,
     project::Project,
 };
 
@@ -25,9 +30,12 @@ pub struct Found {
     pub ldflags: Vec<String>,
 }
 
-/// Runs `program args` and returns its stdout. Injectable so the finders can
-/// be tested without the tools.
-pub type Runner<'a> = &'a dyn Fn(&str, &[String]) -> Result<String, String>;
+/// Environment variables to set for a run, on top of the process's own.
+pub type Env = [(String, String)];
+
+/// Runs `program args` with `env` added and returns its stdout. Injectable so
+/// the finders can be tested without the tools.
+pub type Runner<'a> = &'a dyn Fn(&str, &[String], &Env) -> Result<String, String>;
 
 /// Link options other than `-l`/`-L` that go to the linker as they are. A bare
 /// `-static` is not one: it would make the whole bin static.
@@ -99,8 +107,13 @@ pub fn shell_words(text: &str) -> Vec<String> {
 /// always does, and `-framework` keeps both tokens together. A bare token is a
 /// library file and goes to the linker.
 pub fn split_flags(tokens: &str) -> Found {
+    split_tokens(shell_words(tokens))
+}
+
+/// `split_flags` for tokens that are already split into words.
+pub fn split_tokens(tokens: Vec<String>) -> Found {
     let mut found = Found::default();
-    let mut it = shell_words(tokens).into_iter();
+    let mut it = tokens.into_iter();
     while let Some(token) = it.next() {
         let token = token.as_str();
         if token == "-isystem" {
@@ -151,10 +164,16 @@ fn only_static_archives(found: &Found, exists: &dyn Fn(&Path) -> bool) -> bool {
         })
 }
 
-fn pkg_config(name: &str, run: Runner, exists: &dyn Fn(&Path) -> bool) -> Result<Found, String> {
-    run("pkg-config", &["--exists".into(), name.into()])?;
+fn pkg_config(
+    program: &str,
+    env: &Env,
+    name: &str,
+    run: Runner,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Result<Found, String> {
+    run(program, &["--exists".into(), name.into()], env)?;
     let mut args = vec!["--cflags".to_string(), "--libs".into(), name.into()];
-    let found = split_flags(&run("pkg-config", &args)?);
+    let found = split_flags(&run(program, &args, env)?);
     // A package that resolves to a static archive needs the libraries that the
     // archive uses (e.g. GLFW's X11 dependencies, in Libs.private). A shared
     // one does not: asking for them would over-link.
@@ -162,7 +181,7 @@ fn pkg_config(name: &str, run: Runner, exists: &dyn Fn(&Path) -> bool) -> Result
         return Ok(found);
     }
     args.insert(0, "--static".to_string());
-    Ok(split_flags(&run("pkg-config", &args)?))
+    Ok(split_flags(&run(program, &args, env)?))
 }
 
 fn cmake(name: &str, run: Runner) -> Result<Found, String> {
@@ -175,7 +194,7 @@ fn cmake(name: &str, run: Runner) -> Result<Found, String> {
             "-DLANGUAGE=CXX".into(),
             format!("-DMODE={mode}"),
         ];
-        all.push_str(&run("cmake", &args)?);
+        all.push_str(&run("cmake", &args, &[])?);
         all.push(' ');
     }
     let found = split_flags(&all);
@@ -186,12 +205,111 @@ fn cmake(name: &str, run: Runner) -> Result<Found, String> {
 }
 
 /// Finds a package on the host: `pkg-config` first, then CMake.
+#[cfg(test)]
 pub fn find_package(
     name: &str,
     run: Runner,
     exists: &dyn Fn(&Path) -> bool,
 ) -> Result<Found, String> {
-    let pkg = match pkg_config(name, run, exists) {
+    find_package_for(name, None, run, exists, &|_| None)
+}
+
+/// The platform a cross build is for, and what the toolchain file says about
+/// finding its packages.
+#[derive(Debug, Clone, Copy)]
+pub struct Cross<'a> {
+    pub os: Os,
+    pub arch: Arch,
+    /// The toolchain file's `pkg_config`.
+    pub pkg_config: Option<&'a str>,
+    /// The toolchain file's `sysroot` (absolute).
+    pub sysroot: Option<&'a Path>,
+}
+
+/// The variables that point `pkg-config` at the target's sysroot, except the
+/// ones the user's environment already sets.
+fn sysroot_env(
+    cross: &Cross,
+    sysroot: &Path,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut vars = Vec::new();
+    if env("PKG_CONFIG_SYSROOT_DIR").is_none() {
+        vars.push(("PKG_CONFIG_SYSROOT_DIR".to_string(), path_arg(sysroot)));
+    }
+    if env("PKG_CONFIG_LIBDIR").is_none() {
+        let triple = gnu_triple(cross.os, cross.arch);
+        let dirs = [
+            sysroot.join("usr/lib/pkgconfig"),
+            sysroot.join("usr/share/pkgconfig"),
+            sysroot.join("usr/lib").join(triple).join("pkgconfig"),
+        ];
+        let joined = std::env::join_paths(dirs)
+            .map_err(|e| format!("cannot build PKG_CONFIG_LIBDIR from the sysroot: {e}"))?;
+        vars.push((
+            "PKG_CONFIG_LIBDIR".to_string(),
+            joined.to_string_lossy().into_owned(),
+        ));
+    }
+    Ok(vars)
+}
+
+/// Finds a package for a cross target with a `pkg-config` that knows it. The
+/// host's packages are the wrong architecture, so there is no CMake fallback
+/// (`cmake --find-package` only knows the host).
+fn find_cross_package(
+    name: &str,
+    cross: &Cross,
+    run: Runner,
+    exists: &dyn Fn(&Path) -> bool,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Found, String> {
+    let target = format!("{}-{}", cross.arch.as_str(), cross.os.as_str());
+    let triple = gnu_triple(cross.os, cross.arch);
+    let prefixed = format!("{triple}-pkg-config");
+    let program = if let Some(program) = cross.pkg_config {
+        program.to_string()
+    } else if run(&prefixed, &["--version".into()], &[]).is_ok() {
+        prefixed
+    } else if cross.sysroot.is_some()
+        || env("PKG_CONFIG_LIBDIR").is_some()
+        || env("PKG_CONFIG_SYSROOT_DIR").is_some()
+    {
+        // The sysroot sets the variables below, and the user's own are used
+        // as they are: either way plain `pkg-config` looks at the target.
+        "pkg-config".to_string()
+    } else {
+        return Err(format!(
+            concat!(
+                "cannot find system package `{}` for {}: no pkg-config for the target ",
+                "(set pkg_config/sysroot in the --toolchain file, install {}, ",
+                "or set PKG_CONFIG_LIBDIR)"
+            ),
+            name, target, prefixed
+        ));
+    };
+    let vars = match cross.sysroot {
+        Some(sysroot) => sysroot_env(cross, sysroot, env)?,
+        None => Vec::new(),
+    };
+    pkg_config(&program, &vars, name, run, exists)
+        .map_err(|e| format!("cannot find system package `{name}` for {target}: {program}: {e}"))
+}
+
+/// Finds a package: on the host with `pkg-config` and then CMake, or, when
+/// `cross` names another platform, for that platform (`find_cross_package`).
+/// `env` reads the environment.
+pub fn find_package_for(
+    name: &str,
+    cross: Option<&Cross>,
+    run: Runner,
+    exists: &dyn Fn(&Path) -> bool,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Found, String> {
+    if let Some(cross) = cross {
+        return find_cross_package(name, cross, run, exists, env);
+    }
+    let pkg = match pkg_config("pkg-config", &[], name, run, exists) {
         Ok(found) => return Ok(found),
         Err(e) => e,
     };
@@ -202,10 +320,11 @@ pub fn find_package(
 
 /// The real runner: the program runs with stdin closed, in the temporary
 /// directory (`cmake --find-package` writes a `CMakeFiles` directory into its
-/// working directory).
-fn run_process(program: &str, args: &[String]) -> Result<String, String> {
+/// working directory), with the variables of `env` added to the environment.
+fn run_process(program: &str, args: &[String], env: &Env) -> Result<String, String> {
     let out = Command::new(program)
         .args(args)
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .current_dir(std::env::temp_dir())
         .stdin(Stdio::null())
         .output()
@@ -242,7 +361,7 @@ fn push_unique<T: PartialEq>(list: &mut Vec<T>, item: T) {
 
 /// Turns what a finder found into the dependency's public interface. With an
 /// MSVC-like linker the GNU-only tokens are dropped, with a warning.
-fn to_prepared(
+pub fn to_prepared(
     found: &Found,
     system_headers: bool,
     msvc: bool,
@@ -278,9 +397,13 @@ fn to_prepared(
         let framework = (flag == "-framework").then(|| it.next()).flatten();
         let gnu_only = flag.starts_with("-Wl,") || flag == "-pthread" || framework.is_some();
         if msvc && gnu_only {
-            diags.warn(format!(
-                "dependency `{dep}`: dropped link option `{flag}`, which the MSVC-like linker does not take"
-            ));
+            diags.warn_in(
+                &format!("dependency.{dep}"),
+                None,
+                format!(
+                    "dependency `{dep}`: dropped link option `{flag}`, which the MSVC-like linker does not take"
+                ),
+            );
             continue;
         }
         match framework {
@@ -308,8 +431,21 @@ pub fn prepare_system(project: &mut Project, unit: usize) -> Result<Prepared, Co
         ),
         None => return Err(ConfigError::invalid(field, "not a dependency")),
     };
-    let found = find_package(&find, &run_process, &|path| path.is_file())
-        .map_err(|message| ConfigError::invalid(field, message))?;
+    let platform = project.platform;
+    let cross = project.configured.cross_triple.is_some().then_some(Cross {
+        os: platform.os,
+        arch: platform.arch,
+        pkg_config: project.toolchains.pkg_config.as_deref(),
+        sysroot: project.toolchains.sysroot.as_deref(),
+    });
+    let found = find_package_for(
+        &find,
+        cross.as_ref(),
+        &run_process,
+        &|path| path.is_file(),
+        &|key| std::env::var(key).ok().filter(|v| !v.is_empty()),
+    )
+    .map_err(|message| ConfigError::at_key(&field, "find", message))?;
     let msvc = matches!(
         project.platform.compiler,
         Compiler::Msvc | Compiler::ClangCl
@@ -344,6 +480,7 @@ pub fn prepare_system(project: &mut Project, unit: usize) -> Result<Prepared, Co
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::vocab::{Arch, Os};
 
     #[test]
     fn splits_pkg_config_output() {
@@ -416,7 +553,7 @@ mod tests {
         .collect();
         let exists = |p: &Path| present.contains(p);
         let calls = RefCell::new(Vec::<String>::new());
-        let run = |_: &str, args: &[String]| -> Result<String, String> {
+        let run = |_: &str, args: &[String], _: &Env| -> Result<String, String> {
             calls.borrow_mut().push(args.join(" "));
             Ok(if args.iter().any(|a| a == "glfw3") {
                 if args.contains(&"--static".to_string()) {
@@ -452,7 +589,7 @@ mod tests {
 
     #[test]
     fn falls_back_to_cmake() {
-        let run = |program: &str, args: &[String]| -> Result<String, String> {
+        let run = |program: &str, args: &[String], _: &Env| -> Result<String, String> {
             if program == "pkg-config" {
                 return Err("pkg-config is not installed or not on PATH".into());
             }
@@ -470,7 +607,7 @@ mod tests {
 
     #[test]
     fn pkg_config_wins_over_cmake() {
-        let run = |program: &str, _: &[String]| -> Result<String, String> {
+        let run = |program: &str, _: &[String], _: &Env| -> Result<String, String> {
             assert_eq!(program, "pkg-config");
             Ok("-lz".into())
         };
@@ -479,7 +616,7 @@ mod tests {
 
     #[test]
     fn not_found_names_both_finders() {
-        let run = |_: &str, _: &[String]| -> Result<String, String> { Err("nope".into()) };
+        let run = |_: &str, _: &[String], _: &Env| -> Result<String, String> { Err("nope".into()) };
         let e = find_package("OpenGL", &run, &|_| false).unwrap_err();
         assert!(
             e.contains("pkg-config") && e.contains("cmake") && e.contains("OpenGL"),
@@ -489,7 +626,7 @@ mod tests {
 
     #[test]
     fn cmake_answer_without_flags_is_not_found() {
-        let run = |program: &str, _: &[String]| -> Result<String, String> {
+        let run = |program: &str, _: &[String], _: &Env| -> Result<String, String> {
             if program == "pkg-config" {
                 Err("no".into())
             } else {
@@ -501,6 +638,199 @@ mod tests {
                 .unwrap_err()
                 .contains("cmake")
         );
+    }
+
+    /// A recorded run: program, arguments, and the variables passed.
+    type Call = (String, String, Vec<(String, String)>);
+
+    /// A runner that records its calls, runs `programs` fine (a library of
+    /// `-lz`, a `--version` that works) and fails for any other program.
+    fn recording<'a>(
+        calls: &'a std::cell::RefCell<Vec<Call>>,
+        programs: &'a [&'a str],
+    ) -> impl Fn(&str, &[String], &Env) -> Result<String, String> + 'a {
+        move |program, args, env| {
+            calls
+                .borrow_mut()
+                .push((program.into(), args.join(" "), env.to_vec()));
+            if programs.contains(&program) {
+                Ok("-lz".into())
+            } else {
+                Err(format!("{program} is not installed or not on PATH"))
+            }
+        }
+    }
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    fn arm_linux<'a>(pkg_config: Option<&'a str>, sysroot: Option<&'a Path>) -> Cross<'a> {
+        Cross {
+            os: Os::Linux,
+            arch: Arch::Arm64,
+            pkg_config,
+            sysroot,
+        }
+    }
+
+    #[test]
+    fn a_native_build_runs_the_hosts_pkg_config() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let run = recording(&calls, &["pkg-config"]);
+        let f = find_package_for("zlib", None, &run, &|_| false, &no_env).unwrap();
+        assert_eq!(f.libs, ["z"]);
+        assert_eq!(
+            *calls.borrow(),
+            [
+                ("pkg-config".into(), "--exists zlib".into(), vec![]),
+                ("pkg-config".into(), "--cflags --libs zlib".into(), vec![]),
+            ]
+        );
+        // It still falls back to cmake.
+        let calls = std::cell::RefCell::new(Vec::new());
+        let run = recording(&calls, &["cmake"]);
+        let _ = find_package_for("zlib", None, &run, &|_| false, &no_env);
+        assert!(calls.borrow().iter().any(|(p, ..)| p == "cmake"));
+    }
+
+    #[test]
+    fn a_cross_build_runs_the_toolchain_files_pkg_config_and_never_cmake() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let cross = arm_linux(Some("my-pkg-config"), None);
+        let run = recording(&calls, &["my-pkg-config", "cmake", "pkg-config"]);
+        let f = find_package_for("zlib", Some(&cross), &run, &|_| false, &no_env).unwrap();
+        assert_eq!(f.libs, ["z"]);
+        assert!(calls.borrow().iter().all(|(p, ..)| p == "my-pkg-config"));
+
+        // When it does not find the package there is no cmake to ask either.
+        let calls = std::cell::RefCell::new(Vec::new());
+        let run = recording(&calls, &["cmake", "pkg-config"]);
+        let e = find_package_for("zlib", Some(&cross), &run, &|_| false, &no_env).unwrap_err();
+        assert!(
+            e.contains("zlib") && e.contains("arm64-linux") && e.contains("my-pkg-config"),
+            "{e}"
+        );
+        assert!(calls.borrow().iter().all(|(p, ..)| p == "my-pkg-config"));
+    }
+
+    #[test]
+    fn a_cross_build_uses_the_triple_prefixed_pkg_config_when_it_runs() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let cross = arm_linux(None, None);
+        let run = recording(&calls, &["aarch64-linux-gnu-pkg-config", "pkg-config"]);
+        let f = find_package_for("zlib", Some(&cross), &run, &|_| false, &no_env).unwrap();
+        assert_eq!(f.libs, ["z"]);
+        let calls = calls.borrow();
+        assert_eq!(
+            calls[0],
+            (
+                "aarch64-linux-gnu-pkg-config".into(),
+                "--version".into(),
+                vec![]
+            )
+        );
+        assert!(
+            calls[1..]
+                .iter()
+                .all(|(p, ..)| p == "aarch64-linux-gnu-pkg-config"),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn plain_pkg_config_is_not_used_for_a_target_unless_the_environment_is_set_up() {
+        let message = concat!(
+            "cannot find system package `zlib` for arm64-linux: no pkg-config for the target ",
+            "(set pkg_config/sysroot in the --toolchain file, install aarch64-linux-gnu-pkg-config, ",
+            "or set PKG_CONFIG_LIBDIR)"
+        );
+        let cross = arm_linux(None, None);
+        let calls = std::cell::RefCell::new(Vec::new());
+        let run = recording(&calls, &["pkg-config", "cmake"]);
+        let e = find_package_for("zlib", Some(&cross), &run, &|_| false, &no_env).unwrap_err();
+        assert_eq!(e, message);
+        assert!(
+            calls
+                .borrow()
+                .iter()
+                .all(|(p, a, _)| p == "aarch64-linux-gnu-pkg-config" && a == "--version")
+        );
+
+        for var in ["PKG_CONFIG_LIBDIR", "PKG_CONFIG_SYSROOT_DIR"] {
+            let env = |k: &str| (k == var).then(|| "/somewhere".to_string());
+            let calls = std::cell::RefCell::new(Vec::new());
+            let run = recording(&calls, &["pkg-config"]);
+            let f = find_package_for("zlib", Some(&cross), &run, &|_| false, &env).unwrap();
+            assert_eq!(f.libs, ["z"], "{var}");
+            let calls = calls.borrow();
+            let last = calls.last().unwrap();
+            assert_eq!(last.0, "pkg-config");
+            // The user's variables are inherited as they are, not replaced.
+            assert!(last.2.is_empty(), "{var}: {last:?}");
+        }
+    }
+
+    #[test]
+    fn a_toolchain_sysroot_points_pkg_config_at_the_target() {
+        let sysroot = Path::new("sys").join("root");
+        let cross = arm_linux(Some("my-pkg-config"), Some(&sysroot));
+        let calls = std::cell::RefCell::new(Vec::new());
+        let run = recording(&calls, &["my-pkg-config"]);
+        find_package_for("zlib", Some(&cross), &run, &|_| false, &no_env).unwrap();
+        let libdir = std::env::join_paths([
+            sysroot.join("usr/lib/pkgconfig"),
+            sysroot.join("usr/share/pkgconfig"),
+            sysroot
+                .join("usr/lib")
+                .join("aarch64-linux-gnu")
+                .join("pkgconfig"),
+        ])
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+        let want = vec![
+            (
+                "PKG_CONFIG_SYSROOT_DIR".to_string(),
+                sysroot.to_string_lossy().into_owned(),
+            ),
+            ("PKG_CONFIG_LIBDIR".to_string(), libdir),
+        ];
+        let calls = calls.borrow();
+        assert!(!calls.is_empty());
+        for (_, args, env) in calls.iter() {
+            assert_eq!(*env, want, "{args}");
+        }
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        assert_eq!(want[1].1.matches(sep).count(), 2);
+
+        // The user's own variables win, each on its own.
+        let env = |k: &str| (k == "PKG_CONFIG_LIBDIR").then(|| "/mine".to_string());
+        let calls = std::cell::RefCell::new(Vec::new());
+        let run = recording(&calls, &["my-pkg-config"]);
+        find_package_for("zlib", Some(&cross), &run, &|_| false, &env).unwrap();
+        for (_, _, passed) in calls.borrow().iter() {
+            assert_eq!(*passed, want[..1]);
+        }
+        let env = |_: &str| Some("/mine".to_string());
+        let calls = std::cell::RefCell::new(Vec::new());
+        let run = recording(&calls, &["my-pkg-config"]);
+        find_package_for("zlib", Some(&cross), &run, &|_| false, &env).unwrap();
+        assert!(calls.borrow().iter().all(|(.., passed)| passed.is_empty()));
+    }
+
+    #[test]
+    fn a_sysroot_alone_is_enough_to_use_plain_pkg_config() {
+        let sysroot = PathBuf::from("sysroot");
+        let cross = arm_linux(None, Some(&sysroot));
+        let calls = std::cell::RefCell::new(Vec::new());
+        let run = recording(&calls, &["pkg-config"]);
+        let f = find_package_for("zlib", Some(&cross), &run, &|_| false, &no_env).unwrap();
+        assert_eq!(f.libs, ["z"]);
+        let calls = calls.borrow();
+        let last = calls.last().unwrap();
+        assert_eq!(last.0, "pkg-config");
+        assert_eq!(last.2.len(), 2);
     }
 
     #[test]

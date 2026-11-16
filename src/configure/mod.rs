@@ -117,7 +117,11 @@ fn invalid(s: &Sourced, message: impl std::fmt::Display) -> ConfigError {
         .as_ref()
         .map(|t| format!(" (from `{t}`)"))
         .unwrap_or_default();
-    ConfigError::invalid(&s.origin, format!("`{}`: {message}{from}", s.raw_key))
+    ConfigError::at_key(
+        &s.origin,
+        &s.raw_key,
+        format!("`{}`: {message}{from}", s.raw_key),
+    )
 }
 
 fn wrong_type(s: &Sourced, expected: &str) -> ConfigError {
@@ -308,7 +312,8 @@ fn typed_flags(list: &[Sourced]) -> Result<Vec<String>, ConfigError> {
     let mut out = Vec::new();
     for s in list {
         let flag = want_str(s)?;
-        check_flag(&format!("{}.{}", s.origin, s.raw_key), flag)?;
+        check_flag(&format!("{}.{}", s.origin, s.raw_key), flag)
+            .map_err(|e| e.in_key(&s.origin, &s.raw_key))?;
         push_unique(&mut out, flag.to_string());
     }
     Ok(out)
@@ -376,8 +381,9 @@ impl<'a> Cx<'a> {
             match self.features.get(name) {
                 None => {
                     let declared: Vec<&str> = self.features.keys().map(String::as_str).collect();
-                    return Err(ConfigError::invalid(
+                    return Err(ConfigError::at_key(
                         &s.origin,
+                        &s.raw_key,
                         unknown_feature_message(name, &declared),
                     ));
                 }
@@ -397,8 +403,10 @@ impl<'a> Cx<'a> {
 
 fn check_standard(key: &str, value: &Option<String>, allowed: &[&str]) -> Result<(), ConfigError> {
     match value {
-        Some(v) if !allowed.contains(&v.as_str()) => Err(ConfigError::invalid(
+        Some(v) if !allowed.contains(&v.as_str()) => Err(ConfigError::at(
             format!("workspace.{key}"),
+            "workspace",
+            Some(key),
             format!(
                 "`{v}` is not a valid standard (expected one of: {})",
                 allowed.join(", ")
@@ -414,15 +422,19 @@ fn check_requires(m: &Manifest) -> Result<(), ConfigError> {
     };
     let field = "workspace.requires.tool";
     let Some(minimum) = req.trim().strip_prefix(">=") else {
-        return Err(ConfigError::invalid(
+        return Err(ConfigError::at(
             field,
+            "workspace",
+            Some("requires"),
             format!("`{req}` is not supported; use `>=<version>`, e.g. `>=0.1`"),
         ));
     };
     let this = env!("CARGO_PKG_VERSION");
     if compare_versions(this, minimum.trim()) == std::cmp::Ordering::Less {
-        return Err(ConfigError::invalid(
+        return Err(ConfigError::at(
             field,
+            "workspace",
+            Some("requires"),
             format!("this project requires forge-build {req}, found {this}"),
         ));
     }
@@ -491,13 +503,9 @@ pub fn configure(
     };
 
     // Profile scalars and the profile's defines/flags, for dependency builds (spec 8.1).
-    // A dependency never sees workspace values, so a profile removal of one has nothing to remove.
-    let mut profile_merged = merge_with(
-        &profile_layers(),
-        &cx.lookup(None),
-        LIST_KEYS,
-        Removals::SkipAbsent,
-    )?;
+    // A dependency never sees workspace values, so a profile removal of one has nothing to remove
+    // (a profile's removals are skipped when absent, and not counted for the typo warning below).
+    let mut profile_merged = merge(&profile_layers(), &cx.lookup(None), LIST_KEYS)?;
     let missing = |k: &str| {
         ConfigError::invalid(
             format!("profile.{profile}"),
@@ -525,6 +533,8 @@ pub fn configure(
     }
 
     let mut units = Vec::new();
+    // Whether any target had the value a `workspace` or profile removal names.
+    let mut shared_removals: BTreeMap<(String, String, String), bool> = BTreeMap::new();
 
     for (name, decl) in &m.targets {
         let origin = &decl.settings.origin;
@@ -538,6 +548,11 @@ pub fn configure(
             alias: None,
         });
         let (mut merged, _) = cx.merge_unit(layers, None)?;
+        for r in &merged.shared_removals {
+            *shared_removals
+                .entry((r.origin.clone(), r.raw_key.clone(), r.value.clone()))
+                .or_default() |= r.removed;
+        }
         if !profile_scalars.asserts {
             ensure_ndebug(&mut merged, &profile);
         }
@@ -561,14 +576,23 @@ pub fn configure(
         // of the workspace to the manifest directory.
         let mut own_patterns = Vec::new();
         let mut outer_patterns = Vec::new();
+        // The first key of each kind that wrote a pattern, for messages about the patterns.
+        let mut own_key: Option<&Sourced> = None;
+        let mut outer_key: Option<&Sourced> = None;
         for s in merged.list("sources", Visibility::Private) {
             let pattern = want_str(s)?.to_string();
             if s.origin == *origin {
                 own_patterns.push(pattern);
+                own_key.get_or_insert(s);
             } else {
                 outer_patterns.push(pattern);
+                outer_key.get_or_insert(s);
             }
         }
+        let sources_error = |from: Option<&Sourced>, message: String| match from {
+            Some(s) => ConfigError::at(origin, &s.origin, Some(s.raw_key.as_str()), message),
+            None => ConfigError::at_key(origin, "sources", message),
+        };
         let no_sources = own_patterns.is_empty() && outer_patterns.is_empty();
         // Only the lib's own `include` keys make it an interface lib, not
         // includes it inherits from the workspace, a profile or a feature.
@@ -599,13 +623,13 @@ pub fn configure(
             found.sort();
             found.dedup();
             if found.is_empty() {
-                let (patterns, from) = if own_patterns.is_empty() {
-                    (&outer_patterns, root)
+                let (patterns, from, key) = if own_patterns.is_empty() {
+                    (&outer_patterns, root, outer_key)
                 } else {
-                    (&own_patterns, base.as_path())
+                    (&own_patterns, base.as_path(), own_key)
                 };
-                return Err(ConfigError::invalid(
-                    origin,
+                return Err(sources_error(
+                    key,
                     format!(
                         "`sources` matched no C/C++ files: {} (relative to {})",
                         patterns.join(", "),
@@ -614,8 +638,9 @@ pub fn configure(
                 ));
             }
             check_patterns("sources", root, &base, &own_patterns, &found)
-                .and_then(|()| check_patterns("sources", root, root, &outer_patterns, &found))
-                .map_err(|message| ConfigError::invalid(origin, message))?;
+                .map_err(|message| sources_error(own_key, message))?;
+            check_patterns("sources", root, root, &outer_patterns, &found)
+                .map_err(|message| sources_error(outer_key, message))?;
             found
         };
 
@@ -634,8 +659,8 @@ pub fn configure(
             warnings: scalar_enum(&merged, "warnings")?,
             warnings_as_errors: scalar_bool(&merged, "warnings_as_errors")?.unwrap_or(false),
             opt,
-            output: match scalar_string(&merged, "output")? {
-                Some(output) => check_output(origin, output)?,
+            output: match merged.scalar("output") {
+                Some(s) => check_output(s, want_str(s)?.to_string())?,
                 None => name.clone(),
             },
             subsystem: scalar_enum(&merged, "subsystem")?,
@@ -646,6 +671,17 @@ pub fn configure(
             warn_abi(&unit.name, origin, &unit.private, &mut diags);
         }
         units.push(unit);
+    }
+
+    // A removal in `workspace` or a profile that no target had the value for is probably a typo.
+    for ((origin, key, value), removed) in &shared_removals {
+        if !removed {
+            diags.warn_at(
+                origin,
+                Some(key),
+                format!("{key} value `{value}` is not present in any target"),
+            );
+        }
     }
 
     check_duplicate_outputs(&units, platform.os)?;
@@ -666,6 +702,7 @@ pub fn configure(
     Ok(Configured {
         platform,
         cross_triple,
+        sysroot: None,
         profile,
         profile_scalars,
         profile_settings,
@@ -679,10 +716,11 @@ pub fn configure(
 }
 
 /// `output` names an artifact: one file name, never a path (spec 6.1).
-fn check_output(origin: &str, output: String) -> Result<String, ConfigError> {
+fn check_output(s: &Sourced, output: String) -> Result<String, ConfigError> {
     let bad = |what: &str| {
-        Err(ConfigError::invalid(
-            origin,
+        Err(ConfigError::at_key(
+            &s.origin,
+            &s.raw_key,
             format!("`output` {what} (found `{output}`)"),
         ))
     };
@@ -713,8 +751,9 @@ fn check_duplicate_outputs(units: &[Unit], os: Os) -> Result<(), ConfigError> {
             }
         }
         if let Some(other) = seen.insert((is_bin, file), u) {
-            return Err(ConfigError::invalid(
+            return Err(ConfigError::at_key(
                 unit_origin(u),
+                "output",
                 format!(
                     "`output` `{}` is also the output of `{}`; two {} would overwrite each other",
                     u.output,
@@ -750,7 +789,7 @@ fn dependency_unit(
         .as_ref()
         .map(Alias::parse)
         .transpose()
-        .map_err(|e| ConfigError::invalid(origin, e))?;
+        .map_err(|e| ConfigError::at_key(origin, "alias", e))?;
 
     // A dependency takes its own table and features only; the profile reaches
     // it through `Configured.profile_*` (spec 8.1) and the workspace never does.
@@ -764,7 +803,7 @@ fn dependency_unit(
     let lctx = cx.lookup(alias.as_ref());
     let expanded = |field: &str, text: &str| {
         expand(text, &lctx)
-            .map_err(|message| ConfigError::invalid(origin, format!("`{field}`: {message}")))
+            .map_err(|message| ConfigError::at_key(origin, field, format!("`{field}`: {message}")))
     };
     let source = match &decl.source {
         DepSource::Path(p) => {
@@ -783,8 +822,9 @@ fn dependency_unit(
         DepSource::Path(p) => {
             let dir = root.join(p);
             if !dir.is_dir() {
-                return Err(ConfigError::invalid(
+                return Err(ConfigError::at_key(
                     origin,
+                    "path",
                     format!("`path` {} is not a directory", dir.display()),
                 ));
             }
@@ -879,17 +919,23 @@ fn warn_abi(name: &str, origin: &str, private: &Settings, diags: &mut Diagnostic
         if ABI_FLAG_PREFIXES.iter().any(|p| f.starts_with(p))
             && !NON_ABI_FLAGS.iter().any(|p| f.starts_with(p))
         {
-            diags.warn(format!(
-                "{origin}: private flag `{f}` in `{name}` is ABI-affecting; {hint} (`flags.public`)"
-            ));
+            diags.warn_at(
+                origin,
+                None,
+                format!("private flag `{f}` in `{name}` is ABI-affecting; {hint} (`flags.public`)"),
+            );
         }
     }
     for d in &private.defines {
         if ABI_DEFINES.contains(&d.name.as_str()) {
-            diags.warn(format!(
-                "{origin}: private define `{}` in `{name}` is ABI-affecting; {hint} (`defines.public`)",
-                d.name
-            ));
+            diags.warn_at(
+                origin,
+                None,
+                format!(
+                    "private define `{}` in `{name}` is ABI-affecting; {hint} (`defines.public`)",
+                    d.name
+                ),
+            );
         }
     }
 }
@@ -905,6 +951,14 @@ fn diagnose_dependency(
     let origin = &decl.settings.origin;
     // Keys that only some kinds read (spec 10.3): accepted, but a warning says they do nothing here.
     let present = |name: &str| decl.settings.entries.iter().any(|e| e.key.name == name);
+    // The key as written (`libs.linux`), for the line of the warning.
+    let written = |name: &str| {
+        decl.settings
+            .entries
+            .iter()
+            .find(|e| e.key.name == name)
+            .map_or(name.to_string(), |e| e.raw_key.clone())
+    };
     let used: [(&str, bool, &[DepKind]); 6] = [
         ("options", present("options"), &[DepKind::Cmake]),
         ("files", present("files"), &[DepKind::Sources]),
@@ -920,11 +974,15 @@ fn diagnose_dependency(
     for (key, is_present, kinds) in used {
         if is_present && !kinds.contains(&decl.kind) {
             let kinds: Vec<String> = kinds.iter().map(|k| format!("`{}`", k.as_str())).collect();
-            diags.warn(format!(
-                "{origin}: `{key}` has no effect on a `{}` dependency (it applies to {})",
-                decl.kind.as_str(),
-                kinds.join(" and ")
-            ));
+            diags.warn_at(
+                origin,
+                Some(&written(key)),
+                format!(
+                    "`{key}` has no effect on a `{}` dependency (it applies to {})",
+                    decl.kind.as_str(),
+                    kinds.join(" and ")
+                ),
+            );
         }
     }
 
@@ -952,13 +1010,18 @@ fn diagnose_dependency(
                 })
                 .map(|e| e.raw_key.as_str())
                 .collect();
-            if !private.is_empty() {
-                diags.warn(format!(
-                    "{origin}: `{}` has private parts ({}) that a `{}` dependency cannot apply ({why}); make them public",
-                    f.origin,
-                    private.join(", "),
-                    decl.kind.as_str()
-                ));
+            if let Some(&first) = private.first() {
+                // The label names the dependency; the line is the first private key of the feature.
+                diags.warn_in(
+                    &f.origin,
+                    Some(first),
+                    format!(
+                        "{origin}: `{}` has private parts ({}) that a `{}` dependency cannot apply ({why}); make them public",
+                        f.origin,
+                        private.join(", "),
+                        decl.kind.as_str()
+                    ),
+                );
             }
         }
     }
@@ -977,9 +1040,13 @@ fn diagnose_dependency(
                 .any(|e| value_uses_platform_lookup(&e.value))
         });
         if !used {
-            diags.warn(format!(
-                "{origin}: `alias` is declared but no value in `{name}` uses `${{os}}`, `${{arch}}`, `${{compiler}}` or `${{triplet}}`"
-            ));
+            diags.warn_at(
+                origin,
+                Some("alias"),
+                format!(
+                    "`alias` is declared but no value in `{name}` uses `${{os}}`, `${{arch}}`, `${{compiler}}` or `${{triplet}}`"
+                ),
+            );
         }
     }
 }

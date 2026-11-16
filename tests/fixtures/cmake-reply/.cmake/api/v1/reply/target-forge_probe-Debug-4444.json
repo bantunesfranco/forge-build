@@ -1,0 +1,23 @@
+{
+  "name": "forge_probe",
+  "id": "forge_probe::@a",
+  "type": "EXECUTABLE",
+  "artifacts": [ { "path": "forge_probe" } ],
+  "link": {
+    "language": "C",
+    "commandFragments": [
+      { "fragment": "-g -pthread -Wl,--subsystem,console", "role": "flags" },
+      { "fragment": "-Wl,-rpath,/work/build/src", "role": "libraries" },
+      { "fragment": "src/libglfw3.a", "role": "libraries", "backtrace": 4 },
+      { "fragment": "util/libglfw_util.a", "role": "libraries" },
+      { "fragment": "-lm", "role": "libraries" },
+      { "fragment": "-ldl", "role": "libraries" },
+      { "fragment": "/usr/lib/x86_64-linux-gnu/libX11.so", "role": "libraries" },
+      { "fragment": "/work/build/extra/libgen.a", "role": "libraries" },
+      { "fragment": "-framework Cocoa", "role": "libraries" },
+      { "fragment": "-framework IOKit", "role": "libraries" },
+      { "fragment": "-L/opt/x/lib", "role": "libraryPath" }
+    ]
+  },
+  "dependencies": [ { "id": "glfw::@a" } ]
+}

@@ -9,6 +9,8 @@ use std::{
 use crate::{
     config::{
         self, ConfigError, Diagnostics,
+        flat::Locations,
+        schema::Manifest,
         types::DepKind,
         vocab::{Compiler, Os, Platform},
     },
@@ -45,6 +47,8 @@ pub struct Project {
     pub prepared: BTreeMap<usize, Prepared>,
     /// Warnings and infos found while configuring.
     pub diagnostics: Diagnostics,
+    /// Where the manifest's tables and keys are, for messages about them.
+    pub locations: Locations,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,7 +127,16 @@ impl Project {
                 source,
             })?;
         let m = config::load(manifest)?;
+        Self::configure_manifest(&m, root, inv, exec, prepare).map_err(|e| m.locations.locate(e))
+    }
 
+    fn configure_manifest(
+        m: &Manifest,
+        root: PathBuf,
+        inv: &Invocation,
+        exec: &dyn Executor,
+        prepare: bool,
+    ) -> Result<Project, ConfigError> {
         // The platform: `--target` names it, otherwise the host is the target.
         let (os, arch) = match inv.target.as_deref() {
             Some(t) => parse_target(t).map_err(|m| ConfigError::invalid("--target", m))?,
@@ -148,7 +161,7 @@ impl Project {
             &root,
             inv.target.is_some().then_some((os, arch)),
         ))?;
-        let mut configured = configure(&m, &root, inv, platform, &cache)?;
+        let mut configured = configure(m, &root, inv, platform, &cache)?;
 
         // A C source needs the C program to agree with the platform compiler.
         // (`sources` dependencies are checked once their files are found.)
@@ -163,7 +176,7 @@ impl Project {
                 // Only C is built, so the C compiler is the one that counts.
                 platform.compiler = c;
                 check_platform(&platform)?;
-                configured = configure(&m, &root, inv, platform, &cache)?;
+                configured = configure(m, &root, inv, platform, &cache)?;
             }
         }
         // The C program stood in for the platform, but C++ sources need theirs.
@@ -185,6 +198,15 @@ impl Project {
         .map_err(|m| ConfigError::invalid("archiver", m))?;
 
         let mut diagnostics = std::mem::take(&mut configured.diagnostics);
+        configured.sysroot = toolchains.sysroot.clone();
+        if configured.sysroot.is_some()
+            && matches!(platform.compiler, Compiler::Msvc | Compiler::ClangCl)
+        {
+            diagnostics.warn(format!(
+                "the toolchain's sysroot is ignored: {} has no --sysroot option",
+                platform.compiler.as_str()
+            ));
+        }
         if let Some(target) = inv.target.as_deref()
             && host_os_arch().is_ok_and(|host| host != (platform.os, platform.arch))
             && let Some(warning) = cross_compile_warning(
@@ -207,6 +229,7 @@ impl Project {
             targets: Vec::new(),
             prepared: BTreeMap::new(),
             diagnostics,
+            locations: m.locations.clone(),
         };
         if prepare {
             project.note_unused_dependencies();
@@ -272,7 +295,7 @@ impl Project {
     /// Builds `targets` again from the configured units and what the
     /// dependencies prepared.
     pub fn rebuild_targets(&mut self) -> Result<(), ConfigError> {
-        self.targets = self.build_targets()?;
+        self.targets = self.build_targets().map_err(|e| self.locations.locate(e))?;
         Ok(())
     }
 

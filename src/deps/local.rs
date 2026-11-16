@@ -79,8 +79,9 @@ fn sources_of(c: &Configured, root: &Path, unit: usize) -> Result<Vec<PathBuf>, 
     }
     let found = discover_globs(root, &u.base_dir, &dep.files)?;
     if found.is_empty() {
-        return Err(ConfigError::invalid(
-            field,
+        return Err(ConfigError::at_key(
+            &field,
+            "files",
             format!(
                 "`files` ({}) matched no source files in {}",
                 dep.files.join(", "),
@@ -89,7 +90,7 @@ fn sources_of(c: &Configured, root: &Path, unit: usize) -> Result<Vec<PathBuf>, 
         ));
     }
     check_patterns("files", root, &u.base_dir, &dep.files, &found)
-        .map_err(|message| ConfigError::invalid(field, message))?;
+        .map_err(|message| ConfigError::at_key(&field, "files", message))?;
     Ok(found)
 }
 
@@ -136,8 +137,9 @@ fn prebuilt(c: &Configured, root: &Path, unit: usize) -> Result<Prepared, Config
     let mut prepared = Prepared::default();
     for name in libs {
         let Some(file) = find_lib_files(&dir, name, msvc).into_iter().next() else {
-            return Err(ConfigError::invalid(
+            return Err(ConfigError::at_key(
                 field,
+                "libs",
                 format!(
                     "library `{name}` not found in {}; expected one of: {}",
                     display_path(&dir),

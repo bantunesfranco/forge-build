@@ -68,7 +68,7 @@ Global options:
 | `-p, --profile NAME` | Build profile: `debug` (default), `release`, `relwithdebinfo` or one the manifest declares. |
 | `--opt NAME=VALUE` | Set an option declared in the manifest. Repeatable. The value is saved in `options.toml` in the build directory (`build/options.toml`, or `build/<arch>-<os>/options.toml` with `--target`), so later runs of the same build reuse it (command line, then cache, then the option's default). |
 | `--target ARCH-OS` | Build for another platform, for example `arm64-macos`. Output goes to `build/<arch>-<os>/<profile>`. See Cross builds below. |
-| `--toolchain FILE` | A file with a `[toolchain]` table naming `c`, `cxx` and `ar`. Precedence: this file, then `CC`/`CXX`/`AR` from the environment, then the user toolchain file, then the default compilers. |
+| `--toolchain FILE` | A file with a `[toolchain]` table naming `c`, `cxx` and `ar`, and for cross builds `pkg_config` and `sysroot` (see Cross builds below). Precedence: this file, then `CC`/`CXX`/`AR` from the environment, then the user toolchain file, then the default compilers. |
 | `-m, --manifest PATH` | A `project.toml`, or a directory containing one. |
 
 Without `-m`, Forge looks for `project.toml` in the current directory and then in each
@@ -107,9 +107,10 @@ TOML tools or editors may flag `project.toml` files.
 
 `[dependency.<name>]` has a `kind`: `header-only`, `sources`, `prebuilt` (from a
 `path` or a `git` checkout), `cmake` (built through CMake, with `expose.target`)
-or `system` (`find`, tried with `pkg-config` and then CMake's `find-package`).
+or `system` (`find`, tried with `pkg-config` and then CMake's `find-package`; for a
+cross build see Cross builds below).
 Git dependencies are checked out under `build/deps/` and removed by
-`forge clean --all`.
+`forge clean --all`. Their submodules are fetched recursively.
 
 `project.lock` sits next to `project.toml` and records the commit each git
 dependency resolved to. Commit it. Builds use the pinned commit; `forge update`
@@ -122,8 +123,10 @@ does not have to exist on the others. Their `project.lock` entries are kept.
 `forge clean` fetches and builds nothing. A relative `git` URL (`./repo`,
 `../repo`) is taken from the manifest directory.
 
-A static CMake library does not report the system libraries it needs, so add them
-with `system` keys on the dependency. Only static libraries can be exposed: a
+forge detects the system libraries that the exposed targets need (`gdi32`, `m`,
+`-framework Cocoa`, ...) through a probe executable that CMake never builds, so they
+reach the link of every bin without `system` keys; this needs CMake 3.19 or newer
+(with an older one forge warns, and the keys are needed). Only static libraries can be exposed: a
 `SHARED_LIBRARY` target is an error (set `BUILD_SHARED_LIBS=OFF` or expose a static
 target). forge picks the CMake generator so that the dependency is built with its own
 compiler: `CMAKE_GENERATOR` if set, otherwise Ninja if it is installed, otherwise on
@@ -142,6 +145,22 @@ cross compilers in a `--toolchain` file (or `CC`/`CXX`). Without one, forge prin
 host. `cmake`
 dependencies also get `CMAKE_SYSTEM_NAME` and `CMAKE_SYSTEM_PROCESSOR`, plus
 `CMAKE_<LANG>_COMPILER_TARGET` for clang.
+
+The `[toolchain]` table of a toolchain file takes two more keys, both optional:
+`pkg_config` (a program name or path) and `sysroot` (a directory; a relative path is
+taken from the toolchain file's directory). `sysroot` is passed to gcc, clang and
+Apple clang as `--sysroot=<dir>` when compiling and linking, cross build or not; MSVC
+and `clang-cl` have no such option, so forge warns and ignores it.
+
+`system` dependencies are looked up for the target, not the host, so a cross build
+never uses the host's packages. forge runs the `pkg_config` of the toolchain file, else
+`<gnu-triple>-pkg-config` (for example `aarch64-linux-gnu-pkg-config`) if it runs, else
+plain `pkg-config` when the toolchain has a `sysroot` or `PKG_CONFIG_LIBDIR` or
+`PKG_CONFIG_SYSROOT_DIR` is already set. With a `sysroot` it sets
+`PKG_CONFIG_SYSROOT_DIR` to it and `PKG_CONFIG_LIBDIR` to its `usr/lib/pkgconfig`,
+`usr/share/pkgconfig` and `usr/lib/<gnu-triple>/pkgconfig`, except for a variable
+that your environment already sets. There is no CMake fallback when cross-compiling;
+without a usable `pkg-config` the dependency is an error that says what to set.
 
 ### Migrating from the old format
 
@@ -292,8 +311,6 @@ Linux, macOS (Apple clang or Homebrew LLVM) and Windows (MSVC `cl`, `clang-cl`, 
   starts can be recorded as clean.
 - **Ctrl-C is not handled specially.** A partially written output is caught on the
   next build, because its hash will not match the record.
-- **Static CMake libraries** do not report their system link dependencies; declare
-  them with `system` keys.
 - **Deferred features** are listed in section 15 of the [manifest specification](docs/manifest-spec.md).
 
 ## Roadmap

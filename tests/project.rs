@@ -6,7 +6,7 @@ use common::{Fixture, VersionStub};
 use forge_build::{
     config::vocab::Compiler,
     configure::model::Invocation,
-    executor::{CommandSpec, Executor, Outcome},
+    executor::{CommandSpec, Executor, Outcome, path_arg},
     graph::Graph,
     project::{BuildTargetKind, Project},
 };
@@ -394,5 +394,100 @@ fn the_c_program_is_used_when_the_cxx_program_is_missing() {
             .platform
             .compiler,
         Compiler::Clang
+    );
+}
+
+#[test]
+fn a_toolchain_sysroot_reaches_the_compile_and_link_lines() {
+    let f = simple();
+    let sysroot = f.root.join("sysroots").join("arm");
+    f.write(
+        "toolchain.toml",
+        &format!(
+            "[toolchain]\nc = \"clang\"\ncxx = \"clang++\"\nsysroot = '{}'\n",
+            sysroot.display()
+        ),
+    );
+    let p = f.load().unwrap();
+    let want = format!("--sysroot={}", path_arg(&sysroot));
+    assert!(
+        p.targets[0].compile_cxx.contains(&want),
+        "{:?}",
+        p.targets[0]
+    );
+    assert!(p.targets[0].link.contains(&want), "{:?}", p.targets[0]);
+    assert!(p.diagnostics.items.is_empty(), "{:?}", p.diagnostics.items);
+}
+
+#[test]
+fn a_relative_toolchain_sysroot_is_taken_from_the_toolchain_file() {
+    let f = simple();
+    f.write(
+        "toolchain.toml",
+        "[toolchain]\nc = \"clang\"\ncxx = \"clang++\"\nsysroot = \"sysroots/arm\"\n",
+    );
+    let p = f.load().unwrap();
+    let want = format!("--sysroot={}", path_arg(&f.root.join("sysroots/arm")));
+    assert!(
+        p.targets[0].compile_cxx.contains(&want),
+        "{:?}",
+        p.targets[0]
+    );
+}
+
+#[test]
+fn a_toolchain_sysroot_is_ignored_with_a_warning_for_msvc() {
+    let f = Fixture::new(SIMPLE);
+    f.touch("src/main.cpp");
+    f.write(
+        "toolchain.toml",
+        "[toolchain]\nc = \"cl\"\ncxx = \"cl\"\nsysroot = \"sysroot\"\n",
+    );
+    let inv = Invocation {
+        target: Some("x86_64-windows".into()),
+        ..f.invocation()
+    };
+    let p = f.load_with(&inv, &VersionStub).unwrap();
+    assert_eq!(p.platform.compiler, Compiler::Msvc);
+    let all: Vec<&String> = p.targets[0]
+        .compile_cxx
+        .iter()
+        .chain(&p.targets[0].link)
+        .collect();
+    assert!(!all.iter().any(|a| a.contains("sysroot")), "{all:?}");
+    let warnings: Vec<&String> = p.diagnostics.items.iter().map(|(_, m)| m).collect();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("sysroot is ignored"), "{warnings:?}");
+}
+
+#[test]
+fn a_cross_build_finds_system_packages_with_the_toolchains_pkg_config() {
+    let f = Fixture::new(concat!(
+        "[workspace]\nname = \"t\"\nversion = \"1\"\ncxx = \"20\"\n",
+        "[bin.app]\nsources = [\"main.cpp\"]\ndeps = [\"zlib\"]\n",
+        "[dependency.zlib]\nkind = \"system\"\nfind = \"zlib\"\n",
+    ));
+    f.touch("main.cpp");
+    f.write(
+        "toolchain.toml",
+        "[toolchain]\nc = \"clang\"\ncxx = \"clang++\"\npkg_config = \"forge-no-such-pkg-config\"\n",
+    );
+    // A platform other than this machine's, so that the build is a cross build.
+    let target = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "arm64-linux"
+    } else {
+        "x86_64-linux"
+    };
+    let inv = Invocation {
+        target: Some(target.into()),
+        ..f.invocation()
+    };
+    let e = f.load_with(&inv, &VersionStub).err().unwrap().to_string();
+    assert!(
+        e.contains("dependency.zlib")
+            && e.contains(target)
+            && e.contains("forge-no-such-pkg-config")
+            && !e.contains("cmake"),
+        "{e}"
     );
 }

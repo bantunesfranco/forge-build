@@ -526,3 +526,157 @@ fn path_dependencies_are_not_locked() {
     f.load().unwrap();
     assert!(!f.root.join("project.lock").exists());
 }
+
+/// Git refuses the `file` transport for submodules unless told otherwise, and
+/// forge does not tell it (only a network or ssh URL is expected in practice).
+/// The fixture submodules are local, so the scenarios below run in a child of
+/// the test binary whose environment allows it. Changing this process's own
+/// environment would race with the other tests.
+#[test]
+fn submodules_of_git_dependencies_are_fetched() {
+    need_git!();
+    let exe = std::env::current_exe().unwrap();
+    let out = Command::new(exe)
+        .args(["--ignored", "--test-threads=1", "submodule_scenarios::"])
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "protocol.file.allow")
+        .env("GIT_CONFIG_VALUE_0", "always")
+        .output()
+        .expect("run the submodule scenarios");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("3 passed"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Only run through `submodules_of_git_dependencies_are_fetched`.
+mod submodule_scenarios {
+    use super::*;
+
+    const SUB_PATH: &str = "vendor/sub";
+
+    /// `Upstream` with a second local repository, `sub`, added as the
+    /// submodule `vendor/sub` of `repo`.
+    struct WithSubmodule {
+        up: Upstream,
+    }
+
+    impl WithSubmodule {
+        fn new() -> Self {
+            let up = Upstream::new();
+            let sub = up.sub();
+            fs::create_dir_all(sub.join("include")).unwrap();
+            git_in(&sub, &["init", "-b", "master", "."]);
+            git_in(&sub, &["config", "user.email", "forge@example.com"]);
+            git_in(&sub, &["config", "user.name", "Forge Test"]);
+            let s = WithSubmodule { up };
+            s.commit_sub("1");
+            git_in(
+                &s.up.repo(),
+                &["submodule", "add", "-q", &s.sub_url(), SUB_PATH],
+            );
+            git_in(&s.up.repo(), &["commit", "-m", "add the submodule"]);
+            s
+        }
+
+        fn sub_url(&self) -> String {
+            self.up.sub().to_string_lossy().replace('\\', "/")
+        }
+
+        fn commit_sub(&self, value: &str) {
+            let sub = self.up.sub();
+            fs::write(sub.join("include/sub.h"), format!("#define SUB {value}\n")).unwrap();
+            git_in(&sub, &["add", "."]);
+            git_in(&sub, &["commit", "-m", &format!("change {value}")]);
+        }
+
+        /// Moves the submodule pointer of `repo` to the newest `sub` commit.
+        fn move_pointer(&self) {
+            let inside = self.up.repo().join(SUB_PATH);
+            git_in(&inside, &["pull", "-q", "origin", "master"]);
+            git_in(&self.up.repo(), &["add", SUB_PATH]);
+            git_in(&self.up.repo(), &["commit", "-m", "move the submodule"]);
+        }
+
+        fn consumer(&self) -> Fixture {
+            let text = manifest(&self.up.url(), "master")
+                .replace("[\"include\"]", "[\"include\", \"vendor/sub/include\"]");
+            let f = Fixture::new(&text);
+            f.touch("main.c");
+            f
+        }
+    }
+
+    impl Upstream {
+        fn sub(&self) -> PathBuf {
+            self.dir.path().join("sub")
+        }
+    }
+
+    fn sub_header(f: &Fixture) -> String {
+        fs::read_to_string(
+            f.root
+                .join("build/deps/dep/source/vendor/sub/include/sub.h"),
+        )
+        .unwrap_or_default()
+        .replace("\r\n", "\n")
+    }
+
+    #[test]
+    #[ignore = "run by submodules_of_git_dependencies_are_fetched"]
+    fn a_submodule_is_checked_out_with_the_dependency() {
+        need_git!();
+        let s = WithSubmodule::new();
+        let f = s.consumer();
+        let p = f.load().unwrap();
+        assert_eq!(sub_header(&f), "#define SUB 1\n");
+
+        let g = Graph::from_project(&p).unwrap();
+        let args = compile_args_of(&p, &g, "main.c");
+        assert!(
+            args.iter()
+                .any(|a| a.contains("build/deps/dep/source/vendor/sub/include")),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "run by submodules_of_git_dependencies_are_fetched"]
+    fn a_current_checkout_with_submodules_needs_no_upstream() {
+        need_git!();
+        let s = WithSubmodule::new();
+        let f = s.consumer();
+        f.load().unwrap();
+
+        // Neither repository is reachable any more.
+        fs::rename(s.up.repo(), s.up.dir.path().join("moved-repo")).unwrap();
+        fs::rename(s.up.sub(), s.up.dir.path().join("moved-sub")).unwrap();
+        f.load().unwrap();
+        assert_eq!(sub_header(&f), "#define SUB 1\n");
+    }
+
+    #[test]
+    #[ignore = "run by submodules_of_git_dependencies_are_fetched"]
+    fn the_submodule_follows_a_new_locked_commit() {
+        need_git!();
+        let s = WithSubmodule::new();
+        let f = s.consumer();
+        f.load().unwrap();
+        let old = lock_of(&f).entries["dep"].commit.clone();
+
+        s.commit_sub("2");
+        s.move_pointer();
+        let new = s.up.head();
+        assert_ne!(new, old);
+
+        let path = f.root.join("project.lock");
+        let mut lock = lock_of(&f);
+        lock.entries.get_mut("dep").unwrap().commit = new.clone();
+        lock.save(&path).unwrap();
+        f.load().unwrap();
+        assert_eq!(checkout_head(&f), new);
+        assert_eq!(sub_header(&f), "#define SUB 2\n");
+    }
+}

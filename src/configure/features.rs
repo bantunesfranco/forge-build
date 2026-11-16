@@ -107,8 +107,9 @@ fn guard_mismatch(
             failing_defaults(&body.when, p)
         ),
     };
-    ConfigError::invalid(
+    ConfigError::at_key(
         origin,
+        "when",
         format!(
             "its `when` guard requires {}, but the current platform is {} ({how})",
             describe_guard(&body.when),

@@ -150,8 +150,10 @@ Rare, but needed when inheriting from `workspace` or a profile:
 remove.defines = ["NOMINMAX"]      # same visibility/condition suffixes allowed
 ```
 
-`remove.*` is applied after merging. It may only remove values that are present.
-Removing a non-existent value is an error.
+`remove.*` is applied after merging. In a target's own table it may only remove
+values that are present, and removing a non-existent value is an error. In
+`workspace` or a profile, a removal applies to every target, so a target that
+does not have the value is skipped instead.
 
 ### 4.5 Lookups
 
@@ -619,7 +621,7 @@ after aliasing. This replaces the need to mentally assemble the manifest.
 | Unknown key, table, condition name or lookup                                           | Error                                       |
 | Two conditions in one key (`defines.windows.x86_64`)                                   | Error                                       |
 | Visibility on a key that doesn't accept it                                             | Error                                       |
-| `remove.*` of a value that isn't present                                               | Error                                       |
+| `remove.*` in a target table of a value that isn't present                             | Error                                       |
 | Variant guard not matching selected option value                                       | Error                                       |
 | Unknown logical `system` name                                                          | Error                                       |
 | Logical system name placed in `deps`                                                   | Error                                       |
