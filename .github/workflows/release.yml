@@ -1,11 +1,16 @@
 name: Release
 
-# A `v*` tag builds Forge for every platform and publishes a GitHub Release
-# with the archives attached. A tag with a pre-release suffix (`v0.2.0-rc.1`)
-# and every 0.x version are published as pre-releases.
+# A `v*` tag builds Forge for every platform, publishes the crate to
+# crates.io, then publishes a GitHub Release with the archives attached. A tag
+# with a pre-release suffix (`v0.2.0-rc.1`) and every 0.x version are
+# GitHub pre-releases.
 #
-# A pull request that changes this file only builds the archives, so the
-# workflow is tested before a tag ever uses it.
+# crates.io needs the repository secret CARGO_REGISTRY_TOKEN (a token with the
+# publish-update scope, or publish-new for the very first upload).
+#
+# A pull request that changes this file or Cargo.toml only builds the archives
+# and runs `cargo publish --dry-run`, so the workflow is tested before a tag
+# ever uses it.
 
 on:
   push:
@@ -13,6 +18,7 @@ on:
   pull_request:
     paths:
       - '.github/workflows/release.yml'
+      - 'Cargo.toml'
 
 permissions:
   contents: read
@@ -95,9 +101,43 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  crates-io:
+    name: Publish to crates.io
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Check the package
+        run: cargo publish --locked --dry-run
+
+      # Re-running a tag whose GitHub Release step failed must not fail here:
+      # a version that crates.io already has is skipped.
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::error::the repository secret CARGO_REGISTRY_TOKEN is not set"
+            exit 1
+          fi
+          name=$(grep -m1 '^name = ' Cargo.toml | cut -d'"' -f2)
+          version="${GITHUB_REF_NAME#v}"
+          status=$(curl -s -o /dev/null -w '%{http_code}' -A "$name release workflow" "https://crates.io/api/v1/crates/$name/$version")
+          if [ "$status" = 200 ]; then
+            echo "$name $version is already on crates.io; skipping"
+            exit 0
+          fi
+          cargo publish --locked
+
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, crates-io]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
