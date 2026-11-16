@@ -8,6 +8,7 @@ use std::{
 
 use crate::{
     build::{BuildOptions, build},
+    compdb,
     config::{self, ConfigError, Diagnostics, Level, find_manifest, flat::Locations},
     configure::{
         model::Invocation,
@@ -68,6 +69,9 @@ enum Commands {
         #[arg(long)]
         dot: bool,
     },
+    /// Write compile_commands.json for editors without building anything.
+    /// `forge build` writes it too.
+    Compdb,
     /// Show what build would do. With a lib, bin or dependency name: its merged
     /// configuration and where each value came from. With a path: why that
     /// file is rebuilt. With nothing: one line per task.
@@ -182,6 +186,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             project.rebuild_targets()?;
 
             let mut graph: Graph = Graph::from_project(&project)?;
+            // An editor needs every file, whichever target is built.
+            if let Err(e) = compdb::write(&project, &graph) {
+                eprintln!("warning: {e}");
+            }
             if let Some(name) = target.as_deref() {
                 graph = graph.select_target(&project, name)?;
             }
@@ -191,6 +199,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => return Err(Box::new(e)),
             }
         }
+        Some(Commands::Compdb) => write_compdb(&mut project, printed)?,
         Some(Commands::Graph { target, dot }) => {
             let mut graph: Graph = Graph::from_project(&project)?;
             if let Some(name) = target.as_deref() {
@@ -226,6 +235,37 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Update { .. }) | None => {}
     }
 
+    Ok(())
+}
+
+/// `forge compdb`: the dependencies are prepared as for `graph`, so a CMake
+/// dependency that has not been built contributes only its declared `include`
+/// keys. Nothing is compiled.
+fn write_compdb(project: &mut Project, printed: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let not_built: Vec<&str> = project
+        .prepared
+        .iter()
+        .filter(|(_, p)| p.not_built)
+        .map(|(&unit, _)| project.configured.units[unit].name.as_str())
+        .collect();
+    if !not_built.is_empty() {
+        let message = format!(
+            "cmake dependencies are not built by `forge compdb`: {}; only their declared include directories are known (run `forge build` once for complete include paths)",
+            not_built.join(", ")
+        );
+        project.diagnostics.info(message);
+    }
+    print_diagnostics(&project.diagnostics, &project.locations, printed);
+
+    let graph = Graph::from_project(project)?;
+    let written = compdb::write(project, &graph)?;
+    if written.is_empty() {
+        println!("{} is up to date", compdb::FILE);
+    }
+    for file in written {
+        let shown = file.strip_prefix(&project.root).unwrap_or(&file);
+        println!("Wrote {}", shown.display());
+    }
     Ok(())
 }
 
@@ -360,6 +400,73 @@ mod tests {
         );
     }
 
+    /// Records every command it is asked to run.
+    struct Recording(std::sync::Mutex<Vec<String>>);
+    impl Executor for Recording {
+        fn run(&self, spec: &CommandSpec) -> io::Result<Outcome> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", spec.program, spec.args.join(" ")));
+            Clang.run(spec)
+        }
+    }
+
+    #[test]
+    fn compdb_writes_the_database_and_compiles_nothing() {
+        let (_t, root) = project_dir();
+        let exec = Recording(Default::default());
+        let args = cli(&["compdb"]);
+        assert!(matches!(args.command, Some(Commands::Compdb)));
+        let mut p = load_project(&root.join("project.toml"), &args, &exec).unwrap();
+        write_compdb(&mut p, 0).unwrap();
+
+        for file in [
+            "build/debug/compile_commands.json",
+            "build/compile_commands.json",
+        ] {
+            let text = fs::read_to_string(root.join(file)).unwrap();
+            assert!(text.contains("a.c"), "{text}");
+        }
+        // at most a `--version` probe ran; no compile command did
+        let commands = exec.0.lock().unwrap();
+        assert!(
+            commands.iter().all(|c| c.contains("--version")),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn compdb_names_the_cmake_dependencies_that_are_not_built() {
+        let (_t, root) = project_dir();
+        let manifest = concat!(
+            "[workspace]
+name = \"t\"
+version = \"1\"
+c = \"17\"
+",
+            "[dependency.m]
+path = \"vendor/m\"
+kind = \"cmake\"
+expose = { target = \"m\" }
+",
+            "[bin.app]
+sources = [\"a.c\"]
+deps = [\"m\"]
+",
+        );
+        fs::write(root.join("project.toml"), manifest).unwrap();
+        fs::create_dir_all(root.join("vendor/m")).unwrap();
+        let mut p = load_project(&root.join("project.toml"), &cli(&["compdb"]), &Clang).unwrap();
+        write_compdb(&mut p, 0).unwrap();
+        let infos: Vec<String> = diagnostic_lines(&p.diagnostics, &p.locations, 0)
+            .into_iter()
+            .filter(|l| l.starts_with("info:") && l.contains("forge build"))
+            .collect();
+        assert_eq!(infos.len(), 1, "{infos:?}");
+        assert!(infos[0].contains(": m;"), "{infos:?}");
+    }
+
     #[test]
     fn only_clean_skips_the_dependencies() {
         for (args, want) in [
@@ -367,6 +474,7 @@ mod tests {
             (&["clean", "--all"], false),
             (&["build"], true),
             (&["graph"], true),
+            (&["compdb"], true),
             (&["explain"], true),
             (&[], true),
         ] {

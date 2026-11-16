@@ -56,6 +56,7 @@ variant feature, a `${option.*}` lookup, `remove.*` and logical system libraries
 | Command | What it does |
 | --- | --- |
 | `forge build [NAME] [-j N] [-v]` | Build all targets, or the named target and its dependency closure. `-v` prints each command and why it runs. |
+| `forge compdb` | Write `compile_commands.json` for editors without building anything (see Editor support). |
 | `forge explain [NAME\|PATH]` | With a lib, bin or dependency name: its merged configuration and where every value came from, then why its archive or link task would rebuild. With a path: why that file is rebuilt. With nothing: one line per task. |
 | `forge graph [NAME] [--dot]` | Print all tasks or a target's dependency closure; `--dot` emits Graphviz (`... \| dot -Tpng -o graph.png`). |
 | `forge clean [--all]` | Remove the selected profile's build directory, or all of `build/`. |
@@ -76,6 +77,25 @@ parent; the nearest wins, and the search stops at a directory containing `.git`.
 The directory holding the manifest is the project root. Every relative path means
 the same thing wherever you run the command, and compilers run with the root as
 their working directory.
+
+## Editor support
+
+`forge build` writes a JSON compilation database for the whole project, so clangd,
+CLion and VS Code understand it without CMake. It goes to
+`build/<profile>/compile_commands.json` (`build/<arch>-<os>/<profile>/` with
+`--target`), and a copy at `build/compile_commands.json` holds the one written
+last. Both are only rewritten when their content changes, so editors do not
+reindex on every build. It lists every file of every target, whichever target you
+build, with the commands `forge build` runs (minus the dependency-file options).
+
+- **clangd** (VS Code with the clangd extension, Neovim, Emacs and others) finds
+  `build/compile_commands.json` on its own.
+- **CLion**: File, Open, choose `build/compile_commands.json`, and open it
+  "as project".
+
+`forge compdb` writes the database without compiling anything, for a fresh
+checkout. A CMake dependency that has not been built contributes only the
+include directories declared in the manifest until you run `forge build` once.
 
 ## Configuration
 
@@ -252,6 +272,8 @@ build/<profile>/dep/<target>/<source>.o.d depfiles
 build/<profile>/bin/<target>             executable targets
 build/<profile>/lib/lib<target>.a        static library targets
 build/<profile>/forge.db                 records for this profile
+build/<profile>/compile_commands.json    compilation database for editors
+build/compile_commands.json              copy of the one written last
 build/options.toml                       cached --opt values (host builds)
 build/<arch>-<os>/options.toml           cached --opt values (--target builds)
 build/deps/<name>/                       fetched and built dependencies
@@ -275,6 +297,7 @@ so switching between them never rebuilds.
 | `planner` | Pure dirty-or-clean decisions with typed reasons |
 | `database`, `fingerprint` | Records and hashing; command and compiler fingerprints |
 | `headers`, `depfile` | Depfile parsing and path normalization |
+| `compdb` | The JSON compilation database for editors |
 | `build`, `executor` | The scheduler and the process boundary (a trait, so tests can fake it) |
 | `explain` | Renders merged configuration and the plan |
 

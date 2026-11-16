@@ -1,5 +1,6 @@
 pub mod build;
 pub mod cli;
+pub mod compdb;
 pub mod config;
 pub mod configure;
 pub mod database;
