@@ -146,7 +146,9 @@ impl Graph {
                         target: ti,
                         lang: if has_cxx(target) { Lang::Cxx } else { Lang::C },
                         inputs: objects[ti].clone(),
-                        implicit_inputs: libs.iter().map(|&i| output(i)).collect(),
+                        // No implicit inputs: the archive does not contain its
+                        // dependencies' archives, only the link needs them.
+                        implicit_inputs: vec![],
                         outputs: vec![output(ti)],
                     });
                 }

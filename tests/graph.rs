@@ -93,8 +93,11 @@ fn static_library_edges_are_ordered_and_target_selection_keeps_the_closure() {
         .iter()
         .position(|t| t.outputs == vec![PathBuf::from(lib("core"))])
         .unwrap();
-    assert!(graph.deps(util).contains(&core));
-    assert_eq!(graph.deps(util).len(), 2); // util object and the core archive
+    // An archive does not contain its dependencies, so it does not wait for them:
+    // archives of different libraries can run in parallel. Only the link needs both.
+    assert!(!graph.deps(util).contains(&core));
+    assert_eq!(graph.deps(util).len(), 1); // util object only
+    assert!(task_of(&graph, &lib("util")).implicit_inputs.is_empty());
 
     let cli = graph.select_target(&project, "cli").unwrap();
     assert_eq!(cli.tasks.len(), 6);
