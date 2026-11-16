@@ -3,7 +3,11 @@
 
 use std::path::Path;
 
-use crate::executor::{CommandSpec, Executor};
+use crate::{
+    config::vocab::Compiler,
+    executor::{CommandSpec, Executor},
+    platform::msvc_like_by_name,
+};
 
 /// Hashes the program, every argument (length-prefixed, so `["ab","c"]` and
 /// `["a","bc"]` differ) and the compiler identity.
@@ -28,12 +32,19 @@ pub fn command_hash(spec: &CommandSpec, compiler_id: &str) -> [u8; 32] {
 /// If the compiler cannot be run, the identity says so; the real compile
 /// then fails with a proper error.
 pub fn compiler_identity(exec: &dyn Executor, program: &str, cwd: &Path) -> String {
+    // `cl` has no `--version`: `/Bv` prints its banner (version and the
+    // host/target architecture) on stderr and exits with an error code.
+    let is_cl = msvc_like_by_name(program) == Some(Compiler::Msvc);
+    let probe = if is_cl { "/Bv" } else { "--version" };
     let spec = CommandSpec {
         program: program.to_string(),
-        args: vec!["--version".to_string()],
+        args: vec![probe.to_string()],
         cwd: cwd.to_path_buf(),
     };
     match exec.run(&spec) {
+        Ok(o) if is_cl && !(o.stdout.is_empty() && o.stderr.is_empty()) => {
+            format!("{program}\n{}\n{}", o.stdout, o.stderr)
+        }
         Ok(o) if o.success() => format!("{program}\n{}", o.stdout),
         _ => format!("{program}\n<version unavailable>"),
     }
@@ -98,6 +109,27 @@ mod tests {
         let a = compiler_identity(&Version("clang 17"), "clang++", Path::new("."));
         let b = compiler_identity(&Version("clang 18"), "clang++", Path::new("."));
         assert_ne!(a, b);
+    }
+
+    /// `cl /Bv`: banner on stderr, stdout empty, nonzero exit.
+    struct Banner(&'static str);
+    impl Executor for Banner {
+        fn run(&self, _: &CommandSpec) -> io::Result<Outcome> {
+            Ok(Outcome {
+                code: Some(2),
+                stdout: String::new(),
+                stderr: self.0.into(),
+            })
+        }
+    }
+
+    #[test]
+    fn cl_identity_comes_from_the_banner_on_stderr() {
+        let x64 = compiler_identity(&Banner("Version 19.40 for x64"), "cl", Path::new("."));
+        let x86 = compiler_identity(&Banner("Version 19.40 for x86"), "cl.exe", Path::new("."));
+        assert!(!x64.contains("unavailable"), "{x64}");
+        assert!(x64.contains("19.40 for x64"), "{x64}");
+        assert_ne!(x64, x86);
     }
 
     #[test]

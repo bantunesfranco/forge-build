@@ -156,6 +156,7 @@ mod tests {
         let graph = Graph::new(vec![
             Task {
                 kind: TaskKind::Compile,
+                target: 0,
                 lang: Lang::Cxx,
                 inputs: vec![p("a.cpp")],
                 implicit_inputs: vec![],
@@ -163,6 +164,7 @@ mod tests {
             },
             Task {
                 kind: TaskKind::Link,
+                target: 0,
                 lang: Lang::Cxx,
                 inputs: vec![p("a.o")],
                 implicit_inputs: vec![],

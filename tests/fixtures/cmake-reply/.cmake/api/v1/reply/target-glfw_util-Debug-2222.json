@@ -1,0 +1,6 @@
+{
+  "name": "glfw_util",
+  "id": "glfw_util::@a",
+  "type": "STATIC_LIBRARY",
+  "artifacts": [ { "path": "util/libglfw_util.a" } ]
+}

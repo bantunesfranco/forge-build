@@ -1,0 +1,6 @@
+{
+  "name": "glfw",
+  "id": "glfw::@a",
+  "type": "STATIC_LIBRARY",
+  "artifacts": [ { "path": "src/release/libglfw3.a" } ]
+}

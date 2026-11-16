@@ -1,4 +1,4 @@
-//! Source languages and the toolchain used for each.
+//! Source languages.
 
 use std::path::Path;
 
@@ -24,13 +24,6 @@ impl Lang {
             Lang::Cxx => "C++",
         }
     }
-}
-
-/// The compiler driver and language standard for one language.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Toolchain {
-    pub program: String,
-    pub standard: String,
 }
 
 #[cfg(test)]

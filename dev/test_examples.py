@@ -15,7 +15,6 @@ Optional environment variables:
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
@@ -28,32 +27,39 @@ ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES = ROOT / "examples"
 
 FORGE = Path(
-    os.environ.get("FORGE_BIN", str(ROOT / "target" / "release" / "forge"))
+    os.environ.get(
+        "FORGE_BIN",
+        str(
+            ROOT
+            / "target"
+            / "release"
+            / ("forge.exe" if sys.platform == "win32" else "forge")
+        ),
+    )
 ).resolve()
 
 PROJECTS = {
     "c-library": {
-        "default_output": "c-library",
         "expected_output": [
             "sqrt(25.0) = 5.0",
             "clamp(42, 0, 10) = 10.0",
         ],
-        "compiler": "CC",
     },
     "cpp-profiles": {
-        "default_output": "cpp-profiles",
         "expected_output": [
             "Hello, Forge!",
         ],
-        "compiler": "CXX",
     },
     "mixed-language": {
-        "default_output": "mixed-language",
         "expected_output": [
             "Message: Hello from Forge",
             "Checksum: 0x",
         ],
-        "compiler": "CXX",
+    },
+    "features": {
+        "expected_output": [
+            "legacy: removed",
+        ],
     },
 }
 
@@ -106,7 +112,7 @@ def require_project(name: str) -> Path:
             f"Example project does not exist: {project}"
         )
 
-    manifest = project / "Forge.toml"
+    manifest = project / "project.toml"
     if not manifest.is_file():
         raise IntegrationTestFailure(
             f"Missing manifest: {manifest}"
@@ -133,7 +139,7 @@ def forge(
             str(FORGE),
             *arguments,
             "--manifest",
-            str(project / "Forge.toml"),
+            str(project / "project.toml"),
         ],
         cwd=project,
         check=check,
@@ -144,13 +150,26 @@ def build(
     project: Path,
     *,
     profile: str | None = None,
+    options: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     arguments = ["build", "-v"]
 
     if profile:
         arguments.extend(["--profile", profile])
 
-    return forge(project, *arguments)
+    for option in options:
+        arguments.extend(["--opt", option])
+
+    result = forge(project, *arguments)
+
+    # MSVC must keep its PDBs below build/, never next to the manifest.
+    stray = sorted(p.name for p in project.glob("*.pdb"))
+    if stray:
+        raise IntegrationTestFailure(
+            f"build left debug-info files in the project root: {stray}"
+        )
+
+    return result
 
 
 def executable(project: Path, name: str, profile: str) -> Path:
@@ -158,7 +177,7 @@ def executable(project: Path, name: str, profile: str) -> Path:
     if sys.platform == "win32":
         name += ".exe"
 
-    return project / "build" / profile / name
+    return project / "build" / profile / "bin" / name
 
 
 def run_program(
@@ -254,6 +273,22 @@ def test_cpp_profiles(temp_root: Path) -> None:
             f"{release_output}"
         )
 
+    # Header tracking works with whichever compiler built it: an edited
+    # header rebuilds exactly the files that include it, and nothing else.
+    header = project / "include" / "greeting.hpp"
+    header.write_text(header.read_text() + "\n// edited\n")
+    rebuilt = build(project, profile="debug").stdout
+    for source in ("src/main.cpp", "src/greeting.cpp"):
+        if f"Compiling {source}" not in rebuilt:
+            raise IntegrationTestFailure(
+                f"editing greeting.hpp did not rebuild {source}:\n{rebuilt}"
+            )
+    unchanged = build(project, profile="debug").stdout
+    if "Build is up to date" not in unchanged:
+        raise IntegrationTestFailure(
+            f"a second build after the header edit was not up to date:\n{unchanged}"
+        )
+
     graph = forge(project, "graph", "--dot")
     if "digraph" not in graph.stdout:
         raise IntegrationTestFailure(
@@ -294,146 +329,75 @@ def test_mixed_language(temp_root: Path) -> None:
     print("[PASS] mixed-language")
 
 
-def test_steps_dependency(temp_root: Path) -> None:
-    """Build and link a local dependency through the custom steps backend."""
-    print("[TEST] steps dependency")
+def test_dependencies(temp_root: Path) -> None:
+    """Build and run the example that consumes a local source dependency."""
+    print("[TEST] dependencies")
 
-    require_tool("ar")
-    dependency = temp_root / "tiny-dependency"
-    dependency.mkdir()
-    (dependency / "tiny.h").write_text(
-        "int tiny_value(void);\n", encoding="utf-8"
-    )
-    (dependency / "tiny.c").write_text(
-        "int tiny_value(void) { return 17; }\n", encoding="utf-8"
-    )
-
-    project = temp_root / "dependency-consumer"
-    (project / "src").mkdir(parents=True)
-    (project / "src" / "main.c").write_text(
-        '#include "tiny.h"\n'
-        "int main(void) { return tiny_value() == 17 ? 0 : 1; }\n",
-        encoding="utf-8",
-    )
-    compiler = os.environ.get("CC") or shutil.which("clang") or shutil.which("gcc")
-    if not compiler:
-        raise IntegrationTestFailure(
-            "No suitable C compiler found for dependency test"
-        )
-
-    manifest = f'''[project]
-name = "dependency-consumer"
-version = "0.1.0"
-
-[build]
-compiler = {json.dumps(compiler)}
-standard = "c11"
-source_dirs = ["src"]
-output = "dependency-consumer"
-default_profile = "debug"
-
-[profile.debug]
-opt_level = 0
-
-[dependencies.tiny]
-prefer = "vendored"
-
-[dependencies.tiny.source]
-type = "path"
-path = "../tiny-dependency"
-
-[dependencies.tiny.build]
-system = "steps"
-steps = [
-  'mkdir -p "{{prefix}}/include" "{{prefix}}/lib"',
-  '"{{cc}}" -c tiny.c -o tiny.o',
-  'ar rcs "{{prefix}}/lib/libtiny.a" tiny.o',
-  'cp tiny.h "{{prefix}}/include/tiny.h"',
-]
-'''
-    (project / "Forge.toml").write_text(manifest, encoding="utf-8")
+    source = require_project("dependencies")
+    dependency_project = temp_root / "c-library"
+    if not dependency_project.is_dir():
+        copy_project(require_project("c-library"), temp_root)
+    project = copy_project(source, temp_root)
+    expected = PROJECTS["c-library"]["expected_output"]
 
     build(project)
-    run_program(project, "dependency-consumer", "debug", [])
-    print("[PASS] steps dependency")
+    run_program(project, "dependencies", "debug", expected)
+
+    build(project, profile="release")
+    run_program(project, "dependencies", "release", expected)
+
+    print("[PASS] dependencies")
 
 
-def test_forge_dependency_auto_detection(temp_root: Path) -> None:
-    """A nested Forge.toml selects the recursive Forge backend automatically."""
-    print("[TEST] Forge dependency auto-detection")
+def test_features(temp_root: Path) -> None:
+    """Options, a variant feature, lookups, remove.* and the option cache."""
+    print("[TEST] features")
 
-    dependency = temp_root / "nested-forge"
-    (dependency / "src").mkdir(parents=True)
-    (dependency / "src" / "main.c").write_text(
-        "int main(void) { return 0; }\n", encoding="utf-8"
-    )
-    (dependency / "Forge.toml").write_text(
-        '''[project]
-name = "nested-forge"
-version = "0.1.0"
-
-[build]
-compiler = "cc"
-standard = "c11"
-source_dirs = ["src"]
-output = "nested-output"
-default_profile = "debug"
-
-[profile.debug]
-opt_level = 0
-''',
-        encoding="utf-8",
-    )
-
-    project = temp_root / "forge-consumer"
-    (project / "src").mkdir(parents=True)
-    (project / "src" / "main.c").write_text(
-        "int main(void) { return 0; }\n", encoding="utf-8"
-    )
-    compiler = os.environ.get("CC") or shutil.which("clang") or shutil.which("gcc")
-    if not compiler:
-        raise IntegrationTestFailure(
-            "No suitable C compiler found for dependency test"
-        )
-    (project / "Forge.toml").write_text(
-        f'''[project]
-name = "forge-consumer"
-version = "0.1.0"
-
-[build]
-compiler = {json.dumps(compiler)}
-standard = "c11"
-source_dirs = ["src"]
-output = "forge-consumer"
-default_profile = "debug"
-
-[profile.debug]
-opt_level = 0
-
-[dependencies.nested]
-prefer = "vendored"
-
-[dependencies.nested.source]
-type = "path"
-path = "../nested-forge"
-
-[dependencies.nested.expose]
-include = []
-lib_dirs = []
-libs = []
-''',
-        encoding="utf-8",
-    )
+    source = require_project("features")
+    project = copy_project(source, temp_root)
+    expected = PROJECTS["features"]["expected_output"]
 
     build(project)
-    child_output = executable(dependency, "nested-output", "debug")
-    if not child_output.is_file():
+    default_output = run_program(
+        project,
+        "features",
+        "debug",
+        [*expected, "level: low", "scaled sqrt: 4.0", "asserts: on"],
+    )
+
+    build(project, options=("level=high",))
+    high_output = run_program(
+        project,
+        "features",
+        "debug",
+        [*expected, "level: high", "scaled sqrt: 16.0", "asserts: on"],
+    )
+
+    if high_output == default_output:
         raise IntegrationTestFailure(
-            "Nested Forge dependency was not built automatically; expected "
-            f"{child_output}"
+            "--opt level=high did not change the program output"
         )
-    run_program(project, "forge-consumer", "debug", [])
-    print("[PASS] Forge dependency auto-detection")
+
+    if not (project / "build" / "options.toml").is_file():
+        raise IntegrationTestFailure("--opt did not write build/options.toml")
+
+    # The option cache applies to later runs, so release also gets `high`.
+    build(project, profile="release")
+    run_program(
+        project,
+        "features",
+        "release",
+        [*expected, "level: high", "scaled sqrt: 16.0", "asserts: off"],
+    )
+
+    explanation = forge(project, "explain", "features").stdout
+    if "LEVEL_SCALE=4" not in explanation or "FEATURES_LEGACY" in explanation:
+        raise IntegrationTestFailure(
+            "forge explain features did not show the merged configuration:\n"
+            f"{explanation}"
+        )
+
+    print("[PASS] features")
 
 
 def main() -> int:
@@ -445,9 +409,9 @@ def main() -> int:
         )
         return 2
 
-    if not sys.platform.startswith(("linux", "darwin")):
+    if not sys.platform.startswith(("linux", "darwin", "win32")):
         print(
-            "error: these integration tests currently target Linux and macOS",
+            "error: these integration tests currently target Linux, macOS and Windows",
             file=sys.stderr,
         )
         return 2
@@ -463,6 +427,8 @@ def main() -> int:
                     if name == "CC"
                     else ("clang++", "g++")
                 )
+                if sys.platform == "win32":
+                    candidates += ("cl", "clang-cl")
                 if not any(shutil.which(candidate) for candidate in candidates):
                     raise IntegrationTestFailure(
                         f"No suitable {name} compiler found. "
@@ -475,8 +441,8 @@ def main() -> int:
             test_c_library(temp_root)
             test_cpp_profiles(temp_root)
             test_mixed_language(temp_root)
-            test_steps_dependency(temp_root)
-            test_forge_dependency_auto_detection(temp_root)
+            test_dependencies(temp_root)
+            test_features(temp_root)
 
     except (IntegrationTestFailure, OSError) as error:
         print(f"\n[FAIL] {error}", file=sys.stderr)

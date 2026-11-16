@@ -1,4 +1,3 @@
-
 name: CI
 
 on:
@@ -16,41 +15,65 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.89"
 
 jobs:
-  check:
-    name: ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-
+  # Format and docs are the same everywhere: check them once.
+  lint:
+    name: Format and docs
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.89"
-          components: rustfmt, clippy
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Toolchain versions
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Documentation
+        run: cargo doc --locked --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # Clippy and the Rust tests on every OS. Platform code differs per OS
+  # (`cfg(windows)`, path handling), and the tests that drive a real compiler,
+  # CMake or git run against the default toolchain of the runner.
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Puts cl.exe, link.exe and lib.exe on PATH. Windows steps run in
+      # PowerShell (the default): Git Bash's /usr/bin/link would shadow link.exe.
+      - if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Tool versions
+        shell: bash
         run: |
           rustc --version
           cargo --version
-          python3 --version
-          clang --version
-          clang++ --version
-          gcc --version
-          g++ --version
-          ar --version 2>&1 | head -n 1 || true
-          make --version 2>&1 | head -n 1 || true
-
-      - name: Format
-        run: cargo fmt --all -- --check
+          cmake --version | head -n 1 || true
+          git --version || true
+          pkg-config --version || true
+          if [ "$RUNNER_OS" = Windows ]; then cl 2>&1 | head -n 1; clang-cl --version | head -n 1; else cc --version | head -n 1; c++ --version | head -n 1; fi
 
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
@@ -61,16 +84,91 @@ jobs:
       - name: Release tests
         run: cargo test --locked --release --all-targets
 
-      - name: Documentation
-        run: cargo doc --locked --no-deps
-        env:
-          RUSTDOCFLAGS: -D warnings
+  # The example projects, built by the real forge binary with each compiler
+  # forge supports on that OS (debug, release with LTO, --opt, clean, ...).
+  examples:
+    name: Examples (${{ matrix.os }}, ${{ matrix.compiler }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, compiler: gcc, cc: gcc, cxx: g++ }
+          - { os: ubuntu-latest, compiler: clang, cc: clang, cxx: clang++ }
+          - { os: macos-latest, compiler: apple_clang, cc: clang, cxx: clang++ }
+          - { os: windows-latest, compiler: msvc, cc: cl, cxx: cl }
+          - { os: windows-latest, compiler: clang_cl, cc: clang-cl, cxx: clang-cl }
+          - { os: windows-latest, compiler: clang, cc: clang, cxx: clang++ }
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      # clang's thin-LTO archives (release profile) need llvm-ar.
+      - if: matrix.compiler == 'clang' && runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y llvm
+
+      - if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # On Windows, clang-cl's LTO (release profile) archives with llvm-lib and
+      # links with lld; clang always archives with llvm-ar.
+      - if: runner.os == 'Windows' && matrix.compiler != 'msvc'
+        name: LLVM tools
+        run: Get-Command clang, clang-cl, llvm-lib, llvm-ar, lld-link | Select-Object Name, Source
 
       - name: Build Forge
         run: cargo build --locked --release
 
-      - name: Example and dependency integration tests
-        run: python3 dev/test_examples.py
+      - name: Example integration tests
+        run: python dev/test_examples.py
+
+  # The Windows build of forge on Linux, under Wine: cross-compiled with
+  # MinGW and run with Wine as the test runner. It checks Windows path and
+  # process handling without a Windows machine. Tests that need a real
+  # compiler, CMake or git skip themselves (Wine cannot start Linux programs).
+  wine:
+    name: Rust tests under Wine
+    # Pinned: Rust's Windows std needs bcryptprimitives.dll, which Wine 6
+    # (Ubuntu 22.04) lacks; 24.04's Wine 9 has it.
+    runs-on: ubuntu-24.04
+    env:
+      TARGET: x86_64-pc-windows-gnu
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER: wine
+      WINEDEBUG: -all
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: x86_64-pc-windows-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install MinGW and Wine
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 wine64 wine
+          wine --version
+
+      - name: Prepare the Wine prefix
+        run: wineboot --init
+
+      - name: Rust tests (Windows build, under Wine)
+        run: cargo test --locked --target "$TARGET" --all-targets
 
   coverage:
     name: Rust coverage (Ubuntu)
@@ -83,7 +181,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.89"
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2

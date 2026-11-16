@@ -8,14 +8,15 @@ use std::{
 };
 
 use crate::{
+    config::vocab::Compiler,
     database::{self, Database, FileState, Snapshot, TaskRecord},
-    executor::{CommandSpec, Executor, Outcome},
-    fingerprint,
+    executor::{CommandSpec, Executor, Outcome, path_arg},
+    fingerprint, flags,
     graph::{Graph, Task, TaskId, TaskKind},
-    headers,
+    headers::{self, DepFormat},
+    lang::Lang,
     planner::{self, DirtyReason},
     project::Project,
-    resolve::Resolved,
 };
 
 pub struct BuildPlan {
@@ -48,46 +49,132 @@ pub enum BuildError {
     SaveDb { path: PathBuf, source: io::Error },
 }
 
-fn path_arg(p: &Path) -> String {
-    p.display().to_string()
-}
+/// The command for a task. A compile takes its target's arguments for the
+/// source's language; a link uses the C++ driver if any object is C++.
+pub fn command_for(task: &Task, project: &Project) -> CommandSpec {
+    let cwd = project.root.clone();
+    let msvc = project.uses_msvc();
+    let compiler = project.platform.compiler;
+    let lto = project.configured.profile_scalars.lto;
+    let target = &project.targets[task.target];
+    let program = |lang: Lang| match lang {
+        Lang::C => project.toolchains.c.clone(),
+        Lang::Cxx => project.toolchains.cxx.clone(),
+    };
+    let objects = || task.inputs.iter().map(|p| path_arg(p));
+    let out = path_arg(&task.outputs[0]);
 
-/// The command for a task. The program and `-std=` come from the task's
-/// language (a link task takes the C++ driver if any object is C++).
-pub fn command_for(task: &Task, r: &Resolved, project: &Project) -> CommandSpec {
-    let toolchain = r.toolchain(task.lang);
-    let mut args = Vec::new();
     match task.kind {
+        TaskKind::Archive => {
+            let mut args = Vec::new();
+            if msvc {
+                args.push("/nologo".to_string());
+                // llvm-lib reads bitcode objects without being told to.
+                if lto && compiler == Compiler::Msvc {
+                    args.push("/LTCG".to_string());
+                }
+                args.push(format!("/OUT:{out}"));
+            } else {
+                args.push("crs".to_string());
+                args.push(out);
+            }
+            args.extend(objects());
+            CommandSpec {
+                program: project.archiver.clone(),
+                args,
+                cwd,
+            }
+        }
         TaskKind::Compile => {
-            args.extend(r.compile_args(task.lang));
-            args.push("-MMD".into());
-            args.push("-MF".into());
-            args.push(path_arg(&task.outputs[1]));
-            args.push("-c".into());
-            args.push(path_arg(&task.inputs[0]));
+            let mut args = match task.lang {
+                Lang::C => target.compile_c.clone(),
+                Lang::Cxx => target.compile_cxx.clone(),
+            };
+            let depfile = path_arg(&task.outputs[1]);
+            let source = path_arg(&task.inputs[0]);
+            if msvc {
+                args.extend(["/nologo".to_string(), "/FS".to_string(), "/c".to_string()]);
+                if compiler == Compiler::ClangCl {
+                    // clang-cl ignores /sourceDependencies; the GNU options
+                    // are passed through to the clang driver.
+                    args.extend(["/clang:-MMD".to_string(), format!("/clang:-MF{depfile}")]);
+                } else {
+                    args.extend(["/sourceDependencies".to_string(), depfile]);
+                }
+                // One PDB directory per target and build dir, so /Zi never
+                // writes `vc140.pdb` into the project root. The trailing
+                // separator makes it a directory.
+                let pdb_dir = project.build_dir().join("obj").join(&target.name);
+                args.push(format!(
+                    "/Fd{}{}",
+                    path_arg(&pdb_dir),
+                    std::path::MAIN_SEPARATOR
+                ));
+                args.extend([format!("/Fo{out}"), source]);
+            } else {
+                args.extend([
+                    "-MMD".to_string(),
+                    "-MF".to_string(),
+                    depfile,
+                    "-c".to_string(),
+                    source,
+                    "-o".to_string(),
+                    out,
+                ]);
+            }
+            CommandSpec {
+                program: program(task.lang),
+                args,
+                cwd,
+            }
         }
         TaskKind::Link => {
-            args.extend(task.inputs.iter().map(|p| path_arg(p)));
-            args.extend(r.link_args.iter().cloned());
+            let mut args: Vec<String> = objects().collect();
+            if msvc {
+                // clang-cl picks its target before the linker options start.
+                args.extend(flags::target_arg(&project.configured));
+                // Thin-LTO bitcode needs lld; link.exe cannot read it.
+                if lto && compiler == Compiler::ClangCl {
+                    args.push("-fuse-ld=lld".to_string());
+                }
+                args.push("/nologo".to_string());
+                args.push("/link".to_string());
+                args.extend(target.link.iter().cloned());
+                args.push(format!("/OUT:{out}"));
+            } else {
+                args.extend(target.link.iter().cloned());
+                args.push("-o".to_string());
+                args.push(out);
+            }
+            CommandSpec {
+                program: program(task.lang),
+                args,
+                cwd,
+            }
         }
-    }
-
-    args.push("-o".into());
-    args.push(path_arg(&task.outputs[0]));
-    CommandSpec {
-        program: toolchain.program.clone(),
-        args,
-        cwd: project.root.clone(),
     }
 }
 
-/// Where the build database for `profile` lives (inside the build directory,
-/// so `clean` removes it).
-pub fn db_path(project: &Project, profile: &str) -> PathBuf {
-    project
-        .root
-        .join(project.build_dir(profile))
-        .join("forge.db")
+/// `cl` and `lib` are only on the PATH of a Developer Command Prompt, and forge
+/// never runs `cl` before the first compile, so say what to do.
+fn missing_program_hint(program: &str, error: &io::Error) -> Option<&'static str> {
+    let msvc_tool = matches!(
+        Path::new(program)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("cl" | "lib")
+    );
+    (error.kind() == io::ErrorKind::NotFound && msvc_tool).then_some(
+        "hint: run forge from a Developer Command Prompt, or name another compiler with CC/CXX or --toolchain",
+    )
+}
+
+/// Where the build database lives (inside the build directory, so `clean`
+/// removes it).
+pub fn db_path(project: &Project) -> PathBuf {
+    project.root.join(project.build_dir()).join("forge.db")
 }
 
 /// Builds the record for a task that just succeeded, or says why it can't be
@@ -105,11 +192,12 @@ fn make_record(
     launched_at: SystemTime,
     inputs_at_launch: &Snapshot,
     produced: &HashSet<&PathBuf>,
+    format: DepFormat,
 ) -> Result<TaskRecord, String> {
     let mut inputs = inputs_at_launch.clone();
 
     if task.kind == TaskKind::Compile {
-        for header in headers::read_headers(root, &root.join(&task.outputs[1]))? {
+        for header in headers::read_headers(root, &root.join(&task.outputs[1]), format)? {
             inputs.entry(header.clone()).or_insert_with(|| {
                 database::file_state(&root.join(&header)).unwrap_or(FileState::Missing)
             });
@@ -151,9 +239,7 @@ fn make_record(
 pub fn build(
     project: &Project,
     graph: &Graph,
-    resolved: &Resolved,
     exec: &(dyn Executor + Sync), // shared across worker threads
-    profile: &str,
     opts: BuildOptions,
 ) -> Result<(), BuildError> {
     let root = project.root.as_path();
@@ -165,8 +251,8 @@ pub fn build(
         specs,
         hashes,
         dirty,
-    } = prepare(graph, project, resolved, exec, profile);
-    let db_file = db_path(project, profile);
+    } = prepare(graph, project, exec);
+    let db_file = db_path(project);
     if dirty.is_empty() {
         println!("Build is up to date");
         return Ok(());
@@ -225,8 +311,20 @@ pub fn build(
                     break;
                 }
 
+                // `ar` adds to an existing archive and never drops members, so
+                // a removed or renamed source would stay in the library.
+                if task.kind == TaskKind::Archive
+                    && let Err(e) = fs::remove_file(root.join(out))
+                    && e.kind() != io::ErrorKind::NotFound
+                {
+                    eprintln!("error: cannot remove {}: {e}", out.display());
+                    failed += 1;
+                    break;
+                }
+
                 match task.kind {
                     TaskKind::Compile => println!("Compiling {}", task.inputs[0].display()),
+                    TaskKind::Archive => println!("Archiving {}", out.display()),
                     TaskKind::Link => println!("Linking {}", out.display()),
                 }
                 if opts.verbose {
@@ -269,7 +367,15 @@ pub fn build(
 
                     // only successes are recorded; an untrustworthy one is forgotten
                     let (at, inputs) = launched.remove(&id).expect("launched task has a snapshot");
-                    match make_record(root, task, hashes[id], at, &inputs, &produced) {
+                    match make_record(
+                        root,
+                        task,
+                        hashes[id],
+                        at,
+                        &inputs,
+                        &produced,
+                        project.depfile_format(),
+                    ) {
                         Ok(rec) => {
                             db.tasks.insert(task.outputs[0].clone(), rec);
                         }
@@ -302,6 +408,9 @@ pub fn build(
                 }
                 Err(e) => {
                     eprintln!("error: could not run `{}`: {e}", specs[id].program);
+                    if let Some(hint) = missing_program_hint(&specs[id].program, &e) {
+                        eprintln!("{hint}");
+                    }
                     db.tasks.remove(&task.outputs[0]);
                     db_changed = true;
                     failed += 1;
@@ -323,25 +432,19 @@ pub fn build(
     Ok(())
 }
 
-pub fn prepare(
-    graph: &Graph,
-    project: &Project,
-    resolved: &Resolved,
-    exec: &(dyn Executor + Sync),
-    profile: &str,
-) -> BuildPlan {
+pub fn prepare(graph: &Graph, project: &Project, exec: &(dyn Executor + Sync)) -> BuildPlan {
     // ---- plan: no process is run for tasks that are up to date ----
-    let db_file = db_path(project, profile);
-    let mut db = Database::load_or_empty(&db_file);
+    let db_file = db_path(project);
+    let db = Database::load_or_empty(&db_file);
 
-    // drop records of tasks that no longer exist (e.g. a deleted source)
-    let live: HashSet<&PathBuf> = graph.tasks.iter().map(|t| &t.outputs[0]).collect();
-    db.tasks.retain(|key, _| live.contains(key));
+    // Keep records for tasks outside a selected target's closure. They remain
+    // useful if a later invocation builds the full project; stale records are
+    // harmless because only graph tasks are ever considered by the planner.
 
     let specs: Vec<CommandSpec> = graph
         .tasks
         .iter()
-        .map(|t| command_for(t, resolved, project))
+        .map(|t| command_for(t, project))
         .collect();
     // one identity per distinct compiler program (C and C++ may differ)
     let mut identities: std::collections::HashMap<&str, String> = Default::default();
@@ -363,5 +466,24 @@ pub fn prepare(
         specs,
         hashes,
         dirty,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_cl_gets_a_developer_prompt_hint() {
+        let missing = io::Error::new(io::ErrorKind::NotFound, "program not found");
+        for program in ["cl", "cl.exe", "C:/VS/bin/lib.exe"] {
+            assert!(
+                missing_program_hint(program, &missing).is_some(),
+                "{program}"
+            );
+        }
+        assert!(missing_program_hint("clang", &missing).is_none());
+        let denied = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        assert!(missing_program_hint("cl", &denied).is_none());
     }
 }

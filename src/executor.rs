@@ -1,4 +1,22 @@
-use std::{io, path::PathBuf, process::Command};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+/// Formats filesystem paths for native command-line tools. `canonicalize`
+/// returns Windows verbatim paths (`\\?\C:\...`), which many tools don't
+/// accept even though the Windows APIs do.
+pub fn path_arg(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        path.into_owned()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {

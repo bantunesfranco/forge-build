@@ -1,0 +1,11 @@
+{
+  "cmake": { "version": { "string": "3.26.2" } },
+  "objects": [
+    { "kind": "codemodel", "version": { "major": 2, "minor": 5 }, "jsonFile": "codemodel-v2-aaaa.json" }
+  ],
+  "reply": {
+    "client-stateless": {
+      "codemodel-v2": { "kind": "codemodel", "jsonFile": "codemodel-v2-aaaa.json" }
+    }
+  }
+}

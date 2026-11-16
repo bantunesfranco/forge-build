@@ -1,19 +1,25 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::{lang::Lang, project::Project};
+use crate::{
+    lang::Lang,
+    project::{BuildTarget, BuildTargetKind, Project},
+};
 
 pub type TaskId = usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskKind {
     Compile,
+    Archive,
     Link,
 }
 
 #[derive(Clone, Debug)]
 pub struct Task {
     pub kind: TaskKind,
+    /// Index into `Project::targets`: whose settings produce this task's command.
+    pub target: usize,
     /// Selects the compiler and standard. A compile task takes its source's
     /// language; a link task is C++ if any object is, so `libstdc++` gets linked.
     pub lang: Lang,
@@ -37,6 +43,10 @@ pub enum GraphError {
     DuplicateOutput { path: PathBuf },
     #[error("dependency cycle involving: {}", .0.join(", "))]
     Cycle(Vec<String>),
+    #[error("unknown target `{0}`")]
+    UnknownTarget(String),
+    #[error("`{0}` is a header-only library; it has nothing to build")]
+    NothingToBuild(String),
 }
 
 #[derive(Debug, Clone)]
@@ -87,35 +97,114 @@ impl Graph {
         })
     }
 
-    pub fn from_project(project: &Project, profile: &str) -> Result<Graph, GraphError> {
+    pub fn from_project(project: &Project) -> Result<Graph, GraphError> {
         let mut tasks = Vec::new();
-        let mut objects = Vec::new();
+        let index: HashMap<&str, usize> = project
+            .targets
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.name.as_str(), i))
+            .collect();
+        let output = |i: usize| project.target_output_path(&project.targets[i]);
 
-        for src in &project.sources {
-            let obj = project.object_path(profile, src);
-            let dep = project.depfile_path(profile, src);
-            tasks.push(Task {
-                kind: TaskKind::Compile,
-                lang: Lang::from_path(src).expect("discovered sources have a known language"),
-                inputs: vec![src.clone()],
-                implicit_inputs: vec![],
-                outputs: vec![obj.clone(), dep],
-            });
-            objects.push(obj);
+        let mut objects: Vec<Vec<PathBuf>> = vec![Vec::new(); project.targets.len()];
+        for (ti, target) in project.targets.iter().enumerate() {
+            for src in &target.sources {
+                let obj = project.target_object_path(&target.name, src);
+                tasks.push(Task {
+                    kind: TaskKind::Compile,
+                    target: ti,
+                    lang: Lang::from_path(src).expect("discovered sources have a known language"),
+                    inputs: vec![src.clone()],
+                    implicit_inputs: vec![],
+                    outputs: vec![obj.clone(), project.target_depfile_path(&target.name, src)],
+                });
+                objects[ti].push(obj);
+            }
         }
 
-        let any_cxx = project
-            .sources
-            .iter()
-            .any(|s| Lang::from_path(s) == Some(Lang::Cxx));
-        tasks.push(Task {
-            kind: TaskKind::Link,
-            lang: if any_cxx { Lang::Cxx } else { Lang::C },
-            inputs: objects,
-            implicit_inputs: project.library_files(),
-            outputs: vec![project.output_path(profile)],
-        });
+        for (ti, target) in project.targets.iter().enumerate() {
+            let has_cxx = |t: &BuildTarget| {
+                t.sources
+                    .iter()
+                    .any(|s| Lang::from_path(s) == Some(Lang::Cxx))
+            };
+            // The static libraries this target links, which are what its link
+            // (or archive) has to wait for.
+            let libs: Vec<usize> = target
+                .deps
+                .iter()
+                .filter_map(|d| index.get(d.as_str()).copied())
+                .filter(|&i| project.targets[i].kind == BuildTargetKind::StaticLibrary)
+                .collect();
+            match target.kind {
+                // Header-only: consumers compile it, nothing is built for it.
+                BuildTargetKind::Interface => {}
+                BuildTargetKind::StaticLibrary => {
+                    tasks.push(Task {
+                        kind: TaskKind::Archive,
+                        target: ti,
+                        lang: if has_cxx(target) { Lang::Cxx } else { Lang::C },
+                        inputs: objects[ti].clone(),
+                        // No implicit inputs: the archive does not contain its
+                        // dependencies' archives, only the link needs them.
+                        implicit_inputs: vec![],
+                        outputs: vec![output(ti)],
+                    });
+                }
+                BuildTargetKind::Binary => {
+                    // `libstdc++` has to be linked if any C++ object goes in.
+                    let any_cxx =
+                        has_cxx(target) || libs.iter().any(|&i| has_cxx(&project.targets[i]));
+                    // The libraries are on the command line through the link
+                    // arguments, so they are implicit inputs here, not inputs.
+                    let mut implicit_inputs: Vec<PathBuf> =
+                        libs.iter().map(|&i| output(i)).collect();
+                    implicit_inputs.extend(target.link_inputs.iter().cloned());
+                    tasks.push(Task {
+                        kind: TaskKind::Link,
+                        target: ti,
+                        lang: if any_cxx { Lang::Cxx } else { Lang::C },
+                        inputs: objects[ti].clone(),
+                        implicit_inputs,
+                        outputs: vec![output(ti)],
+                    });
+                }
+            }
+        }
         Graph::new(tasks)
+    }
+
+    /// Keep a target's task and its complete producer/dependency closure.
+    pub fn select_target(&self, project: &Project, name: &str) -> Result<Graph, GraphError> {
+        let target = project
+            .targets
+            .iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| GraphError::UnknownTarget(name.to_string()))?;
+        if target.kind == BuildTargetKind::Interface {
+            return Err(GraphError::NothingToBuild(name.to_string()));
+        }
+        let output = project.target_output_path(target);
+        let root = self
+            .tasks
+            .iter()
+            .position(|t| t.outputs.first() == Some(&output))
+            .ok_or_else(|| GraphError::UnknownTarget(name.to_string()))?;
+        let mut keep = std::collections::HashSet::new();
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            if keep.insert(id) {
+                stack.extend(self.deps(id).iter().copied());
+            }
+        }
+        Graph::new(
+            self.tasks
+                .iter()
+                .enumerate()
+                .filter_map(|(id, task)| keep.contains(&id).then_some(task.clone()))
+                .collect(),
+        )
     }
 
     pub fn deps(&self, id: TaskId) -> &[TaskId] {
@@ -142,6 +231,7 @@ impl Graph {
             let t = &self.tasks[id];
             let kind = match t.kind {
                 TaskKind::Compile => "compile",
+                TaskKind::Archive => "archive",
                 TaskKind::Link => "link",
             };
             for o in &t.outputs {
@@ -220,6 +310,7 @@ mod tests {
     fn task(ins: &[&str], outs: &[&str]) -> Task {
         Task {
             kind: TaskKind::Compile,
+            target: 0,
             lang: Lang::Cxx,
             implicit_inputs: vec![],
             inputs: ins.iter().map(PathBuf::from).collect(),

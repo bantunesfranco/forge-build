@@ -1,0 +1,17 @@
+[workspace]
+name    = "mixed-language"
+version = "0.1.0"
+c       = "11"
+cxx     = "20"
+
+[profile.debug]
+opt        = "none"
+debug_info = true
+
+[profile.release]
+opt        = "speed"
+debug_info = false
+
+[bin.mixed-language]
+sources = ["src/**/*.c", "src/**/*.cpp"]
+include = ["include"]

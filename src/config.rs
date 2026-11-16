@@ -1,15 +1,10 @@
-pub mod manifest;
+pub mod flat;
+pub mod key;
+pub mod schema;
 pub mod types;
+pub mod vocab;
 
 use std::path::{Path, PathBuf};
-use toml::{self};
-
-pub use manifest::Manifest;
-
-pub struct Config {
-    pub path: PathBuf,
-    pub content: Manifest,
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -25,7 +20,7 @@ pub enum ConfigError {
     },
     #[error("{field}: {message}")]
     Invalid { field: String, message: String },
-    #[error("could not find Forge.toml in {} or any parent directory", start.display())]
+    #[error("could not find project.toml in {} or any parent directory", start.display())]
     NotFound { start: PathBuf },
 }
 
@@ -38,7 +33,7 @@ impl ConfigError {
     }
 }
 
-const MANIFEST_NAME: &str = "Forge.toml";
+const MANIFEST_NAME: &str = "project.toml";
 
 pub fn find_manifest(explicit: Option<&Path>) -> Result<PathBuf, ConfigError> {
     if let Some(p) = explicit {
@@ -78,24 +73,78 @@ fn find_from(start: &Path) -> Option<PathBuf> {
     None
 }
 
-pub fn load(path: &PathBuf) -> Result<Config, ConfigError> {
+/// Reads and validates a spec 0.3 manifest.
+pub fn load(path: &Path) -> Result<schema::Manifest, ConfigError> {
     let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
         path: path.into(),
         source,
     })?;
-    let manifest = toml::from_str(text.as_str()).map_err(|source| ConfigError::Parse {
-        path: path.into(),
-        source,
-    })?;
-    Ok(Config {
-        path: path.into(),
-        content: manifest,
-    })
+    let table = flat::parse_flat(&text)
+        .map_err(|e| ConfigError::invalid(format!("{}:{}", path.display(), e.line), e.message))?;
+    schema::parse_manifest(table)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    Warning,
+    Info,
+}
+
+/// Non-fatal messages collected while configuring; printed as `warning: ...`
+/// and `info: ...`.
+#[derive(Debug, Default)]
+pub struct Diagnostics {
+    pub items: Vec<(Level, String)>,
+}
+
+impl Diagnostics {
+    pub fn warn(&mut self, message: impl Into<String>) {
+        self.items.push((Level::Warning, message.into()));
+    }
+
+    pub fn info(&mut self, message: impl Into<String>) {
+        self.items.push((Level::Info, message.into()));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_reports_path_and_line_for_syntax_errors() {
+        let (_t, r) = tree();
+        std::fs::write(r.join("project.toml"), "[workspace]\nname = \n").unwrap();
+        let e = load(&r.join("project.toml")).unwrap_err().to_string();
+        assert!(e.contains("project.toml:2"), "{e}");
+    }
+
+    #[test]
+    fn load_parses_a_valid_file() {
+        let (_t, r) = tree();
+        std::fs::write(
+            r.join("project.toml"),
+            "[workspace]\nname = \"a\"\nversion = \"1\"\n[bin.a]\nsources = [\"a.c\"]\n",
+        )
+        .unwrap();
+        let m = load(&r.join("project.toml")).unwrap();
+        assert_eq!(m.workspace.name, "a");
+        assert!(m.targets.contains_key("a"));
+    }
+
+    #[test]
+    fn diagnostics_collect_in_order() {
+        let mut d = Diagnostics::default();
+        d.warn("w");
+        d.info("i");
+        assert_eq!(
+            d.items,
+            [
+                (Level::Warning, "w".to_string()),
+                (Level::Info, "i".to_string())
+            ]
+        );
+    }
 
     fn tree() -> (tempfile::TempDir, PathBuf) {
         let t = tempfile::tempdir().unwrap();
@@ -107,22 +156,25 @@ mod tests {
     #[test]
     fn finds_manifest_in_parent() {
         let (_t, r) = tree();
-        std::fs::write(r.join("a/Forge.toml"), "").unwrap();
-        assert_eq!(find_from(&r.join("a/b/c")), Some(r.join("a/Forge.toml")));
+        std::fs::write(r.join("a/project.toml"), "").unwrap();
+        assert_eq!(find_from(&r.join("a/b/c")), Some(r.join("a/project.toml")));
     }
 
     #[test]
     fn nearest_manifest_wins() {
         let (_t, r) = tree();
-        std::fs::write(r.join("a/Forge.toml"), "").unwrap();
-        std::fs::write(r.join("a/b/Forge.toml"), "").unwrap();
-        assert_eq!(find_from(&r.join("a/b/c")), Some(r.join("a/b/Forge.toml")));
+        std::fs::write(r.join("a/project.toml"), "").unwrap();
+        std::fs::write(r.join("a/b/project.toml"), "").unwrap();
+        assert_eq!(
+            find_from(&r.join("a/b/c")),
+            Some(r.join("a/b/project.toml"))
+        );
     }
 
     #[test]
     fn git_directory_stops_the_search() {
         let (_t, r) = tree();
-        std::fs::write(r.join("Forge.toml"), "").unwrap();
+        std::fs::write(r.join("project.toml"), "").unwrap();
         std::fs::create_dir(r.join("a/.git")).unwrap();
         assert_eq!(find_from(&r.join("a/b/c")), None);
     }
@@ -130,10 +182,10 @@ mod tests {
     #[test]
     fn explicit_directory_resolves_to_its_manifest() {
         let (_t, r) = tree();
-        std::fs::write(r.join("a/Forge.toml"), "").unwrap();
+        std::fs::write(r.join("a/project.toml"), "").unwrap();
         assert_eq!(
             find_manifest(Some(&r.join("a"))).unwrap(),
-            r.join("a/Forge.toml")
+            r.join("a/project.toml")
         );
     }
 
@@ -141,6 +193,6 @@ mod tests {
     fn explicit_directory_without_manifest_is_an_error() {
         let (_t, r) = tree();
         let e = find_manifest(Some(&r.join("a"))).unwrap_err().to_string();
-        assert!(e.contains("Forge.toml"), "{e}");
+        assert!(e.contains("project.toml"), "{e}");
     }
 }

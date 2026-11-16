@@ -1,0 +1,123 @@
+[workspace]
+name     = "ft_vox"
+version  = "1.0.0"
+c        = "11"
+cxx      = "20"
+warnings = "high"
+defines.public.windows = ["NOMINMAX", "WIN32_LEAN_AND_MEAN"]
+
+[option.simd]
+type          = "enum"
+values        = ["none", "sse42", "avx", "avx2", "neon"]
+default       = "avx2"
+default.arm64 = "neon"
+
+[option.werror]
+type    = "bool"
+default = true
+
+[feature.simd.avx2]
+when           = { arch = "x86_64" }
+defines.public = ["GLM_FORCE_AVX2"]
+flags.public.msvc_like = ["/arch:AVX2"]
+flags.public.gcc_like  = ["-mavx2", "-mfma"]
+
+[feature.simd.neon]
+when = { arch = "arm64" }
+
+[feature.simd.none]
+
+[feature.opengl_deprecation]
+defines.public.macos = ["GL_SILENCE_DEPRECATION"]
+
+[profile.debug]
+opt        = "speed"
+debug_info = true
+
+[profile.release]
+opt        = "max"
+lto        = true
+defines    = ["NDEBUG"]
+
+[lib.engine]
+root           = "engine"
+sources        = ["srcs/**/*.cpp"]
+include.public = ["incs"]
+deps.public    = ["glad", "glfw", "glm", "stb"]
+system.public  = ["opengl", "threads"]
+defines.public = ["GLM_FORCE_INLINE", "GLM_ENABLE_EXPERIMENTAL"]
+features       = ["opengl_deprecation"]
+
+[lib.net]
+root           = "server"
+sources        = ["srcs/**/*.cpp"]
+include.public = ["incs"]
+system.public  = ["threads", "sockets"]
+defines.public.windows = ["_WIN32_WINNT=0x0A00"]
+
+[bin.ft_vox]
+sources            = ["srcs/**/*.cpp"]
+include            = ["incs"]
+deps               = ["engine", "net", "imgui"]
+warnings_as_errors = "${option.werror}"
+defines.windows    = ["_CRT_SECURE_NO_WARNINGS"]
+
+[dependency.glm]
+git      = "https://github.com/g-truc/glm"
+rev      = "1.0.2"
+kind     = "header-only"
+features = ["simd"]
+
+[dependency.stb]
+git  = "https://github.com/nothings/stb"
+rev  = "master"
+kind = "header-only"
+
+[dependency.glad]
+path           = "engine/vendor/glad"
+kind           = "sources"
+files          = ["src/glad.c"]
+include.public = ["include"]
+system         = ["dl"]
+
+[dependency.glfw]
+git     = "https://github.com/glfw/glfw"
+rev     = "3.4"
+kind    = "cmake"
+options = { GLFW_BUILD_EXAMPLES = false, GLFW_BUILD_TESTS = false,
+            GLFW_BUILD_DOCS = false, GLFW_INSTALL = false,
+            BUILD_SHARED_LIBS = false }
+options.linux = { GLFW_BUILD_X11 = true, GLFW_BUILD_WAYLAND = false }
+expose  = { target = "glfw" }
+
+[dependency.imgui]
+git            = "https://github.com/ocornut/imgui"
+rev            = "v1.93.0"
+kind           = "sources"
+files          = ["imgui.cpp", "imgui_draw.cpp", "imgui_tables.cpp",
+                  "imgui_widgets.cpp", "imgui_demo.cpp",
+                  "backends/imgui_impl_glfw.cpp",
+                  "backends/imgui_impl_opengl3.cpp"]
+include.public = [".", "backends"]
+deps.public    = ["glfw"]
+system.public  = ["opengl"]
+
+# Example of a prebuilt dependency with aliases (vcpkg-style layout):
+#   vendor/foo/lib/x64-windows/release/foo.lib
+#   vendor/foo/lib/aarch64-osx/debug/libfoo.a
+#
+[dependency.foo]
+path    = "vendor/foo"
+kind    = "prebuilt"
+lib_dir = "lib/${arch}-${os}/${profile}"
+libs    = ["foo"]
+alias   = { arch = { x86_64 = "x64", arm64 = "aarch64" },
+            os   = { macos = "osx" } }
+#
+# Go-style layout (vendor/bar/windows_amd64):
+#
+[dependency.bar]
+path    = "vendor/bar"
+kind    = "prebuilt"
+lib_dir = "${os}_${arch}"
+alias   = { arch = { x86_64 = "amd64" } }

@@ -1,14 +1,23 @@
-use clap::{Parser, Subcommand};
-use std::{env::current_dir, fs, num::NonZeroUsize, path::PathBuf};
+use clap::{ArgAction, Parser, Subcommand};
+use std::{
+    env::current_dir,
+    fs,
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+};
 
 use crate::{
-    build::{BuildOptions, BuildPlan, build, prepare},
-    config::{find_manifest, load},
-    executor::ProcessExecutor,
-    explain::explain,
+    build::{BuildOptions, build},
+    config::{self, ConfigError, Diagnostics, Level, find_manifest},
+    configure::{
+        model::Invocation,
+        options::{cache_path, load_cache, parse_cli_opt, save_cache},
+    },
+    deps::{self, Phase, prepare_all},
+    executor::{Executor, ProcessExecutor},
+    explain::explain_arg,
     graph::Graph,
     project::Project,
-    resolve::{Resolved, resolve},
 };
 
 #[derive(Parser)]
@@ -17,9 +26,23 @@ struct Cli {
     #[arg(short, long, global = true)]
     manifest: Option<PathBuf>,
 
-    /// Build profile (default: the manifest's default_profile)
+    /// Build profile (default: debug)
     #[arg(short, long, global = true)]
     profile: Option<String>,
+
+    /// Set an option declared in the manifest; repeatable. Saved in the build directory's options.toml.
+    #[arg(long = "opt", value_name = "NAME=VALUE", global = true, action = ArgAction::Append)]
+    opt: Vec<String>,
+
+    /// Build for this platform instead of the host (`<arch>-<os>`, e.g. arm64-macos).
+    /// Output goes to build/<arch>-<os>/<profile>.
+    // Named apart from the positional `target` of build, graph and explain.
+    #[arg(long = "target", value_name = "ARCH-OS", global = true)]
+    platform_target: Option<String>,
+
+    /// A toolchain file naming the compilers (`[toolchain]` with c, cxx, ar)
+    #[arg(long, value_name = "FILE", global = true)]
+    toolchain: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -28,6 +51,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Build {
+        /// Build this target and its dependency closure (default: all targets).
+        target: Option<String>,
         #[arg(short, long)]
         jobs: Option<NonZeroUsize>,
         #[arg(short, long)]
@@ -38,56 +63,126 @@ enum Commands {
         all: bool,
     },
     Graph {
+        /// Show this target and its dependency closure (default: all targets).
+        target: Option<String>,
         #[arg(long)]
         dot: bool,
     },
-    Explain {
-        target: Option<PathBuf>,
+    /// Show what build would do. With a lib, bin or dependency name: its merged
+    /// configuration and where each value came from. With a path: why that
+    /// file is rebuilt. With nothing: one line per task.
+    Explain { target: Option<PathBuf> },
+    /// Resolve git dependencies again and rewrite project.lock.
+    Update {
+        /// Update only this git dependency (default: all of them).
+        dep: Option<String>,
     },
+}
+
+/// Prints what configure had to say, before any command runs.
+fn print_diagnostics(diagnostics: &Diagnostics) {
+    for (level, message) in &diagnostics.items {
+        match level {
+            Level::Warning => eprintln!("warning: {message}"),
+            Level::Info => eprintln!("info: {message}"),
+        }
+    }
+}
+
+/// Whether a command needs its dependencies fetched and found (spec 11 step
+/// 7). `clean` only needs the build layout, so it works offline and without a
+/// system package installed.
+fn needs_dependencies(command: Option<&Commands>) -> bool {
+    !matches!(command, Some(Commands::Clean { .. }))
+}
+
+/// Loads the project for this invocation. `--opt` values are written to the
+/// option cache once configure accepted them, so later runs reuse them.
+fn load_project(
+    manifest: &Path,
+    args: &Cli,
+    exec: &dyn Executor,
+) -> Result<Project, Box<dyn std::error::Error>> {
+    let prepare = needs_dependencies(args.command.as_ref());
+    let options = args
+        .opt
+        .iter()
+        .map(|o| parse_cli_opt(o).map_err(|m| ConfigError::invalid("--opt", m)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let inv = Invocation {
+        profile: args.profile.clone(),
+        options,
+        target: args.platform_target.clone(),
+        toolchain: args.toolchain.clone(),
+    };
+    let project = if prepare {
+        Project::load(manifest, &inv, exec)?
+    } else {
+        Project::load_unprepared(manifest, &inv, exec)?
+    };
+    if !inv.options.is_empty() {
+        let target = project
+            .target_override
+            .then_some((project.platform.os, project.platform.arch));
+        let path = cache_path(&project.root, target);
+        let mut cache = load_cache(&path)?;
+        cache.extend(inv.options.iter().cloned());
+        // An entry for an option the manifest does not declare is dropped.
+        cache.retain(|name, _| project.configured.options.contains_key(name));
+        save_cache(&path, &cache).map_err(|source| ConfigError::Io { path, source })?;
+    }
+    Ok(project)
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Cli = Cli::parse();
     let manifest: PathBuf = find_manifest(args.manifest.as_deref())?;
-    let mut project: Project = Project::from_config(load(&manifest)?)?;
-    let profile: String = project.select_profile(args.profile.as_deref())?;
+    if let Some(Commands::Update { dep }) = &args.command {
+        return update(&manifest, dep.as_deref());
+    }
+    let mut project: Project = load_project(&manifest, &args, &ProcessExecutor)?;
+    print_diagnostics(&project.diagnostics);
 
     match args.command {
-        Some(Commands::Build { jobs, verbose }) => {
+        Some(Commands::Build {
+            target,
+            jobs,
+            verbose,
+        }) => {
             let opts = BuildOptions {
                 jobs: jobs.map_or_else(|| BuildOptions::default().jobs, |j| j.get()),
                 verbose,
             };
 
-            crate::dependencies::prepare(&mut project, &profile, opts.jobs)?;
-            let graph: Graph = Graph::from_project(&project, &profile)?;
-            let resolved: Resolved = resolve(&project, &profile)?;
+            // Whatever needs the network or a build system happens now; the
+            // local kinds were prepared when the project was loaded.
+            prepare_all(&mut project, Phase::Build, &ProcessExecutor, opts.jobs)?;
+            project.rebuild_targets()?;
 
-            match build(
-                &project,
-                &graph,
-                &resolved,
-                &ProcessExecutor,
-                &profile,
-                opts,
-            ) {
+            let mut graph: Graph = Graph::from_project(&project)?;
+            if let Some(name) = target.as_deref() {
+                graph = graph.select_target(&project, name)?;
+            }
+
+            match build(&project, &graph, &ProcessExecutor, opts) {
                 Ok(_) => println!("Build successful"),
                 Err(e) => return Err(Box::new(e)),
             }
         }
-        Some(Commands::Graph { dot }) => {
-            let graph: Graph = Graph::from_project(&project, &profile)?;
+        Some(Commands::Graph { target, dot }) => {
+            let mut graph: Graph = Graph::from_project(&project)?;
+            if let Some(name) = target.as_deref() {
+                graph = graph.select_target(&project, name)?;
+            }
             println!("{}", graph.render(dot));
         }
         Some(Commands::Clean { all }) => {
-            let mut dir: PathBuf = project.build_dir(&profile);
-            if all {
-                if let Some(parent) = dir.parent() {
-                    dir = parent.to_path_buf();
-                } else {
-                    return Err("Could not find the root build directory".into());
-                }
-            }
+            // `--all` removes every profile and every target.
+            let dir: PathBuf = if all {
+                project.build_root()
+            } else {
+                project.build_dir()
+            };
 
             let abs = project.root.join(&dir);
 
@@ -101,19 +196,232 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Some(Commands::Explain { target }) => {
-            let graph: Graph = Graph::from_project(&project, &profile)?;
-            let resolved: Resolved = resolve(&project, &profile)?;
-            let plan: BuildPlan = prepare(&graph, &project, &resolved, &ProcessExecutor, &profile);
+            // A unit name prints its configuration, anything else is a path.
             let cwd: PathBuf = current_dir().unwrap();
-            match explain(&graph, &plan, target.as_deref(), &project.root, &cwd) {
-                Ok(str) => {
-                    println!("{}", str)
-                }
-                Err(e) => return Err(Box::new(e)),
-            }
+            let text = explain_arg(&project, target.as_deref(), &cwd, &ProcessExecutor)?;
+            println!("{}", text)
         }
-        None => {}
+        Some(Commands::Update { .. }) | None => {}
     }
 
     Ok(())
+}
+
+/// `forge update`: needs the manifest only, so no compiler has to be found.
+fn update(manifest: &Path, dep: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let m = config::load(manifest)?;
+    let root = match manifest.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let mut diagnostics = Diagnostics::default();
+    let result = deps::update(root, &m, dep, &mut diagnostics);
+    print_diagnostics(&diagnostics);
+    result?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        configure::options::OptionSource,
+        executor::{CommandSpec, Outcome},
+    };
+    use std::io;
+
+    /// Answers every command with a clang `--version`.
+    struct Clang;
+    impl Executor for Clang {
+        fn run(&self, _: &CommandSpec) -> io::Result<Outcome> {
+            Ok(Outcome {
+                code: Some(0),
+                stdout: "clang version 17.0.0\n".into(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    const MANIFEST: &str = concat!(
+        "[workspace]\nname = \"t\"\nversion = \"1\"\nc = \"17\"\n",
+        "[option.level]\ntype = \"enum\"\nvalues = [\"low\", \"high\"]\ndefault = \"low\"\n",
+        "[bin.app]\nsources = [\"a.c\"]\n",
+    );
+
+    fn cli(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("forge").chain(args.iter().copied())).unwrap()
+    }
+
+    fn project_dir() -> (tempfile::TempDir, PathBuf) {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().canonicalize().unwrap();
+        fs::write(root.join("a.c"), "").unwrap();
+        fs::write(root.join("project.toml"), MANIFEST).unwrap();
+        (t, root)
+    }
+
+    #[test]
+    fn opt_flag_is_saved_to_cache_and_reused() {
+        let (_t, root) = project_dir();
+        let manifest = root.join("project.toml");
+        let level = |p: &Project| p.configured.options["level"].clone();
+
+        let p = load_project(&manifest, &cli(&["--opt", "level=high"]), &Clang).unwrap();
+        assert_eq!(level(&p).value.to_string(), "high");
+        assert_eq!(level(&p).source, OptionSource::Cli);
+        let cache = fs::read_to_string(cache_path(&root, None)).unwrap();
+        assert!(cache.contains("level = \"high\""), "{cache}");
+
+        // no `--opt` this time: the cached value is used
+        let p = load_project(&manifest, &cli(&[]), &Clang).unwrap();
+        assert_eq!(level(&p).value.to_string(), "high");
+        assert_eq!(level(&p).source, OptionSource::Cache);
+
+        // a new value replaces the cached one
+        let p = load_project(&manifest, &cli(&["--opt", "level=low"]), &Clang).unwrap();
+        assert_eq!(level(&p).value.to_string(), "low");
+        let cache = fs::read_to_string(cache_path(&root, None)).unwrap();
+        assert!(
+            cache.contains("level = \"low\"") && !cache.contains("high"),
+            "{cache}"
+        );
+    }
+
+    #[test]
+    fn a_rejected_opt_is_not_saved() {
+        let (_t, root) = project_dir();
+        let e = load_project(
+            &root.join("project.toml"),
+            &cli(&["--opt", "level=medium"]),
+            &Clang,
+        )
+        .err()
+        .expect("medium is not a value")
+        .to_string();
+        assert!(e.contains("level"), "{e}");
+        assert!(!cache_path(&root, None).exists());
+    }
+
+    #[test]
+    fn update_needs_no_compiler_and_rejects_unknown_names() {
+        let (_t, root) = project_dir();
+        let manifest = root.join("project.toml");
+        // No git dependency: nothing to do, nothing written.
+        update(&manifest, None).unwrap();
+        assert!(!root.join("project.lock").exists());
+        let e = update(&manifest, Some("glm")).unwrap_err().to_string();
+        assert!(
+            e.contains("glm") && e.contains("not a git dependency"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn only_clean_skips_the_dependencies() {
+        for (args, want) in [
+            (&["clean"][..], false),
+            (&["clean", "--all"], false),
+            (&["build"], true),
+            (&["graph"], true),
+            (&["explain"], true),
+            (&[], true),
+        ] {
+            assert_eq!(
+                needs_dependencies(cli(args).command.as_ref()),
+                want,
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clean_loads_a_project_whose_dependency_is_missing() {
+        let (_t, root) = project_dir();
+        let manifest = concat!(
+            "[workspace]\nname = \"t\"\nversion = \"1\"\nc = \"17\"\n",
+            "[dependency.p]\npath = \"vendor/p\"\nkind = \"prebuilt\"\nlibs = [\"p\"]\n",
+            "[bin.app]\nsources = [\"a.c\"]\ndeps = [\"p\"]\n",
+        );
+        fs::write(root.join("project.toml"), manifest).unwrap();
+        fs::create_dir_all(root.join("vendor/p")).unwrap();
+        let path = root.join("project.toml");
+        let e = load_project(&path, &cli(&["build"]), &Clang)
+            .err()
+            .expect("the library file is missing")
+            .to_string();
+        assert!(e.contains("dependency.p"), "{e}");
+        load_project(&path, &cli(&["clean"]), &Clang).unwrap();
+    }
+
+    #[test]
+    fn a_malformed_opt_is_an_error() {
+        let (_t, root) = project_dir();
+        let e = load_project(
+            &root.join("project.toml"),
+            &cli(&["--opt", "level"]),
+            &Clang,
+        )
+        .err()
+        .expect("no value")
+        .to_string();
+        assert!(e.contains("--opt"), "{e}");
+    }
+
+    #[test]
+    fn target_and_toolchain_are_global_flags() {
+        // `--target` coexists with the positional target of `build`, before
+        // or after the subcommand.
+        let a = cli(&["--target", "arm64-macos", "build", "app"]);
+        assert_eq!(a.platform_target.as_deref(), Some("arm64-macos"));
+        let Some(Commands::Build { target, .. }) = a.command else {
+            panic!("expected build");
+        };
+        assert_eq!(target.as_deref(), Some("app"));
+
+        let a = cli(&[
+            "build",
+            "app",
+            "--target",
+            "x86_64-linux",
+            "--toolchain",
+            "t.toml",
+        ]);
+        assert_eq!(a.platform_target.as_deref(), Some("x86_64-linux"));
+        assert_eq!(a.toolchain, Some(PathBuf::from("t.toml")));
+        assert!(cli(&["graph"]).platform_target.is_none());
+    }
+
+    #[test]
+    fn only_one_axis_is_rejected() {
+        let (_t, root) = project_dir();
+        let e = load_project(
+            &root.join("project.toml"),
+            &cli(&["--target", "arm64"]),
+            &Clang,
+        )
+        .err()
+        .expect("one axis is not a target")
+        .to_string();
+        assert!(e.contains("<arch>-<os>"), "{e}");
+    }
+
+    #[test]
+    fn target_and_toolchain_reach_the_project() {
+        let (_t, root) = project_dir();
+        fs::write(
+            root.join("tc.toml"),
+            "[toolchain]\nc = \"my-cc\"\ncxx = \"my-c++\"\n",
+        )
+        .unwrap();
+        let a = cli(&[
+            "--target",
+            "arm64-macos",
+            "--toolchain",
+            root.join("tc.toml").to_str().unwrap(),
+        ]);
+        let p = load_project(&root.join("project.toml"), &a, &Clang).unwrap();
+        assert_eq!(p.toolchains.c, "my-cc");
+        assert_eq!(p.build_dir(), PathBuf::from("build/arm64-macos/debug"));
+        assert_eq!(p.build_root(), PathBuf::from("build"));
+    }
 }
