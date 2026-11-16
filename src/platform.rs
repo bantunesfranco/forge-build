@@ -167,6 +167,7 @@ pub fn llvm_triple(os: Os, arch: Arch) -> String {
     };
     let os_part = match os {
         Os::Windows => "pc-windows-msvc",
+        Os::Linux if arch == Arch::Arm => "unknown-linux-gnueabihf",
         Os::Linux => "unknown-linux-gnu",
         Os::Macos => "apple-macos",
         Os::Bsd => "unknown-freebsd",
@@ -410,6 +411,10 @@ mod tests {
             "aarch64-unknown-linux-gnu"
         );
         assert_eq!(llvm_triple(Os::Windows, Arch::X86), "i686-pc-windows-msvc");
+        assert_eq!(
+            llvm_triple(Os::Linux, Arch::Arm),
+            "armv7-unknown-linux-gnueabihf"
+        );
     }
 
     #[test]

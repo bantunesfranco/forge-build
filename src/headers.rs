@@ -5,7 +5,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use crate::{config::vocab::Compiler, depfile::parse_depfile};
+use crate::{config::vocab::Compiler, depfile::parse_depfile, executor::path_arg};
 
 /// Normalizes a path from a depfile:
 /// * `./` and `x/../` segments are removed lexically,
@@ -14,13 +14,32 @@ use crate::{config::vocab::Compiler, depfile::parse_depfile};
 pub fn normalize(root: &Path, raw: &str) -> PathBuf {
     let p = Path::new(raw);
     if p.is_absolute() {
-        match p.strip_prefix(root) {
-            Ok(rel) => clean(rel),
-            Err(_) => clean(p),
+        match strip_root(p, root) {
+            Some(rel) => clean(&rel),
+            None => clean(p),
         }
     } else {
         clean(p)
     }
+}
+
+/// `p` relative to `root`, if it lies inside it. On Windows the comparison
+/// ignores case and the `\\?\` prefix: MSVC writes absolute, lowercased paths,
+/// while the root is canonical.
+fn strip_root(p: &Path, root: &Path) -> Option<PathBuf> {
+    if let Ok(rel) = p.strip_prefix(root) {
+        return Some(rel.to_path_buf());
+    }
+    if !cfg!(windows) {
+        return None;
+    }
+    let (p, root) = (path_arg(p), path_arg(root));
+    let (p, root) = (p.replace('/', "\\"), root.replace('/', "\\"));
+    let root = root.trim_end_matches('\\');
+    let head = p.get(..root.len())?;
+    let rest = p.get(root.len()..)?;
+    (head.eq_ignore_ascii_case(root) && rest.starts_with('\\'))
+        .then(|| PathBuf::from(rest.trim_start_matches('\\')))
 }
 
 fn clean(p: &Path) -> PathBuf {
@@ -156,6 +175,27 @@ mod tests {
         assert_eq!(
             n(&abs("/proj"), &abs("/proj/include/a.hpp")),
             PathBuf::from("include/a.hpp")
+        );
+    }
+
+    #[test]
+    fn windows_paths_match_the_root_ignoring_case_and_verbatim_prefix() {
+        if !cfg!(windows) {
+            return;
+        }
+        // cl writes `c:\users\...`; the canonical root is `\\?\C:\Users\...`.
+        assert_eq!(
+            n(r"\\?\C:\Users\Me\proj", r"c:\users\me\proj\include\a.hpp"),
+            PathBuf::from(r"include\a.hpp")
+        );
+        assert_eq!(
+            n(r"C:\proj", r"c:/proj/include/a.hpp"),
+            PathBuf::from("include/a.hpp")
+        );
+        // Whole components only, still.
+        assert_eq!(
+            n(r"C:\proj", r"c:\project\a.h"),
+            PathBuf::from(r"c:\project\a.h")
         );
     }
 
