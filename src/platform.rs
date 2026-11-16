@@ -226,6 +226,38 @@ pub struct Toolchains {
     pub ar: Option<String>,
 }
 
+impl Toolchains {
+    /// Neither compiler was named by a toolchain file, `CC`/`CXX` or the user
+    /// file: both are the platform's default driver.
+    fn default_compilers(&self) -> bool {
+        let (c, cxx) = if cfg!(windows) {
+            ("cl", "cl")
+        } else {
+            ("cc", "c++")
+        };
+        self.c == c && self.cxx == cxx
+    }
+}
+
+/// gcc and MSVC choose their target by which compiler is run, not by a flag.
+/// A cross build that names no compiler (no `--toolchain`, no `CC`/`CXX`) would
+/// silently build for the host, so say so.
+pub fn cross_compile_warning(
+    target: &str,
+    compiler: Compiler,
+    toolchain_given: bool,
+    toolchains: &Toolchains,
+) -> Option<String> {
+    let by_flag = !matches!(compiler, Compiler::Gcc | Compiler::Msvc);
+    if by_flag || toolchain_given || !toolchains.default_compilers() {
+        return None;
+    }
+    Some(format!(
+        "--target {target}: {} cannot cross-compile by flag; name a cross compiler with --toolchain",
+        compiler.as_str()
+    ))
+}
+
 /// Precedence per field: explicit file > environment > user file > default.
 fn pick_toolchains(
     explicit: Option<UserToolchain>,
@@ -340,6 +372,30 @@ mod tests {
         assert!(check_combination(&pf(Os::Linux, Arch::Arm64, Compiler::Clang)).is_ok());
         assert!(check_combination(&pf(Os::Windows, Arch::X86_64, Compiler::Msvc)).is_ok());
         assert!(check_combination(&pf(Os::Macos, Arch::Arm64, Compiler::AppleClang)).is_ok());
+    }
+
+    #[test]
+    fn gcc_and_msvc_cross_builds_without_a_toolchain_warn() {
+        let defaults = pick_toolchains(None, &|_| None, UserToolchain::default());
+        let named = pick_toolchains(None, &|_| Some("x-gcc".into()), UserToolchain::default());
+        let warn = |compiler, given, t: &Toolchains| {
+            cross_compile_warning("arm64-linux", compiler, given, t)
+        };
+        let w = warn(Compiler::Gcc, false, &defaults).unwrap();
+        assert_eq!(
+            w,
+            "--target arm64-linux: gcc cannot cross-compile by flag; name a cross compiler with --toolchain"
+        );
+        assert!(
+            warn(Compiler::Msvc, false, &defaults)
+                .unwrap()
+                .contains("msvc")
+        );
+        assert!(warn(Compiler::Gcc, true, &defaults).is_none());
+        assert!(warn(Compiler::Gcc, false, &named).is_none());
+        for flagged in [Compiler::Clang, Compiler::AppleClang, Compiler::ClangCl] {
+            assert!(warn(flagged, false, &defaults).is_none(), "{flagged:?}");
+        }
     }
 
     #[test]

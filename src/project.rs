@@ -23,7 +23,8 @@ use crate::{
     headers::DepFormat,
     lang::Lang,
     platform::{
-        Toolchains, check_combination, detect_compiler, host_os_arch, load_toolchains, parse_target,
+        Toolchains, check_combination, cross_compile_warning, detect_compiler, host_os_arch,
+        load_toolchains, parse_target,
     },
 };
 
@@ -183,7 +184,18 @@ impl Project {
         )
         .map_err(|m| ConfigError::invalid("archiver", m))?;
 
-        let diagnostics = std::mem::take(&mut configured.diagnostics);
+        let mut diagnostics = std::mem::take(&mut configured.diagnostics);
+        if let Some(target) = inv.target.as_deref()
+            && host_os_arch().is_ok_and(|host| host != (platform.os, platform.arch))
+            && let Some(warning) = cross_compile_warning(
+                target,
+                platform.compiler,
+                inv.toolchain.is_some(),
+                &toolchains,
+            )
+        {
+            diagnostics.warn(warning);
+        }
         let mut project = Project {
             root,
             profile: configured.profile.clone(),

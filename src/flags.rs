@@ -152,11 +152,11 @@ fn profile_defines(c: &Configured) -> Vec<Define> {
 }
 
 /// `--target=<triple>` for the compilers that choose their target by flag
-/// (clang, clang-cl), when the build is for a platform other than the host's.
-/// gcc, Apple clang and MSVC get their cross compilers from the toolchain file.
+/// (clang, Apple clang, clang-cl), when the build is for a platform other than
+/// the host's. gcc and MSVC get their cross compilers from the toolchain file.
 pub fn target_arg(c: &Configured) -> Option<String> {
     match c.platform.compiler {
-        Compiler::Clang | Compiler::ClangCl => {
+        Compiler::Clang | Compiler::AppleClang | Compiler::ClangCl => {
             c.cross_triple.as_ref().map(|t| format!("--target={t}"))
         }
         _ => None,
@@ -1033,7 +1033,7 @@ sources = [\"m.c\"]
     }
 
     #[test]
-    fn cross_triple_only_for_clang_and_clang_cl() {
+    fn cross_triple_only_for_the_clang_family() {
         let src = "[workspace]\nc = \"11\"\n[bin.m]\nsources = [\"m.c\"]\n";
         let t = tempfile::tempdir().unwrap();
         let root = t.path().canonicalize().unwrap();
@@ -1056,7 +1056,7 @@ sources = [\"m.c\"]
             (linux(Compiler::Clang), true),
             (windows(Compiler::ClangCl), true),
             (linux(Compiler::Gcc), false),
-            (plat(Os::Macos, Compiler::AppleClang), false),
+            (plat(Os::Macos, Compiler::AppleClang), true),
             (windows(Compiler::Msvc), false),
         ] {
             let c = cross(platform);
@@ -1067,7 +1067,7 @@ sources = [\"m.c\"]
             assert_eq!(compile.contains(&want), expect, "{platform:?}: {compile:?}");
             assert_eq!(profile.contains(&want), expect, "{platform:?}: {profile:?}");
             // clang-cl's link line is linker options: the triple goes before `/link`.
-            let in_link = expect && platform.compiler == Compiler::Clang;
+            let in_link = expect && platform.compiler != Compiler::ClangCl;
             assert_eq!(link.contains(&want), in_link, "{platform:?}: {link:?}");
             assert_eq!(target_arg(&c).is_some(), expect);
         }
