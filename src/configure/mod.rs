@@ -17,7 +17,7 @@ use crate::config::{
     ConfigError, Diagnostics,
     key::{Key, Visibility},
     schema::{DepSource, DependencyDecl, Entry, Manifest, Table, TargetKind},
-    types::{Define, DepKind, Opt, check_flag},
+    types::{Define, DepKind, LibKind, Opt, check_flag},
     vocab::{Os, Platform},
 };
 use crate::discover::{check_patterns, discover_globs};
@@ -344,6 +344,42 @@ fn ensure_ndebug(merged: &mut Merged, profile: &str) {
         });
 }
 
+/// The base of a shared library's export macros: the target name upper-cased
+/// with every character that is not a letter or digit replaced by `_` (spec 6.5).
+fn export_macro_base(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// A shared library defines `<NAME>_SHARED` publicly (its own sources and every
+/// consumer) and `<NAME>_BUILDING` privately (spec 6.5). Added to the merged
+/// lists so `explain` can show where they came from.
+fn add_export_defines(merged: &mut Merged, name: &str) {
+    let base = export_macro_base(name);
+    for (vis, suffix) in [
+        (Visibility::Public, "SHARED"),
+        (Visibility::Private, "BUILDING"),
+    ] {
+        merged
+            .lists
+            .entry(("defines".to_string(), vis))
+            .or_default()
+            .push(Sourced {
+                value: toml::Value::String(format!("{base}_{suffix}")),
+                origin: format!("lib.{name}"),
+                raw_key: "kind = \"shared\"".to_string(),
+                template: None,
+            });
+    }
+}
+
 // ---------------------------------------------------------------- configure
 
 /// What every unit's merge needs.
@@ -556,6 +592,13 @@ pub fn configure(
         if !profile_scalars.asserts {
             ensure_ndebug(&mut merged, &profile);
         }
+        let lib_kind = match decl.kind {
+            TargetKind::Lib => scalar_enum::<LibKind>(&merged, "kind")?.unwrap_or(LibKind::Static),
+            TargetKind::Bin => LibKind::Static,
+        };
+        if lib_kind == LibKind::Shared {
+            add_export_defines(&mut merged, name);
+        }
 
         let base = match scalar_string(&merged, "root")? {
             Some(r) => root.join(r),
@@ -606,7 +649,15 @@ pub fn configure(
                 return Err(ConfigError::invalid(origin, "a bin needs `sources`"));
             }
             (TargetKind::Bin, false) => UnitKind::Bin,
+            (TargetKind::Lib, false) if lib_kind == LibKind::Shared => UnitKind::SharedLib,
             (TargetKind::Lib, false) => UnitKind::Lib,
+            (TargetKind::Lib, true) if lib_kind == LibKind::Shared => {
+                return Err(ConfigError::at_key(
+                    origin,
+                    "kind",
+                    "`kind = \"shared\"` needs `sources`: a header-only library has no library file to link (spec 6.5)",
+                ));
+            }
             (TargetKind::Lib, true) if has_include => UnitKind::InterfaceLib,
             (TargetKind::Lib, true) => {
                 return Err(ConfigError::invalid(
@@ -667,7 +718,7 @@ pub fn configure(
             dep: None,
             merged,
         };
-        if matches!(unit.kind, UnitKind::Lib) {
+        if matches!(unit.kind, UnitKind::Lib | UnitKind::SharedLib) {
             warn_abi(&unit.name, origin, &unit.private, &mut diags);
         }
         units.push(unit);
@@ -739,7 +790,7 @@ fn check_duplicate_outputs(units: &[Unit], os: Os) -> Result<(), ConfigError> {
     for u in units {
         let is_bin = match u.kind {
             UnitKind::Bin => true,
-            UnitKind::Lib => false,
+            UnitKind::Lib | UnitKind::SharedLib => false,
             UnitKind::InterfaceLib | UnitKind::Dep(_) => continue,
         };
         // Windows file names ignore case, and a bin gets `.exe` appended.
@@ -1064,7 +1115,9 @@ fn value_uses_platform_lookup(v: &toml::Value) -> bool {
 
 fn unit_origin(u: &Unit) -> String {
     match u.kind {
-        UnitKind::Lib | UnitKind::InterfaceLib => format!("lib.{}", u.name),
+        UnitKind::Lib | UnitKind::SharedLib | UnitKind::InterfaceLib => {
+            format!("lib.{}", u.name)
+        }
         UnitKind::Bin => format!("bin.{}", u.name),
         UnitKind::Dep(_) => format!("dependency.{}", u.name),
     }

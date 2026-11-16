@@ -111,6 +111,11 @@ spelled_enum!(Subsystem, "subsystem", {
     Windows => "windows",
 });
 
+spelled_enum!(LibKind, "lib kind", {
+    Static => "static",
+    Shared => "shared",
+});
+
 spelled_enum!(DepKind, "dependency kind", {
     HeaderOnly => "header-only",
     Sources => "sources",

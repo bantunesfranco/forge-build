@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use crate::config::{
     ConfigError,
     schema::{DepSource, DependencyDecl, FeatureDecl, Manifest, Table, TargetKind},
-    types::{Define, Opt, Subsystem, Warnings},
+    types::{Define, LibKind, Opt, Subsystem, Warnings},
     vocab::{Arch, Compiler, Os, Platform},
 };
 use crate::configure::lookup::{LookupCtx, expand};
@@ -229,6 +229,8 @@ fn scalar(s: &Sourced, key: &str) -> Result<(), ConfigError> {
         "warnings" => parse_enum::<Warnings>(s, literal(s))?,
         "opt" => parse_enum::<Opt>(s, literal(s))?,
         "subsystem" => parse_enum::<Subsystem>(s, literal(s))?,
+        // Only a lib table has a `kind` entry: a dependency's is structural.
+        "kind" => parse_enum::<LibKind>(s, literal(s))?,
         "output" | "root" | "lib_dir" => {
             let text = want_str(s)?;
             if key == "output" && !is_template(text) {
@@ -375,6 +377,23 @@ mod tests {
         let e = rejected("[dependency.d]\nkind = \"system\"\nfind = \"x${nope}\"\n");
         assert!(e.contains("`find`"), "{e}");
         check("[dependency.d]\npath = \"v/${os}\"\nkind = \"header-only\"\n").unwrap();
+    }
+
+    #[test]
+    fn lib_kind_is_checked_when_literal() {
+        let e = rejected("[lib.a]\nsources = [\"a.c\"]\nkind = \"dynamic\"\n");
+        assert!(
+            e.starts_with("lib.a: ") && e.contains("`kind`") && e.contains("static, shared"),
+            "{e}"
+        );
+        let e = rejected("[lib.a]\nsources = [\"a.c\"]\nkind = 3\n");
+        assert!(e.contains("lib.a") && e.contains("a string"), "{e}");
+        check("[lib.a]\nsources = [\"a.c\"]\nkind = \"shared\"\n").unwrap();
+        // A template is only known once the options are.
+        check(
+            "[option.k]\ntype = \"string\"\ndefault = \"x\"\n[lib.a]\nsources = [\"a.c\"]\nkind = \"${option.k}\"\n",
+        )
+        .unwrap();
     }
 
     #[test]

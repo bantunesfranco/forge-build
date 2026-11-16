@@ -162,6 +162,11 @@ impl Project {
             inv.target.is_some().then_some((os, arch)),
         ))?;
         let mut configured = configure(m, &root, inv, platform, &cache)?;
+        // Temporary: shared libraries are configured (`explain` shows them) but
+        // not built yet, and nothing may build a static library in their place.
+        if prepare {
+            reject_shared_libs(&configured)?;
+        }
 
         // A C source needs the C program to agree with the platform compiler.
         // (`sources` dependencies are checked once their files are found.)
@@ -177,6 +182,9 @@ impl Project {
                 platform.compiler = c;
                 check_platform(&platform)?;
                 configured = configure(m, &root, inv, platform, &cache)?;
+                if prepare {
+                    reject_shared_libs(&configured)?;
+                }
             }
         }
         // The C program stood in for the platform, but C++ sources need theirs.
@@ -308,6 +316,9 @@ impl Project {
         for (index, unit) in c.units.iter().enumerate() {
             let kind = match unit.kind {
                 UnitKind::Lib => BuildTargetKind::StaticLibrary,
+                // `load` rejects shared libraries before this point; an
+                // unprepared load (`clean`) has nothing to build anyway.
+                UnitKind::SharedLib => continue,
                 UnitKind::Bin => BuildTargetKind::Binary,
                 UnitKind::InterfaceLib => BuildTargetKind::Interface,
                 UnitKind::Dep(DepKind::Sources) if used.contains(&index) => {
@@ -493,6 +504,19 @@ fn family_mismatch(toolchains: &Toolchains, c: Compiler, platform: Compiler) -> 
     )
 }
 
+/// Shared libraries are not built yet (spec 6.5); this goes away with the
+/// build support.
+fn reject_shared_libs(c: &Configured) -> Result<(), ConfigError> {
+    match c.units.iter().find(|u| u.kind == UnitKind::SharedLib) {
+        Some(u) => Err(ConfigError::at_key(
+            format!("lib.{}", u.name),
+            "kind",
+            "kind \"shared\" is not built yet",
+        )),
+        None => Ok(()),
+    }
+}
+
 fn check_platform(platform: &Platform) -> Result<(), ConfigError> {
     check_combination(platform).map_err(|m| ConfigError::invalid("compiler", m))
 }
@@ -501,7 +525,7 @@ fn check_platform(platform: &Platform) -> Result<(), ConfigError> {
 fn any_source(c: &Configured, lang: Lang) -> bool {
     c.units
         .iter()
-        .filter(|u| matches!(u.kind, UnitKind::Lib | UnitKind::Bin))
+        .filter(|u| matches!(u.kind, UnitKind::Lib | UnitKind::SharedLib | UnitKind::Bin))
         .flat_map(|u| &u.sources)
         .any(|s| Lang::from_path(s) == Some(lang))
 }
@@ -511,7 +535,7 @@ fn check_standards(c: &Configured) -> Result<(), ConfigError> {
     for unit in c
         .units
         .iter()
-        .filter(|u| matches!(u.kind, UnitKind::Lib | UnitKind::Bin))
+        .filter(|u| matches!(u.kind, UnitKind::Lib | UnitKind::SharedLib | UnitKind::Bin))
     {
         for (lang, key, std) in [(Lang::C, "c", &c.c_std), (Lang::Cxx, "cxx", &c.cxx_std)] {
             let Some(src) = unit

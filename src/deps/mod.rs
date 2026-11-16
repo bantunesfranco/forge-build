@@ -64,7 +64,7 @@ pub fn reached(c: &Configured) -> BTreeSet<usize> {
         .filter(|(_, u)| {
             matches!(
                 u.kind,
-                UnitKind::Lib | UnitKind::InterfaceLib | UnitKind::Bin
+                UnitKind::Lib | UnitKind::SharedLib | UnitKind::InterfaceLib | UnitKind::Bin
             )
         })
         .flat_map(|(index, _)| reachable(c, index))

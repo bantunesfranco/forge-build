@@ -61,6 +61,10 @@ pub struct ProfileScalars {
 pub enum UnitKind {
     /// A static library with sources.
     Lib,
+    /// A `lib` with `kind = "shared"` (spec 6.5). Building it is not done yet,
+    /// so `Project::load` rejects it; every place that matches `UnitKind` has
+    /// to decide what a shared library means there.
+    SharedLib,
     /// A `lib` with `include` and no `sources`: headers only, no archive.
     InterfaceLib,
     Bin,
@@ -274,6 +278,8 @@ pub fn effective(c: &Configured, unit: usize) -> Effective {
         .iter()
         .copied()
         .filter(|u| {
+            // A shared library is linked as a unit of its own, which is not
+            // done yet (`Project::load` rejects it).
             matches!(
                 c.units[*u].kind,
                 UnitKind::Lib | UnitKind::Dep(DepKind::Sources)
@@ -507,6 +513,103 @@ mod tests {
             ]
         );
         assert_eq!(unit(&c, "engine").kind, UnitKind::Lib);
+    }
+
+    #[test]
+    fn shared_libs_get_their_export_defines() {
+        let src = "[lib.my-lib]\nkind = \"shared\"\nsources = [\"a.c\"]\ndefines = [\"X\"]\n[lib.st]\nsources = [\"a.c\"]\n[lib.s2]\nkind = \"static\"\nsources = [\"a.c\"]\n";
+        let c = cfg(src, &["a.c"], LINUX);
+        let shared = unit(&c, "my-lib");
+        assert_eq!(shared.kind, UnitKind::SharedLib);
+        assert!(has_define(&shared.public, "MY_LIB_SHARED"));
+        assert!(!has_define(&shared.public, "MY_LIB_BUILDING"));
+        assert!(has_define(&shared.private, "MY_LIB_BUILDING"));
+        assert!(!has_define(&shared.private, "MY_LIB_SHARED"));
+        assert!(has_define(&shared.private, "X"));
+        for name in ["st", "s2"] {
+            let u = unit(&c, name);
+            assert_eq!(u.kind, UnitKind::Lib, "{name}");
+            assert!(
+                u.public.defines.is_empty() && u.private.defines.is_empty(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn export_macros_come_from_the_name_upper_cased() {
+        let src = "[lib.a-b_c9]\nkind = \"shared\"\nsources = [\"a.c\"]\n";
+        let c = cfg(src, &["a.c"], LINUX);
+        assert!(has_define(&unit(&c, "a-b_c9").public, "A_B_C9_SHARED"));
+        assert!(has_define(&unit(&c, "a-b_c9").private, "A_B_C9_BUILDING"));
+    }
+
+    #[test]
+    fn the_export_defines_name_where_they_came_from() {
+        let c = cfg(
+            "[lib.e]\nkind = \"shared\"\nsources = [\"a.c\"]\n",
+            &["a.c"],
+            LINUX,
+        );
+        let from = |vis, name: &str| {
+            let s = unit(&c, "e")
+                .merged
+                .list("defines", vis)
+                .iter()
+                .find(|s| s.value.as_str() == Some(name))
+                .unwrap_or_else(|| panic!("no {name}"));
+            (s.origin.clone(), s.raw_key.clone())
+        };
+        let want = ("lib.e".to_string(), "kind = \"shared\"".to_string());
+        assert_eq!(from(Visibility::Public, "E_SHARED"), want);
+        assert_eq!(from(Visibility::Private, "E_BUILDING"), want);
+    }
+
+    #[test]
+    fn kind_follows_an_option_and_rejects_a_bad_expansion() {
+        let src = "[option.k]\ntype = \"string\"\ndefault = \"static\"\n[lib.a]\nsources = [\"a.c\"]\nkind = \"${option.k}\"\n";
+        assert_eq!(unit(&cfg(src, &["a.c"], LINUX), "a").kind, UnitKind::Lib);
+        let with = |value: &str| {
+            let inv = Invocation {
+                options: vec![("k".to_string(), value.to_string())],
+                ..Invocation::default()
+            };
+            run(src, &["a.c"], LINUX, &inv)
+        };
+        assert_eq!(
+            unit(&with("shared").unwrap(), "a").kind,
+            UnitKind::SharedLib
+        );
+        let e = with("dynamic").unwrap_err().to_string();
+        assert!(
+            e.contains("lib.a")
+                && e.contains("`kind`")
+                && e.contains("dynamic")
+                && e.contains("${option.k}"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn shared_needs_sources() {
+        let e = err(
+            "[lib.h]\nkind = \"shared\"\ninclude = [\"inc\"]\n",
+            &[],
+            LINUX,
+        );
+        assert!(
+            e.contains("lib.h") && e.contains("kind") && e.contains("header-only"),
+            "{e}"
+        );
+        let e = err("[lib.h]\nkind = \"shared\"\n", &[], LINUX);
+        assert!(e.contains("lib.h") && e.contains("sources"), "{e}");
+        // A static header-only lib is unchanged.
+        let c = cfg(
+            "[lib.h]\nkind = \"static\"\ninclude = [\"inc\"]\n",
+            &[],
+            LINUX,
+        );
+        assert_eq!(unit(&c, "h").kind, UnitKind::InterfaceLib);
     }
 
     const STRING_OPTION: &str = "[option.s]\ntype = \"string\"\ndefault = \"-O2 -g\"\n";

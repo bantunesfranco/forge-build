@@ -180,7 +180,7 @@ pub fn sysroot_arg(c: &Configured) -> Option<String> {
 pub fn compile_args(c: &Configured, unit: usize, lang: Lang) -> Result<Vec<String>, ConfigError> {
     let u = &c.units[unit];
     let own = match u.kind {
-        UnitKind::Lib | UnitKind::Bin => true,
+        UnitKind::Lib | UnitKind::SharedLib | UnitKind::Bin => true,
         UnitKind::Dep(DepKind::Sources) => false,
         UnitKind::InterfaceLib | UnitKind::Dep(_) => {
             return Err(ConfigError::invalid(
@@ -956,6 +956,38 @@ system = [\"opengl\"]
 
     fn artifact_of(c: &Configured) -> impl Fn(usize) -> PathBuf + '_ {
         move |u| PathBuf::from(format!("out/{}.a", c.units[u].name))
+    }
+
+    #[test]
+    fn shared_lib_macros_reach_the_right_compiles() {
+        let src = "[workspace]\ncxx = \"17\"\n[lib.my-lib]\nkind = \"shared\"\nsources = [\"a.cpp\"]\n[lib.st]\nsources = [\"s.cpp\"]\n[bin.app]\nsources = [\"m.cpp\"]\ndeps = [\"my-lib\", \"st\"]\n";
+        let files = ["a.cpp", "s.cpp", "m.cpp"];
+        for platform in [linux(Compiler::Gcc), windows(Compiler::Msvc)] {
+            let c = build(src, &files, platform, None);
+            let flag = |name: &str| {
+                if platform.compiler == Compiler::Msvc {
+                    format!("/D{name}")
+                } else {
+                    format!("-D{name}")
+                }
+            };
+            let own = compile(&c, "my-lib", Lang::Cxx);
+            assert_eq!(count(&own, &flag("MY_LIB_SHARED")), 1, "{own:?}");
+            assert_eq!(count(&own, &flag("MY_LIB_BUILDING")), 1, "{own:?}");
+            let consumer = compile(&c, "app", Lang::Cxx);
+            assert_eq!(count(&consumer, &flag("MY_LIB_SHARED")), 1, "{consumer:?}");
+            assert_eq!(
+                count(&consumer, &flag("MY_LIB_BUILDING")),
+                0,
+                "{consumer:?}"
+            );
+            let st = compile(&c, "st", Lang::Cxx);
+            assert!(
+                !st.iter()
+                    .any(|a| a.contains("ST_SHARED") || a.contains("ST_BUILDING")),
+                "{st:?}"
+            );
+        }
     }
 
     #[test]
