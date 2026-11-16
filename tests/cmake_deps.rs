@@ -347,14 +347,18 @@ fn a_static_library_links_the_system_libraries_it_needs() {
         return;
     };
     let (link, source, shown) = system_lib_dependency();
-    // No `system` key anywhere in the manifest.
-    let manifest = MANIFEST.replace("options = { M_RESULT = 7 }\n", "");
+    // No `system` key anywhere in the manifest. The CMake target is not
+    // called `m`: on Linux it links libm, and `target_link_libraries(m PUBLIC
+    // m)` would make CMake read it as the target linking to itself.
+    let manifest = MANIFEST
+        .replace("options = { M_RESULT = 7 }\n", "")
+        .replace("target = \"m\"", "target = \"mlib\"");
     assert!(!manifest.contains("system"));
     let f = Fixture::with_toolchain(&manifest, &cc, &cxx);
     f.write(
         "vendor/m/CMakeLists.txt",
         &format!(
-            "cmake_minimum_required(VERSION 3.10)\nproject(m C)\nadd_library(m STATIC m.c)\ntarget_link_libraries(m PUBLIC {link})\n"
+            "cmake_minimum_required(VERSION 3.10)\nproject(m C)\nadd_library(mlib STATIC m.c)\ntarget_link_libraries(mlib PUBLIC {link})\n"
         ),
     );
     f.write("vendor/m/m.c", source);
