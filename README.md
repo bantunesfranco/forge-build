@@ -56,6 +56,7 @@ variant feature, a `${option.*}` lookup, `remove.*` and logical system libraries
 | Command | What it does |
 | --- | --- |
 | `forge build [NAME] [-j N] [-v]` | Build all targets, or the named target and its dependency closure. `-v` prints each command and why it runs. |
+| `forge run [NAME] [-j N] [-v] [-- ARGS...]` | Build the bin (and its dependency closure, like `forge build NAME`), then run it. Without a name, the manifest's only bin; with several bins you must name one. Arguments after `--` go to the program unchanged. It runs in the directory you started `forge` from, with your environment and standard streams, and `forge` exits with its exit code (128 plus the signal number on Unix when a signal killed it). A `Running <path>` line goes to stderr first. If the build fails the program is not run. With `--target` for another platform it builds but refuses to run. |
 | `forge compdb` | Write `compile_commands.json` for editors without building anything (see Editor support). |
 | `forge explain [NAME\|PATH]` | With a lib, bin or dependency name: its merged configuration and where every value came from, then why its archive or link task would rebuild. With a path: why that file is rebuilt. With nothing: one line per task. |
 | `forge graph [NAME] [--dot]` | Print all tasks or a target's dependency closure; `--dot` emits Graphviz (`... \| dot -Tpng -o graph.png`). |

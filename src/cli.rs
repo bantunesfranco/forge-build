@@ -4,6 +4,7 @@ use std::{
     fs,
     num::NonZeroUsize,
     path::{Path, PathBuf},
+    process::{Command, ExitStatus},
 };
 
 use crate::{
@@ -11,14 +12,15 @@ use crate::{
     compdb,
     config::{self, ConfigError, Diagnostics, Level, find_manifest, flat::Locations},
     configure::{
-        model::Invocation,
+        model::{Invocation, UnitKind},
         options::{cache_path, load_cache, parse_cli_opt, save_cache},
     },
     deps::{self, Phase, prepare_all},
-    executor::{Executor, ProcessExecutor},
+    executor::{Executor, ProcessExecutor, path_arg},
     explain::explain_arg,
     graph::Graph,
-    project::Project,
+    platform::host_os_arch,
+    project::{BuildTargetKind, Project},
 };
 
 #[derive(Parser)]
@@ -58,6 +60,19 @@ enum Commands {
         jobs: Option<NonZeroUsize>,
         #[arg(short, long)]
         verbose: bool,
+    },
+    /// Build a bin and its dependency closure like `forge build <bin>`, then run it.
+    /// Arguments after `--` go to the program.
+    Run {
+        /// The bin to run (default: the manifest's only bin).
+        bin: Option<String>,
+        #[arg(short, long)]
+        jobs: Option<NonZeroUsize>,
+        #[arg(short, long)]
+        verbose: bool,
+        /// Arguments for the program, after `--`.
+        #[arg(last = true, value_name = "ARGS")]
+        args: Vec<String>,
     },
     Clean {
         #[arg(short, long)]
@@ -157,11 +172,14 @@ fn load_project(
     Ok(project)
 }
 
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// Runs the command and returns the process exit code: 0, except that `forge
+/// run` exits with the program's own code. Failures are errors.
+pub fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let args: Cli = Cli::parse();
     let manifest: PathBuf = find_manifest(args.manifest.as_deref())?;
     if let Some(Commands::Update { dep }) = &args.command {
-        return update(&manifest, dep.as_deref());
+        update(&manifest, dep.as_deref())?;
+        return Ok(0);
     }
     let mut project: Project = load_project(&manifest, &args, &ProcessExecutor)?;
     let printed = print_diagnostics(&project.diagnostics, &project.locations, 0);
@@ -177,27 +195,22 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 verbose,
             };
 
-            // Whatever needs the network or a build system happens now; the
-            // local kinds were prepared when the project was loaded.
-            prepare_all(&mut project, Phase::Build, &ProcessExecutor, opts.jobs)
-                .map_err(|e| project.locations.locate(e))?;
-            // The build phase may warn too (CMake, system packages).
-            print_diagnostics(&project.diagnostics, &project.locations, printed);
-            project.rebuild_targets()?;
-
-            let mut graph: Graph = Graph::from_project(&project)?;
-            // An editor needs every file, whichever target is built.
-            if let Err(e) = compdb::write(&project, &graph) {
-                eprintln!("warning: {e}");
-            }
-            if let Some(name) = target.as_deref() {
-                graph = graph.select_target(&project, name)?;
-            }
-
-            match build(&project, &graph, &ProcessExecutor, opts) {
-                Ok(_) => println!("Build successful"),
-                Err(e) => return Err(Box::new(e)),
-            }
+            build_project(&mut project, target.as_deref(), opts, printed)?;
+            println!("Build successful");
+        }
+        Some(Commands::Run {
+            bin,
+            jobs,
+            verbose,
+            args: program_args,
+        }) => {
+            let opts = BuildOptions {
+                jobs: jobs.map_or_else(|| BuildOptions::default().jobs, |j| j.get()),
+                verbose,
+            };
+            let name = select_bin(&project, bin.as_deref())?.to_string();
+            build_project(&mut project, Some(&name), opts, printed)?;
+            return run_bin(&project, &name, &program_args);
         }
         Some(Commands::Compdb) => write_compdb(&mut project, &ProcessExecutor, printed)?,
         Some(Commands::Graph { target, dot }) => {
@@ -235,7 +248,109 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Update { .. }) | None => {}
     }
 
+    Ok(0)
+}
+
+/// What `forge build` and `forge run` share: prepares the dependencies for the
+/// build phase, writes the compilation database for the whole project and
+/// builds `target` and its dependency closure (everything without a name).
+fn build_project(
+    project: &mut Project,
+    target: Option<&str>,
+    opts: BuildOptions,
+    printed: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Whatever needs the network or a build system happens now; the
+    // local kinds were prepared when the project was loaded.
+    prepare_all(project, Phase::Build, &ProcessExecutor, opts.jobs)
+        .map_err(|e| project.locations.locate(e))?;
+    // The build phase may warn too (CMake, system packages).
+    print_diagnostics(&project.diagnostics, &project.locations, printed);
+    project.rebuild_targets()?;
+
+    let mut graph: Graph = Graph::from_project(project)?;
+    // An editor needs every file, whichever target is built.
+    if let Err(e) = compdb::write(project, &graph) {
+        eprintln!("warning: {e}");
+    }
+    if let Some(name) = target {
+        graph = graph.select_target(project, name)?;
+    }
+    build(project, &graph, &ProcessExecutor, opts)?;
     Ok(())
+}
+
+/// The bin `forge run` runs: the one named, or the manifest's only one.
+/// Checked before anything is built.
+fn select_bin<'a>(project: &'a Project, name: Option<&str>) -> Result<&'a str, String> {
+    let units = &project.configured.units;
+    let bins: Vec<&str> = units
+        .iter()
+        .filter(|u| u.kind == UnitKind::Bin)
+        .map(|u| u.name.as_str())
+        .collect();
+    let Some(name) = name else {
+        return match bins[..] {
+            [only] => Ok(only),
+            [] => Err("the manifest has no bin to run".to_string()),
+            _ => Err(format!(
+                "several bins: {}; name one: forge run <bin>",
+                bins.join(", ")
+            )),
+        };
+    };
+    if let Some(bin) = bins.iter().find(|&&b| b == name) {
+        return Ok(bin);
+    }
+    let what = match units.iter().find(|u| u.name == name).map(|u| u.kind) {
+        Some(UnitKind::Lib | UnitKind::InterfaceLib) => "a lib",
+        Some(UnitKind::Dep(_)) => "a dependency",
+        _ => return Err(format!("unknown bin `{name}`")),
+    };
+    Err(format!("`{name}` is {what}, not a bin; it cannot be run"))
+}
+
+/// Runs the built bin: arguments verbatim, standard streams, environment and
+/// working directory inherited. Returns the program's exit code (128 plus the
+/// signal on Unix when a signal killed it).
+fn run_bin(
+    project: &Project,
+    name: &str,
+    args: &[String],
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let (os, arch) = host_os_arch()?;
+    if (project.platform.os, project.platform.arch) != (os, arch) {
+        return Err(format!(
+            "built for {}-{}; cannot run it on this machine",
+            project.platform.arch.as_str(),
+            project.platform.os.as_str()
+        )
+        .into());
+    }
+    let target = project
+        .targets
+        .iter()
+        .find(|t| t.name == name && t.kind == BuildTargetKind::Binary)
+        .ok_or_else(|| format!("unknown bin `{name}`"))?;
+    let relative = project.target_output_path(target);
+    eprintln!("Running {}", relative.display());
+    let exe = std::path::absolute(project.root.join(&relative))?;
+    let status = Command::new(path_arg(&exe))
+        .args(args)
+        .status()
+        .map_err(|e| format!("cannot run {}: {e}", relative.display()))?;
+    Ok(exit_code(status))
+}
+
+fn exit_code(status: ExitStatus) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+    status.code().unwrap_or(1)
 }
 
 /// `forge compdb`: the dependencies are prepared as for `graph`, except that a
@@ -474,11 +589,124 @@ deps = [\"m\"]
         assert!(infos[0].contains(": m;"), "{infos:?}");
     }
 
+    const RUN_HEAD: &str = "[workspace]\nname = \"t\"\nversion = \"1\"\nc = \"17\"\n";
+
+    fn select(manifest: &str, name: Option<&str>) -> Result<String, String> {
+        let (_t, root) = project_dir();
+        fs::write(root.join("project.toml"), manifest).unwrap();
+        fs::create_dir_all(root.join("vendor/m")).unwrap();
+        let p = load_project(&root.join("project.toml"), &cli(&["run"]), &Clang).unwrap();
+        select_bin(&p, name).map(str::to_string)
+    }
+
+    #[test]
+    fn run_picks_the_only_bin_or_the_named_one() {
+        let one = format!("{RUN_HEAD}[bin.app]\nsources = [\"a.c\"]\n");
+        assert_eq!(select(&one, None).unwrap(), "app");
+        assert_eq!(select(&one, Some("app")).unwrap(), "app");
+
+        let two = format!("{one}[bin.tool]\nsources = [\"a.c\"]\n");
+        assert_eq!(select(&two, Some("tool")).unwrap(), "tool");
+        assert_eq!(
+            select(&two, None).unwrap_err(),
+            "several bins: app, tool; name one: forge run <bin>"
+        );
+    }
+
+    #[test]
+    fn run_rejects_what_is_not_a_bin() {
+        let manifest = format!(
+            concat!(
+                "{}[lib.util]\nsources = [\"a.c\"]\n",
+                "[dependency.m]\npath = \"vendor/m\"\nkind = \"cmake\"\nexpose = {{ target = \"m\" }}\n",
+                "[bin.app]\nsources = [\"a.c\"]\n",
+            ),
+            RUN_HEAD
+        );
+        assert_eq!(
+            select(&manifest, Some("util")).unwrap_err(),
+            "`util` is a lib, not a bin; it cannot be run"
+        );
+        assert_eq!(
+            select(&manifest, Some("m")).unwrap_err(),
+            "`m` is a dependency, not a bin; it cannot be run"
+        );
+        assert_eq!(
+            select(&manifest, Some("nope")).unwrap_err(),
+            "unknown bin `nope`"
+        );
+        // a lib is not picked when no name is given either
+        let no_bins = format!("{RUN_HEAD}[lib.util]\nsources = [\"a.c\"]\n");
+        assert_eq!(
+            select(&no_bins, None).unwrap_err(),
+            "the manifest has no bin to run"
+        );
+    }
+
+    #[test]
+    fn run_takes_the_programs_arguments_after_two_dashes() {
+        let a = cli(&["run", "app", "-j", "2", "--", "a", "b c", "--flag", "-v"]);
+        let Some(Commands::Run {
+            bin,
+            jobs,
+            verbose,
+            args,
+        }) = a.command
+        else {
+            panic!("expected run");
+        };
+        assert_eq!(bin.as_deref(), Some("app"));
+        assert_eq!(jobs.map(|j| j.get()), Some(2));
+        assert!(!verbose);
+        assert_eq!(args, ["a", "b c", "--flag", "-v"]);
+
+        let Some(Commands::Run { bin, args, .. }) = cli(&["run", "--", "x"]).command else {
+            panic!("expected run");
+        };
+        assert_eq!(bin, None);
+        assert_eq!(args, ["x"]);
+    }
+
+    #[test]
+    fn run_refuses_a_bin_built_for_another_platform() {
+        let (_t, root) = project_dir();
+        let (os, arch) = host_os_arch().unwrap();
+        let other = if (os.as_str(), arch.as_str()) == ("linux", "x86_64") {
+            "arm64-linux"
+        } else {
+            "x86_64-linux"
+        };
+        // named apart from the host's own compiler, so the target is accepted
+        fs::write(
+            root.join("tc.toml"),
+            "[toolchain]
+c = \"my-cc\"
+cxx = \"my-c++\"
+",
+        )
+        .unwrap();
+        let tc = root.join("tc.toml");
+        let a = cli(&[
+            "--target",
+            other,
+            "--toolchain",
+            tc.to_str().unwrap(),
+            "run",
+        ]);
+        let p = load_project(&root.join("project.toml"), &a, &Clang).unwrap();
+        let e = run_bin(&p, "app", &[]).unwrap_err().to_string();
+        assert_eq!(
+            e,
+            format!("built for {other}; cannot run it on this machine")
+        );
+    }
+
     #[test]
     fn only_clean_skips_the_dependencies() {
         for (args, want) in [
             (&["clean"][..], false),
             (&["clean", "--all"], false),
+            (&["run"], true),
             (&["build"], true),
             (&["graph"], true),
             (&["compdb"], true),

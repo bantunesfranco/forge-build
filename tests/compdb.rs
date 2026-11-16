@@ -4,7 +4,6 @@ mod common;
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
     time::{Duration, SystemTime},
 };
 
@@ -224,12 +223,7 @@ impl Cli {
     }
 
     fn forge(&self, args: &[&str]) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_forge"))
-            .current_dir(&self.f.root)
-            .args(["--toolchain", "toolchain.toml"])
-            .args(args)
-            .output()
-            .unwrap()
+        self.f.forge(args)
     }
 
     fn ok(&self, args: &[&str]) -> String {

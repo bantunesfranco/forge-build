@@ -21,7 +21,9 @@ pub mod project;
 /// Shared entry point for every binary name.
 pub fn cli_main() -> std::process::ExitCode {
     match cli::run() {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(0) => std::process::ExitCode::SUCCESS,
+        // `forge run` passes the program's exit code on, whatever its size.
+        Ok(code) => std::process::exit(code),
         Err(e) => {
             eprintln!("error: {e}");
             std::process::ExitCode::FAILURE
