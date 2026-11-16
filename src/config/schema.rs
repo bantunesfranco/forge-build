@@ -296,16 +296,20 @@ pub fn parse_manifest(t: toml::Table) -> Result<Manifest, ConfigError> {
     for (name, value) in &t {
         if !TOP_LEVEL.contains(&name.as_str()) {
             if !value.is_table() {
-                return Err(ConfigError::invalid(
+                return Err(ConfigError::at(
                     "manifest",
+                    "",
+                    Some(name.as_str()),
                     format!(
                         "`{name}` is a key outside any table; keys go inside a table such as `[workspace]` (tables: {})",
                         TOP_LEVEL.join(", ")
                     ),
                 ));
             }
-            return Err(ConfigError::invalid(
+            return Err(ConfigError::at(
                 "manifest",
+                name,
+                None,
                 format!(
                     "unknown table `{name}` (expected one of: {})",
                     TOP_LEVEL.join(", ")
@@ -328,8 +332,10 @@ pub fn parse_manifest(t: toml::Table) -> Result<Manifest, ConfigError> {
             Some(opt) => parse_variants(&origin, name, body, opt)?,
             None => {
                 if let Some((child, _)) = body.iter().find(|(k, v)| v.is_table() && *k != "when") {
-                    return Err(ConfigError::invalid(
+                    return Err(ConfigError::at(
                         &origin,
+                        format!("{origin}.{child}"),
+                        None,
                         format!(
                             "`{child}` is a sub-table, but there is no option `{name}`, so this is a bundle and takes its keys directly (declare `[option.{name}]` to give it one table per option value)"
                         ),
@@ -420,17 +426,22 @@ fn section<'a>(
     let Some(v) = t.get(name) else {
         return Ok(Vec::new());
     };
-    let tables = v
-        .as_table()
-        .ok_or_else(|| ConfigError::invalid("manifest", format!("`{name}` must be a table")))?;
+    let tables = v.as_table().ok_or_else(|| {
+        ConfigError::at(
+            "manifest",
+            "",
+            Some(name),
+            format!("`{name}` must be a table"),
+        )
+    })?;
     tables
         .iter()
         .map(|(child, v)| {
             let origin = format!("{name}.{child}");
             check_name(&origin, child)?;
-            let body = v
-                .as_table()
-                .ok_or_else(|| ConfigError::invalid(&origin, "expected a table"))?;
+            let body = v.as_table().ok_or_else(|| {
+                ConfigError::at(&origin, name, Some(child.as_str()), "expected a table")
+            })?;
             Ok((child, body))
         })
         .collect()
@@ -467,11 +478,12 @@ fn parse_entries(
     let mut entries = Vec::with_capacity(body.len());
     for (raw, value) in body {
         let key = parse_key(raw, |n| rules.rule(n)).map_err(|message| {
-            ConfigError::invalid(origin, with_table_hint(raw, message, rules))
+            ConfigError::at_key(origin, raw, with_table_hint(raw, message, rules))
         })?;
         if value.is_table() && !TABLE_VALUED.contains(&key.name.as_str()) {
-            return Err(ConfigError::invalid(
+            return Err(ConfigError::at_key(
                 origin,
+                raw,
                 format!("`{raw}` must be a value, not a table"),
             ));
         }
@@ -503,10 +515,15 @@ fn take(entries: &mut Vec<Entry>, name: &str) -> Option<Entry> {
     Some(entries.remove(at))
 }
 
+/// The key that holds `name`, which is dotted (`requires.tool`) for an entry of a table-valued key.
+fn holder(name: &str) -> &str {
+    name.split('.').next().unwrap_or(name)
+}
+
 fn want_string(origin: &str, key: &str, v: &toml::Value) -> Result<String, ConfigError> {
-    v.as_str()
-        .map(str::to_owned)
-        .ok_or_else(|| ConfigError::invalid(origin, format!("`{key}` must be a string")))
+    v.as_str().map(str::to_owned).ok_or_else(|| {
+        ConfigError::at_key(origin, holder(key), format!("`{key}` must be a string"))
+    })
 }
 
 fn take_string(
@@ -520,7 +537,13 @@ fn take_string(
 }
 
 fn want_string_array(origin: &str, key: &str, v: &toml::Value) -> Result<Vec<String>, ConfigError> {
-    let bad = || ConfigError::invalid(origin, format!("`{key}` must be an array of strings"));
+    let bad = || {
+        ConfigError::at_key(
+            origin,
+            holder(key),
+            format!("`{key}` must be an array of strings"),
+        )
+    };
     v.as_array()
         .ok_or_else(bad)?
         .iter()
@@ -541,9 +564,14 @@ fn parse_workspace(v: Option<&toml::Value>) -> Result<Workspace, ConfigError> {
             ..Workspace::default()
         });
     };
-    let body = v
-        .as_table()
-        .ok_or_else(|| ConfigError::invalid("manifest", "`workspace` must be a table"))?;
+    let body = v.as_table().ok_or_else(|| {
+        ConfigError::at(
+            "manifest",
+            "",
+            Some("workspace"),
+            "`workspace` must be a table",
+        )
+    })?;
     let mut entries = parse_entries(origin, body, &WORKSPACE_RULES)?;
 
     let name = take_string(origin, &mut entries, "name")?.unwrap_or_default();
@@ -554,15 +582,17 @@ fn parse_workspace(v: Option<&toml::Value>) -> Result<Workspace, ConfigError> {
     let mut requires = BTreeMap::new();
     if let Some(e) = take(&mut entries, "requires") {
         let table = e.value.as_table().ok_or_else(|| {
-            ConfigError::invalid(
+            ConfigError::at_key(
                 origin,
+                "requires",
                 "`requires` must be a table, e.g. { tool = \">=0.1\" }",
             )
         })?;
         for (k, val) in table {
             if k != "tool" {
-                return Err(ConfigError::invalid(
+                return Err(ConfigError::at_key(
                     origin,
+                    "requires",
                     format!("unknown key `{k}` in `requires` (only `tool` is supported)"),
                 ));
             }
@@ -600,8 +630,9 @@ fn parse_option(origin: &str, body: &toml::Table) -> Result<OptionDecl, ConfigEr
                     "string" => OptionType::String,
                     "int" => OptionType::Int,
                     other => {
-                        return Err(ConfigError::invalid(
+                        return Err(ConfigError::at_key(
                             origin,
+                            &e.raw_key,
                             format!(
                                 "unknown option type `{other}` (expected bool, enum, string or int)"
                             ),
@@ -616,8 +647,9 @@ fn parse_option(origin: &str, body: &toml::Table) -> Result<OptionDecl, ConfigEr
                     .enumerate()
                     .find_map(|(i, v)| list[..i].contains(v).then_some(v))
                 {
-                    return Err(ConfigError::invalid(
+                    return Err(ConfigError::at_key(
                         origin,
+                        &e.raw_key,
                         format!("`values` lists `{dup}` more than once"),
                     ));
                 }
@@ -625,8 +657,9 @@ fn parse_option(origin: &str, body: &toml::Table) -> Result<OptionDecl, ConfigEr
             }
             "default" => {
                 if e.value.is_array() || e.value.is_table() {
-                    return Err(ConfigError::invalid(
+                    return Err(ConfigError::at_key(
                         origin,
+                        &e.raw_key,
                         format!("`{}` must be a single value", e.raw_key),
                     ));
                 }
@@ -643,14 +676,16 @@ fn parse_option(origin: &str, body: &toml::Table) -> Result<OptionDecl, ConfigEr
     let values = match (ty, values) {
         (OptionType::Enum, Some(v)) if !v.is_empty() => v,
         (OptionType::Enum, _) => {
-            return Err(ConfigError::invalid(
+            return Err(ConfigError::at_key(
                 origin,
+                "values",
                 "an enum option needs a non-empty `values` list",
             ));
         }
         (_, Some(_)) => {
-            return Err(ConfigError::invalid(
+            return Err(ConfigError::at_key(
                 origin,
+                "values",
                 "`values` is only valid for enum options",
             ));
         }
@@ -676,8 +711,9 @@ fn parse_variants(
     for (variant, v) in body {
         let variant_origin = format!("{origin}.{variant}");
         let sub = v.as_table().ok_or_else(|| {
-            ConfigError::invalid(
+            ConfigError::at_key(
                 origin,
+                variant,
                 format!(
                     "`{variant}` must be a sub-table: `{name}` is also an option, \
                      so this feature takes one `[{origin}.<value>]` table per option value"
@@ -727,28 +763,32 @@ fn parse_feature_body(origin: &str, body: &toml::Table) -> Result<FeatureBody, C
 
 fn parse_when(origin: &str, v: &toml::Value) -> Result<When, ConfigError> {
     let table = v.as_table().ok_or_else(|| {
-        ConfigError::invalid(
+        ConfigError::at_key(
             origin,
+            "when",
             "`when` must be a table of equalities, e.g. { os = \"windows\" }",
         )
     })?;
     let mut when = When::default();
     for (axis, val) in table {
         let name = val.as_str().ok_or_else(|| {
-            ConfigError::invalid(
+            ConfigError::at_key(
                 origin,
+                "when",
                 format!("`when.{axis}` must be a single name (no lists, no nested tables)"),
             )
         })?;
-        let bad =
-            |message: String| ConfigError::invalid(origin, format!("`when.{axis}`: {message}"));
+        let bad = |message: String| {
+            ConfigError::at_key(origin, "when", format!("`when.{axis}`: {message}"))
+        };
         match axis.as_str() {
             "os" => when.os = Some(name.parse().map_err(bad)?),
             "compiler" => when.compiler = Some(name.parse().map_err(bad)?),
             "arch" => when.arch = Some(name.parse().map_err(bad)?),
             other => {
-                return Err(ConfigError::invalid(
+                return Err(ConfigError::at_key(
                     origin,
+                    "when",
                     format!("unknown `when` axis `{other}` (expected os, compiler or arch)"),
                 ));
             }
@@ -777,7 +817,7 @@ fn parse_dependency(origin: &str, body: &toml::Table) -> Result<DependencyDecl, 
     })?;
     let kind: DepKind = kind
         .parse()
-        .map_err(|message: String| ConfigError::invalid(origin, message))?;
+        .map_err(|message: String| ConfigError::at_key(origin, "kind", message))?;
 
     let git = take_string(origin, &mut entries, "git")?;
     let rev = take_string(origin, &mut entries, "rev")?;
@@ -786,8 +826,9 @@ fn parse_dependency(origin: &str, body: &toml::Table) -> Result<DependencyDecl, 
 
     for (field, value) in [("git", &git), ("rev", &rev)] {
         if value.as_deref().is_some_and(|v| v.contains("${")) {
-            return Err(ConfigError::invalid(
+            return Err(ConfigError::at_key(
                 origin,
+                field,
                 format!("`{field}` takes no lookups: the lockfile pins one commit per dependency"),
             ));
         }
@@ -803,16 +844,18 @@ fn parse_dependency(origin: &str, body: &toml::Table) -> Result<DependencyDecl, 
         (_, Some(url), None) => match rev {
             Some(rev) => DepSource::Git { url, rev },
             None => {
-                return Err(ConfigError::invalid(
+                return Err(ConfigError::at_key(
                     origin,
+                    "git",
                     "`git` requires `rev` (a tag, branch or commit)",
                 ));
             }
         },
         (_, None, Some(path)) => {
             if rev.is_some() {
-                return Err(ConfigError::invalid(
+                return Err(ConfigError::at_key(
                     origin,
+                    "rev",
                     "`rev` is only valid together with `git`",
                 ));
             }
@@ -834,15 +877,20 @@ fn parse_dependency(origin: &str, body: &toml::Table) -> Result<DependencyDecl, 
 
     let system_headers = match take(&mut entries, "system_headers") {
         Some(e) => e.value.as_bool().ok_or_else(|| {
-            ConfigError::invalid(origin, "`system_headers` must be true or false")
+            ConfigError::at_key(
+                origin,
+                "system_headers",
+                "`system_headers` must be true or false",
+            )
         })?,
         None => true,
     };
     let alias = match take(&mut entries, "alias") {
         Some(e) if e.value.is_table() => Some(e.value),
         Some(_) => {
-            return Err(ConfigError::invalid(
+            return Err(ConfigError::at_key(
                 origin,
+                "alias",
                 "`alias` must be an inline table, e.g. { os = { macos = \"osx\" } }",
             ));
         }
@@ -854,8 +902,9 @@ fn parse_dependency(origin: &str, body: &toml::Table) -> Result<DependencyDecl, 
     };
     for e in entries.iter().filter(|e| e.key.name == "options") {
         if !e.value.is_table() {
-            return Err(ConfigError::invalid(
+            return Err(ConfigError::at_key(
                 origin,
+                &e.raw_key,
                 format!("`{}` must be an inline table of cache variables", e.raw_key),
             ));
         }
@@ -877,16 +926,18 @@ fn parse_dependency(origin: &str, body: &toml::Table) -> Result<DependencyDecl, 
 
 fn parse_expose(origin: &str, v: &toml::Value) -> Result<Vec<String>, ConfigError> {
     let table = v.as_table().ok_or_else(|| {
-        ConfigError::invalid(
+        ConfigError::at_key(
             origin,
+            "expose",
             "`expose` must be a table, e.g. { target = \"glfw\" }",
         )
     })?;
     let mut names = Vec::new();
     for (k, val) in table {
         if k != "target" {
-            return Err(ConfigError::invalid(
+            return Err(ConfigError::at_key(
                 origin,
+                "expose",
                 format!("unknown key `{k}` in `expose` (only `target` is supported)"),
             ));
         }

@@ -189,15 +189,20 @@ pub fn compile_args(c: &Configured, unit: usize, lang: Lang) -> Result<Vec<Strin
         Lang::Cxx => ("cxx", c.cxx_std.as_deref()),
     };
     let std = std.ok_or_else(|| {
-        ConfigError::invalid(
+        ConfigError::at(
             key,
+            "workspace",
+            Some(key),
             format!(
                 "no {} standard is set; add `{key} = \"<standard>\"` to [workspace]",
                 lang.name()
             ),
         )
     })?;
-    args.push(std_flag(compiler, lang, std).map_err(|e| ConfigError::invalid(key, e))?);
+    args.push(
+        std_flag(compiler, lang, std)
+            .map_err(|e| ConfigError::at(key, "workspace", Some(key), e))?,
+    );
     if msvc && lang == Lang::Cxx {
         args.push("/permissive-".to_string());
         args.push("/EHsc".to_string());

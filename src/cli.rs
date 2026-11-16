@@ -216,7 +216,7 @@ fn update(manifest: &Path, dep: Option<&str>) -> Result<(), Box<dyn std::error::
         _ => Path::new("."),
     };
     let mut diagnostics = Diagnostics::default();
-    let result = deps::update(root, &m, dep, &mut diagnostics);
+    let result = deps::update(root, &m, dep, &mut diagnostics).map_err(|e| m.locations.locate(e));
     print_diagnostics(&diagnostics, &m.locations);
     result?;
     Ok(())

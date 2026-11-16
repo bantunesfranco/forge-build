@@ -608,17 +608,23 @@ fn probe_script_for(
     diags: &mut Diagnostics,
 ) -> Option<String> {
     if options.contains_key("CMAKE_PROJECT_INCLUDE") {
-        diags.warn(format!(
-            "dependency.{dep}: the option CMAKE_PROJECT_INCLUDE replaces forge's probe, so its system libraries are not detected: add `system` keys to it"
-        ));
+        diags.warn_at(
+            &format!("dependency.{dep}"),
+            None,
+            "the option CMAKE_PROJECT_INCLUDE replaces forge's probe, so its system libraries are not detected: add `system` keys to it",
+        );
         return None;
     }
     if version.is_some_and(|v| v >= PROBE_MIN_VERSION) {
         return Some(probe_script(expose));
     }
-    diags.warn(format!(
-        "the system libraries of dependency `{dep}` are not detected (that needs CMake 3.19 or newer): add `system` keys to it"
-    ));
+    diags.warn_in(
+        &format!("dependency.{dep}"),
+        None,
+        format!(
+            "the system libraries of dependency `{dep}` are not detected (that needs CMake 3.19 or newer): add `system` keys to it"
+        ),
+    );
     None
 }
 

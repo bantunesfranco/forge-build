@@ -283,9 +283,13 @@ pub fn to_prepared(
         let framework = (flag == "-framework").then(|| it.next()).flatten();
         let gnu_only = flag.starts_with("-Wl,") || flag == "-pthread" || framework.is_some();
         if msvc && gnu_only {
-            diags.warn(format!(
-                "dependency `{dep}`: dropped link option `{flag}`, which the MSVC-like linker does not take"
-            ));
+            diags.warn_in(
+                &format!("dependency.{dep}"),
+                None,
+                format!(
+                    "dependency `{dep}`: dropped link option `{flag}`, which the MSVC-like linker does not take"
+                ),
+            );
             continue;
         }
         match framework {
@@ -314,7 +318,7 @@ pub fn prepare_system(project: &mut Project, unit: usize) -> Result<Prepared, Co
         None => return Err(ConfigError::invalid(field, "not a dependency")),
     };
     let found = find_package(&find, &run_process, &|path| path.is_file())
-        .map_err(|message| ConfigError::invalid(field, message))?;
+        .map_err(|message| ConfigError::at_key(&field, "find", message))?;
     let msvc = matches!(
         project.platform.compiler,
         Compiler::Msvc | Compiler::ClangCl

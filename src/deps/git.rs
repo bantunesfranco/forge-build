@@ -242,7 +242,7 @@ pub fn pin(
         return Ok(entry.commit.clone());
     }
     let commit = resolve_rev(root, name, url, rev)
-        .map_err(|message| ConfigError::invalid(format!("dependency.{name}"), message))?;
+        .map_err(|message| ConfigError::at_key(format!("dependency.{name}"), "rev", message))?;
     let short = &commit[..commit.len().min(12)];
     diags.info(format!("pinned {name} {rev} -> {short}"));
     lock.entries.insert(

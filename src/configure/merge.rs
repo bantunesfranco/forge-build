@@ -170,8 +170,9 @@ fn set_scalar(
     ctx: &LookupCtx,
 ) -> Result<(), ConfigError> {
     if entry.value.is_array() {
-        return Err(ConfigError::invalid(
+        return Err(ConfigError::at_key(
             &table.origin,
+            &entry.raw_key,
             format!("`{}` is not a list and cannot be an array", entry.raw_key),
         ));
     }
@@ -221,8 +222,9 @@ fn apply_remove(
             continue;
         }
         if at.is_none() {
-            return Err(ConfigError::invalid(
+            return Err(ConfigError::at_key(
                 &table.origin,
+                &entry.raw_key,
                 format!(
                     "`{shown}` is not present in `{name}` ({vis_name}) on {triplet}; {hint}",
                     vis_name = vis.as_str(),
@@ -270,8 +272,9 @@ fn absent_hint(layers: &[Layer], remove: &Entry, item: &toml::Value) -> String {
 /// The items of a list entry, or the "needs an array" error.
 fn array_of<'a>(table: &Table, entry: &'a Entry) -> Result<&'a [toml::Value], ConfigError> {
     entry.value.as_array().map(Vec::as_slice).ok_or_else(|| {
-        ConfigError::invalid(
+        ConfigError::at_key(
             &table.origin,
+            &entry.raw_key,
             format!("`{}` must be an array", entry.raw_key),
         )
     })
@@ -285,7 +288,11 @@ fn sourced(
     ctx: &LookupCtx,
 ) -> Result<Sourced, ConfigError> {
     let expanded = expand_value(value, ctx).map_err(|message| {
-        ConfigError::invalid(&table.origin, format!("`{}`: {message}", entry.raw_key))
+        ConfigError::at_key(
+            &table.origin,
+            &entry.raw_key,
+            format!("`{}`: {message}", entry.raw_key),
+        )
     })?;
     let template = match (value, &expanded) {
         (toml::Value::String(before), toml::Value::String(after)) if before != after => {

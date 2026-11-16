@@ -9,7 +9,7 @@ use std::{
 use crate::config::{
     ConfigError, Diagnostics,
     schema::{OptionDecl, OptionType},
-    vocab::{Arch, Os, Platform},
+    vocab::{Arch, Condition, Os, Platform},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,11 +97,20 @@ fn enum_value(name: &str, decl: &OptionDecl, raw: &str) -> Result<OptionValue, S
 fn parse_default(
     name: &str,
     decl: &OptionDecl,
+    condition: Option<Condition>,
     v: &toml::Value,
 ) -> Result<OptionValue, ConfigError> {
     let field = format!("option.{name}");
+    let key = match condition {
+        Some(c) => format!("default.{}", c.as_str()),
+        None => "default".to_string(),
+    };
     let wrong = |expected: &str| {
-        ConfigError::invalid(&field, format!("default must be {expected}, got `{v}`"))
+        ConfigError::at_key(
+            &field,
+            &key,
+            format!("default must be {expected}, got `{v}`"),
+        )
     };
     match (decl.ty, v) {
         (OptionType::Bool, toml::Value::Boolean(b)) => Ok(OptionValue::Bool(*b)),
@@ -111,7 +120,7 @@ fn parse_default(
         (OptionType::String, toml::Value::String(s)) => Ok(OptionValue::Str(s.clone())),
         (OptionType::String, _) => Err(wrong("a string")),
         (OptionType::Enum, toml::Value::String(s)) => enum_value(name, decl, s)
-            .map_err(|m| ConfigError::invalid(&field, format!("default: {m}"))),
+            .map_err(|m| ConfigError::at_key(&field, &key, format!("default: {m}"))),
         (OptionType::Enum, _) => Err(wrong("a string")),
     }
 }
@@ -159,8 +168,8 @@ pub fn resolve_options(
     let mut out = BTreeMap::new();
     for (name, decl) in decls {
         // Validate every declared default, not only the one that applies here.
-        for (_, v) in &decl.defaults {
-            parse_default(name, decl, v)?;
+        for (condition, v) in &decl.defaults {
+            parse_default(name, decl, *condition, v)?;
         }
         let resolved = if let Some(raw) = cli_values.get(name.as_str()) {
             let value = parse_raw(name, decl, raw)
@@ -182,7 +191,7 @@ pub fn resolve_options(
             }
         } else if let Some(v) = select_default(decl, platform) {
             ResolvedOption {
-                value: parse_default(name, decl, v)?,
+                value: parse_default(name, decl, None, v)?,
                 source: OptionSource::Default,
             }
         } else {
