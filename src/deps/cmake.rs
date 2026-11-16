@@ -598,13 +598,21 @@ fn strip_dir(dir: &Path, path: &Path) -> Option<PathBuf> {
 }
 
 /// The probe script for `dep`, or `None` (with a warning) when `version` of
-/// CMake cannot defer commands.
+/// CMake cannot defer commands, or when `options` set `CMAKE_PROJECT_INCLUDE`
+/// themselves, which replaces the probe's include.
 fn probe_script_for(
     dep: &str,
     expose: &[String],
+    options: &BTreeMap<String, String>,
     version: Option<(u32, u32)>,
     diags: &mut Diagnostics,
 ) -> Option<String> {
+    if options.contains_key("CMAKE_PROJECT_INCLUDE") {
+        diags.warn(format!(
+            "dependency.{dep}: the option CMAKE_PROJECT_INCLUDE replaces forge's probe, so its system libraries are not detected: add `system` keys to it"
+        ));
+        return None;
+    }
     if version.is_some_and(|v| v >= PROBE_MIN_VERSION) {
         return Some(probe_script(expose));
     }
@@ -728,7 +736,13 @@ pub fn build_cmake(
         toolchains.ar.as_deref(),
     )?;
     tool_args.extend(archiver_args(&ar, &find_program)?);
-    let probe = probe_script_for(&u.name, &dep.expose, cmake_version(), diags);
+    let probe = probe_script_for(
+        &u.name,
+        &dep.expose,
+        &dep.cmake_options,
+        cmake_version(),
+        diags,
+    );
     if let Some(script) = &probe {
         let file = build.join(PROBE_FILE);
         write_if_changed(&file, script)
@@ -1086,6 +1100,32 @@ mod tests {
         assert!(script.contains("EXCLUDE_FROM_ALL"));
         assert!(script.contains("FORGE_PROBE_DONE"));
         assert!(!script.contains("IN_LIST"));
+    }
+
+    #[test]
+    fn a_dependency_that_sets_its_own_project_include_is_warned_about() {
+        let expose = s(&["m"]);
+        let mut diags = Diagnostics::default();
+        let mut options = BTreeMap::new();
+        assert!(probe_script_for("m", &expose, &options, Some((3, 26)), &mut diags).is_some());
+        assert!(diags.items.is_empty());
+
+        options.insert("CMAKE_PROJECT_INCLUDE".to_string(), "x.cmake".to_string());
+        assert!(probe_script_for("m", &expose, &options, Some((3, 26)), &mut diags).is_none());
+        assert_eq!(diags.items.len(), 1, "{:?}", diags.items);
+        let message = &diags.items[0].1;
+        assert!(
+            message.starts_with("dependency.m:")
+                && message.contains("CMAKE_PROJECT_INCLUDE")
+                && message.contains("`system` keys"),
+            "{message}"
+        );
+
+        // An old CMake warns once, too.
+        let mut old = Diagnostics::default();
+        let none = BTreeMap::new();
+        assert!(probe_script_for("m", &expose, &none, Some((3, 18)), &mut old).is_none());
+        assert_eq!(old.items.len(), 1);
     }
 
     #[test]
