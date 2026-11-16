@@ -27,7 +27,7 @@ use lookup::{Alias, LookupCtx, expand, uses_platform_lookup};
 use merge::{Layer, Merged, Removals, Sourced, merge, merge_with};
 use model::{
     Configured, DepDetails, IncludeDir, Invocation, ProfileScalars, Settings, Unit, UnitKind,
-    compare_versions,
+    compare_versions, duplicate_static_links,
 };
 use options::resolve_options;
 use system_libs::{LOGICAL, SystemLib, resolve_logical};
@@ -750,7 +750,7 @@ pub fn configure(
     let cross_triple = (inv.target.is_some()
         && host_os_arch().is_ok_and(|host| host != (platform.os, platform.arch)))
     .then(|| llvm_triple(platform.os, platform.arch));
-    Ok(Configured {
+    let mut configured = Configured {
         platform,
         cross_triple,
         sysroot: None,
@@ -763,7 +763,32 @@ pub fn configure(
         units,
         link_order,
         diagnostics: diags,
-    })
+    };
+    warn_duplicate_static_links(&mut configured);
+    Ok(configured)
+}
+
+/// A static library that a bin links directly and also through a shared
+/// library is in the process twice, with its global state (spec 6.5, 12).
+fn warn_duplicate_static_links(c: &mut Configured) {
+    let mut warnings = Vec::new();
+    for (bin, unit) in c.units.iter().enumerate() {
+        if unit.kind != UnitKind::Bin {
+            continue;
+        }
+        for (lib, shared) in duplicate_static_links(c, bin) {
+            warnings.push((
+                unit_origin(unit),
+                format!(
+                    "static library `{}` is linked into the bin directly and through shared library `{}`; its code and global state exist twice",
+                    c.units[lib].name, c.units[shared].name
+                ),
+            ));
+        }
+    }
+    for (origin, message) in warnings {
+        c.diagnostics.warn_at(&origin, None, message);
+    }
 }
 
 /// `output` names an artifact: one file name, never a path (spec 6.1).

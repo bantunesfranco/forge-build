@@ -61,9 +61,8 @@ pub struct ProfileScalars {
 pub enum UnitKind {
     /// A static library with sources.
     Lib,
-    /// A `lib` with `kind = "shared"` (spec 6.5). Building it is not done yet,
-    /// so `Project::load` rejects it; every place that matches `UnitKind` has
-    /// to decide what a shared library means there.
+    /// A `lib` with `kind = "shared"` (spec 6.5): linked like a bin, and
+    /// linked by its consumers as one unit.
     SharedLib,
     /// A `lib` with `include` and no `sources`: headers only, no archive.
     InterfaceLib,
@@ -156,12 +155,13 @@ pub struct Effective {
     /// (and of that dependency's public dependencies). `link_flags` and
     /// `system` are left empty; see `link_system` and `link_flags` below.
     pub compile: Settings,
-    /// Static libraries to link (`Lib` and `sources` dependency units), through
-    /// every dependency edge whatever its visibility, consumers first.
+    /// Libraries to link (`Lib`, `SharedLib` and `sources` dependency units),
+    /// through every dependency edge whatever its visibility, consumers first.
+    /// A shared library is listed but what is behind it is not (`link_reach`).
     pub link_units: Vec<usize>,
-    /// System libraries of this unit and everything it reaches.
+    /// System libraries of this unit and what its link reaches.
     pub link_system: Vec<SystemLib>,
-    /// Raw link flags of this unit and everything it reaches.
+    /// Raw link flags of this unit and what its link reaches.
     pub link_flags: Vec<String>,
 }
 
@@ -261,6 +261,85 @@ pub fn reachable(c: &Configured, unit: usize) -> Vec<usize> {
         .collect()
 }
 
+/// The units whose link side `unit`'s link takes: everything reachable from it,
+/// except that nothing behind a shared library is (spec 6.5). A shared library
+/// that is reached is in the result and stops that path there. When `unit` is
+/// itself a shared library its own link looks through it. In `link_order`.
+pub fn link_reach(c: &Configured, unit: usize) -> Vec<usize> {
+    let index = name_index(c);
+    let mut seen = HashSet::new();
+    let mut stack = vec![unit];
+    while let Some(u) = stack.pop() {
+        if u != unit && c.units[u].kind == UnitKind::SharedLib {
+            continue;
+        }
+        for (dep, _) in edges(c, &index, u) {
+            if seen.insert(dep) {
+                stack.push(dep);
+            }
+        }
+    }
+    seen.remove(&unit);
+    c.link_order
+        .iter()
+        .copied()
+        .filter(|u| seen.contains(u))
+        .collect()
+}
+
+/// Whether the code of `unit` ends up inside a shared library, which makes it
+/// position-independent code (spec 6.5): it is a shared library, or a static
+/// library, `sources` or `cmake` dependency that some shared library's link
+/// takes in.
+pub fn linked_into_shared(c: &Configured, unit: usize) -> bool {
+    c.units[unit].kind == UnitKind::SharedLib
+        || c.units
+            .iter()
+            .enumerate()
+            .any(|(s, u)| u.kind == UnitKind::SharedLib && link_reach(c, s).contains(&unit))
+}
+
+/// A static library or `sources` dependency (`lib`) that `bin` links directly
+/// and also through a shared library (`shared`): its code and global state
+/// then exist twice (spec 6.5). One entry per pair, in `link_order`.
+pub fn duplicate_static_links(c: &Configured, bin: usize) -> Vec<(usize, usize)> {
+    let direct = link_reach(c, bin);
+    let mut found = Vec::new();
+    // Every shared library the bin's link reaches, directly or through another.
+    let mut shared: Vec<usize> = Vec::new();
+    let mut todo: Vec<usize> = direct
+        .iter()
+        .copied()
+        .filter(|&u| c.units[u].kind == UnitKind::SharedLib)
+        .collect();
+    while let Some(s) = todo.pop() {
+        if shared.contains(&s) {
+            continue;
+        }
+        shared.push(s);
+        todo.extend(
+            link_reach(c, s)
+                .into_iter()
+                .filter(|&u| c.units[u].kind == UnitKind::SharedLib),
+        );
+    }
+    shared.sort_by_key(|s| c.link_order.iter().position(|u| u == s));
+    for lib in &direct {
+        if !matches!(
+            c.units[*lib].kind,
+            UnitKind::Lib | UnitKind::Dep(DepKind::Sources)
+        ) {
+            continue;
+        }
+        for &s in &shared {
+            if link_reach(c, s).contains(lib) {
+                found.push((*lib, s));
+            }
+        }
+    }
+    found
+}
+
 pub fn effective(c: &Configured, unit: usize) -> Effective {
     let index = name_index(c);
     let own = &c.units[unit];
@@ -273,16 +352,16 @@ pub fn effective(c: &Configured, unit: usize) -> Effective {
         export_into(c, &index, dep, &mut seen, &mut compile);
     }
 
-    let reach = reachable(c, unit);
+    // The link side stops at a shared library: it is linked, and what is
+    // inside it (its `system` libraries, `link_flags`) is not looked at.
+    let reach = link_reach(c, unit);
     let link_units = reach
         .iter()
         .copied()
         .filter(|u| {
-            // A shared library is linked as a unit of its own, which is not
-            // done yet (`Project::load` rejects it).
             matches!(
                 c.units[*u].kind,
-                UnitKind::Lib | UnitKind::Dep(DepKind::Sources)
+                UnitKind::Lib | UnitKind::SharedLib | UnitKind::Dep(DepKind::Sources)
             )
         })
         .collect();
@@ -290,8 +369,11 @@ pub fn effective(c: &Configured, unit: usize) -> Effective {
     let mut link_system = Vec::new();
     let mut link_flags = Vec::new();
     for u in std::iter::once(unit).chain(reach) {
-        let unit = &c.units[u];
-        for side in [&unit.private, &unit.public] {
+        let reached = &c.units[u];
+        if reached.kind == UnitKind::SharedLib && u != unit {
+            continue;
+        }
+        for side in [&reached.private, &reached.public] {
             push_unique(&mut link_system, &side.system);
             push_unique(&mut link_flags, &side.link_flags);
         }
@@ -1390,6 +1472,110 @@ features = [\"x\"]
         assert_eq!(unit(&c, "m").output, "game");
         assert_eq!(unit(&c, "m").subsystem, Some(Subsystem::Windows));
         assert_eq!(unit(&c, "a").output, "a");
+    }
+
+    /// app -> mid (static) -> sh1 (shared) -> a (static), sh2 (shared) -> b (static, `m`).
+    const BOUNDARY: &str = concat!(
+        "[lib.b]\nsources = [\"a.c\"]\nsystem = [\"math\"]\n",
+        "[lib.sh2]\nkind = \"shared\"\nsources = [\"a.c\"]\ndeps = [\"b\"]\n",
+        "[lib.a]\nsources = [\"a.c\"]\n",
+        "[lib.sh1]\nkind = \"shared\"\nsources = [\"a.c\"]\ndeps = [\"a\", \"sh2\"]\n",
+        "[lib.mid]\nsources = [\"a.c\"]\ndeps = [\"sh1\"]\n",
+        "[bin.app]\nsources = [\"a.c\"]\ndeps = [\"mid\"]\n",
+    );
+
+    /// The names of `units`, sorted.
+    fn sorted(c: &Configured, units: Vec<usize>) -> Vec<&str> {
+        let mut names: Vec<&str> = units.iter().map(|&u| c.units[u].name.as_str()).collect();
+        names.sort_unstable();
+        names
+    }
+
+    #[test]
+    fn a_link_reaches_until_the_first_shared_library_on_each_path() {
+        let c = cfg(BOUNDARY, &["a.c"], LINUX);
+        // The bin takes `mid` and `sh1`, and nothing behind `sh1`.
+        assert_eq!(sorted(&c, link_reach(&c, idx(&c, "app"))), ["mid", "sh1"]);
+        // A shared library's own link looks through itself, up to the next one.
+        assert_eq!(sorted(&c, link_reach(&c, idx(&c, "sh1"))), ["a", "sh2"]);
+        assert_eq!(sorted(&c, link_reach(&c, idx(&c, "sh2"))), ["b"]);
+        // The compile interface is not cut: `reachable` still sees everything.
+        assert_eq!(reachable(&c, idx(&c, "app")).len(), 5);
+    }
+
+    #[test]
+    fn the_link_side_of_what_is_inside_a_shared_library_stops_there() {
+        let c = cfg(BOUNDARY, &["a.c"], LINUX);
+        let app = effective(&c, idx(&c, "app"));
+        assert_eq!(sorted(&c, app.link_units), ["mid", "sh1"]);
+        assert!(app.link_system.is_empty(), "{:?}", app.link_system);
+        // `sh2` links `b` and with it `m`; `sh1` links `sh2` and takes nothing of `b`.
+        let sh2 = effective(&c, idx(&c, "sh2"));
+        assert_eq!(sorted(&c, sh2.link_units), ["b"]);
+        assert_eq!(sh2.link_system, [lib("m")]);
+        let sh1 = effective(&c, idx(&c, "sh1"));
+        assert_eq!(sorted(&c, sh1.link_units), ["a", "sh2"]);
+        assert!(sh1.link_system.is_empty(), "{:?}", sh1.link_system);
+    }
+
+    #[test]
+    fn the_compile_interface_goes_through_a_shared_library() {
+        let src = "[lib.a]\nsources = [\"a.c\"]\ninclude.public = [\"ia\"]\ndefines.public = [\"A\"]\n[lib.sh]\nkind = \"shared\"\nsources = [\"a.c\"]\ndeps.public = [\"a\"]\ninclude.public = [\"ish\"]\n[bin.app]\nsources = [\"a.c\"]\ndeps = [\"sh\"]\n";
+        let c = cfg(src, &["a.c", "ia/", "ish/"], LINUX);
+        let eff = effective(&c, idx(&c, "app"));
+        assert!(has_define(&eff.compile, "A"));
+        assert!(has_define(&eff.compile, "SH_SHARED"));
+        let includes: Vec<_> = eff.compile.include.iter().map(|i| i.path.clone()).collect();
+        assert!(includes.contains(&PathBuf::from("ia")), "{includes:?}");
+        assert!(includes.contains(&PathBuf::from("ish")), "{includes:?}");
+        // ...while the link takes the shared library only.
+        assert_eq!(sorted(&c, eff.link_units), ["sh"]);
+    }
+
+    #[test]
+    fn code_inside_a_shared_library_is_position_independent() {
+        let c = cfg(BOUNDARY, &["a.c"], LINUX);
+        let pic = |name: &str| linked_into_shared(&c, idx(&c, name));
+        // Shared libraries, and statics that one of them links, however deep.
+        assert!(
+            [pic("sh1"), pic("sh2"), pic("a"), pic("b")]
+                .iter()
+                .all(|&p| p)
+        );
+        // `mid` and the bin are linked into nothing shared.
+        assert!(!pic("mid") && !pic("app"));
+    }
+
+    #[test]
+    fn a_static_library_reached_both_ways_is_found_once_per_shared_library() {
+        let c = cfg(BOUNDARY, &["a.c"], LINUX);
+        assert!(duplicate_static_links(&c, idx(&c, "app")).is_empty());
+        // The bin also uses `a` (which `sh1` links) and `b` (which `sh2` links).
+        let src = BOUNDARY.replace("deps = [\"mid\"]", "deps = [\"mid\", \"a\", \"b\"]");
+        let c = cfg(&src, &["a.c"], LINUX);
+        let named = |c: &Configured| -> Vec<(String, String)> {
+            let mut found: Vec<_> = duplicate_static_links(c, idx(c, "app"))
+                .into_iter()
+                .map(|(l, s)| (c.units[l].name.clone(), c.units[s].name.clone()))
+                .collect();
+            found.sort();
+            found
+        };
+        assert_eq!(
+            named(&c),
+            [("a".into(), "sh1".into()), ("b".into(), "sh2".into())]
+        );
+        // One warning each, at the bin's table.
+        let ws = warnings(&c);
+        assert_eq!(ws.len(), 2, "{ws:?}");
+        assert!(
+            ws.iter()
+                .any(|w| w.starts_with("bin.app: ") && w.contains("`a`") && w.contains("`sh1`")),
+            "{ws:?}"
+        );
+        // A bin that does not link the static library itself is fine.
+        let c = cfg(BOUNDARY, &["a.c"], LINUX);
+        assert!(warnings(&c).is_empty());
     }
 
     #[test]
