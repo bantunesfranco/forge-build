@@ -34,10 +34,28 @@ pub struct Sourced {
     pub template: Option<String>,
 }
 
+/// A `remove.*` value written in `workspace` or a profile, and whether this
+/// merge found it to remove (spec 4.4). Such a removal applies to every
+/// target, so one that has nothing to remove is skipped; the caller warns when
+/// no target had the value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedRemoval {
+    /// The table it was written in, e.g. `workspace` or `profile.debug`.
+    pub origin: String,
+    /// The key as written, e.g. `remove.defines.public`.
+    pub raw_key: String,
+    /// The value as shown to the user.
+    pub value: String,
+    /// Whether the value was present and is now gone.
+    pub removed: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct Merged {
     pub lists: BTreeMap<(String, Visibility), Vec<Sourced>>,
     pub scalars: BTreeMap<String, Sourced>,
+    /// The removals of tables that apply to every target, in the order applied.
+    pub shared_removals: Vec<SharedRemoval>,
 }
 
 impl Merged {
@@ -55,11 +73,9 @@ impl Merged {
 /// Which `remove.*` entries a merge applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Removals {
-    /// Every removal; a value that is not present is an error.
+    /// Every removal. A value that is not present is an error, except for a
+    /// removal in `workspace` or a profile, which is skipped (spec 4.4).
     All,
-    /// Every removal, but a value that is not present is skipped. For merges
-    /// that do not see the layer that adds the value (a dependency's profile).
-    SkipAbsent,
     /// Only the removals of this key; the rest wait for the final merge.
     Only(&'static str),
 }
@@ -97,7 +113,7 @@ pub fn merge_with(
             if entry.key.remove {
                 let wanted = match removals {
                     Removals::Only(key) => entry.key.name == key,
-                    Removals::All | Removals::SkipAbsent => true,
+                    Removals::All => true,
                 };
                 if wanted {
                     pending.push((layer.table, entry, layer.alias));
@@ -112,7 +128,7 @@ pub fn merge_with(
 
     for (table, entry, alias) in pending {
         let lctx = layer_ctx(ctx, alias);
-        apply_remove(&mut merged, layers, table, entry, &lctx, removals)?;
+        apply_remove(&mut merged, layers, table, entry, &lctx)?;
     }
     Ok(merged)
 }
@@ -179,22 +195,32 @@ fn apply_remove(
     table: &Table,
     entry: &Entry,
     ctx: &LookupCtx,
-    removals: Removals,
 ) -> Result<(), ConfigError> {
     let items = array_of(table, entry)?;
     let name = &entry.key.name;
     let vis = entry.key.visibility;
+    let shared = applies_to_every_target(table);
     for item in items {
         let want = sourced(table, entry, item, ctx)?.value;
+        let shown = match &want {
+            toml::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
         let list = merged.lists.entry((name.clone(), vis)).or_default();
-        let Some(at) = list.iter().position(|s| s.value == want) else {
-            if removals == Removals::SkipAbsent {
-                continue;
-            }
-            let shown = match &want {
-                toml::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
+        let at = list.iter().position(|s| s.value == want);
+        if let Some(at) = at {
+            list.remove(at);
+        }
+        if shared {
+            merged.shared_removals.push(SharedRemoval {
+                origin: table.origin.clone(),
+                raw_key: entry.raw_key.clone(),
+                value: shown,
+                removed: at.is_some(),
+            });
+            continue;
+        }
+        if at.is_none() {
             return Err(ConfigError::invalid(
                 &table.origin,
                 format!(
@@ -204,10 +230,15 @@ fn apply_remove(
                     hint = absent_hint(layers, entry, item),
                 ),
             ));
-        };
-        list.remove(at);
+        }
     }
     Ok(())
+}
+
+/// `workspace` and the profiles are inherited by every target, so a removal
+/// written there cannot know which target has the value (spec 4.4).
+fn applies_to_every_target(table: &Table) -> bool {
+    table.origin == "workspace" || table.origin.starts_with("profile.")
 }
 
 /// What to do about a removal of a value that is not there: name the key that
@@ -521,6 +552,52 @@ mod tests {
         assert!(e.contains("`defines` (public)"), "{e}");
         assert!(e.contains("`remove.defines.public.windows`"), "{e}");
         assert!(e.starts_with("lib.a: "), "{e}");
+    }
+
+    #[test]
+    fn workspace_and_profile_remove_skip_absent_values() {
+        let ws = table("workspace", &[("remove.defines", r#"["NOPE"]"#)]);
+        let profile = table("profile.debug", &[("remove.defines.public", r#"["ALSO"]"#)]);
+        let lib = table("lib.a", &[("defines", r#"["A"]"#)]);
+        let m = merged_on(&[&ws, &profile, &lib], linux_clang());
+        assert_eq!(strs(m.list("defines", Private)), ["A"]);
+        let seen: Vec<_> = m
+            .shared_removals
+            .iter()
+            .map(|r| {
+                (
+                    r.origin.as_str(),
+                    r.raw_key.as_str(),
+                    r.value.as_str(),
+                    r.removed,
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("workspace", "remove.defines", "NOPE", false),
+                ("profile.debug", "remove.defines.public", "ALSO", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_remove_records_the_values_it_removed() {
+        let ws = table("workspace", &[("remove.defines", r#"["A", "B"]"#)]);
+        let lib = table("lib.a", &[("defines", r#"["A"]"#)]);
+        let m = merged_on(&[&ws, &lib], linux_clang());
+        assert!(m.list("defines", Private).is_empty());
+        let removed: Vec<_> = m.shared_removals.iter().map(|r| r.removed).collect();
+        assert_eq!(removed, [true, false]);
+    }
+
+    #[test]
+    fn target_remove_is_not_recorded_as_shared() {
+        let ws = table("workspace", &[("defines", r#"["A"]"#)]);
+        let lib = table("lib.a", &[("remove.defines", r#"["A"]"#)]);
+        let m = merged_on(&[&ws, &lib], linux_clang());
+        assert!(m.shared_removals.is_empty());
     }
 
     #[test]

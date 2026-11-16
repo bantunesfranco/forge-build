@@ -491,13 +491,9 @@ pub fn configure(
     };
 
     // Profile scalars and the profile's defines/flags, for dependency builds (spec 8.1).
-    // A dependency never sees workspace values, so a profile removal of one has nothing to remove.
-    let mut profile_merged = merge_with(
-        &profile_layers(),
-        &cx.lookup(None),
-        LIST_KEYS,
-        Removals::SkipAbsent,
-    )?;
+    // A dependency never sees workspace values, so a profile removal of one has nothing to remove
+    // (a profile's removals are skipped when absent, and not counted for the typo warning below).
+    let mut profile_merged = merge(&profile_layers(), &cx.lookup(None), LIST_KEYS)?;
     let missing = |k: &str| {
         ConfigError::invalid(
             format!("profile.{profile}"),
@@ -525,6 +521,8 @@ pub fn configure(
     }
 
     let mut units = Vec::new();
+    // Whether any target had the value a `workspace` or profile removal names.
+    let mut shared_removals: BTreeMap<(String, String, String), bool> = BTreeMap::new();
 
     for (name, decl) in &m.targets {
         let origin = &decl.settings.origin;
@@ -538,6 +536,11 @@ pub fn configure(
             alias: None,
         });
         let (mut merged, _) = cx.merge_unit(layers, None)?;
+        for r in &merged.shared_removals {
+            *shared_removals
+                .entry((r.origin.clone(), r.raw_key.clone(), r.value.clone()))
+                .or_default() |= r.removed;
+        }
         if !profile_scalars.asserts {
             ensure_ndebug(&mut merged, &profile);
         }
@@ -646,6 +649,15 @@ pub fn configure(
             warn_abi(&unit.name, origin, &unit.private, &mut diags);
         }
         units.push(unit);
+    }
+
+    // A removal in `workspace` or a profile that no target had the value for is probably a typo.
+    for ((origin, key, value), removed) in &shared_removals {
+        if !removed {
+            diags.warn(format!(
+                "{origin}: {key} value `{value}` is not present in any target"
+            ));
+        }
     }
 
     check_duplicate_outputs(&units, platform.os)?;

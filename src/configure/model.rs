@@ -637,6 +637,69 @@ mod tests {
     }
 
     #[test]
+    fn profile_remove_reaches_every_target_that_has_the_value() {
+        let src = "[workspace]\ndefines = [\"LOG\", \"KEEP\"]\n[profile.debug]\nremove.defines = [\"LOG\"]\n[bin.app]\nsources = [\"a.c\"]\nremove.defines = [\"KEEP\"]\n[lib.l]\nsources = [\"l.c\"]\n";
+        let c = cfg(src, &["a.c", "l.c"], LINUX);
+        assert!(!has_define(&unit(&c, "app").private, "LOG"));
+        assert!(!has_define(&unit(&c, "l").private, "LOG"));
+        assert!(has_define(&unit(&c, "l").private, "KEEP"));
+        assert!(warnings(&c).is_empty(), "{:?}", warnings(&c));
+    }
+
+    #[test]
+    fn workspace_remove_skips_a_target_without_the_value() {
+        let src = "[workspace]\nremove.defines = [\"LOG\"]\n[bin.app]\nsources = [\"a.c\"]\n[lib.l]\nsources = [\"l.c\"]\ndefines = [\"LOG\", \"KEEP\"]\n";
+        let c = cfg(src, &["a.c", "l.c"], LINUX);
+        assert!(!has_define(&unit(&c, "l").private, "LOG"));
+        assert!(has_define(&unit(&c, "l").private, "KEEP"));
+        assert!(unit(&c, "app").private.defines.is_empty());
+        assert!(warnings(&c).is_empty(), "{:?}", warnings(&c));
+    }
+
+    #[test]
+    fn workspace_and_profile_remove_of_a_value_no_target_has_warns() {
+        let src = "[workspace]\ndefines = [\"KEEP\"]\nremove.defines = [\"LOG\"]\n[profile.debug]\nremove.defines.public = [\"GONE\"]\n[bin.app]\nsources = [\"a.c\"]\n[lib.l]\nsources = [\"l.c\"]\n";
+        let c = cfg(src, &["a.c", "l.c"], LINUX);
+        assert_eq!(
+            warnings(&c),
+            [
+                "profile.debug: remove.defines.public value `GONE` is not present in any target",
+                "workspace: remove.defines value `LOG` is not present in any target",
+            ]
+        );
+    }
+
+    #[test]
+    fn dependencies_do_not_count_towards_the_unused_removal_warning() {
+        // A dependency never receives workspace values, so its own `LOG` cannot be what the workspace removes.
+        let src = "[workspace]\nremove.defines = [\"LOG\"]\n[bin.app]\nsources = [\"a.c\"]\n[dependency.d]\npath = \"d\"\nkind = \"header-only\"\ndefines.public = [\"LOG\"]\n";
+        let c = cfg(src, &["a.c", "d/"], LINUX);
+        assert_eq!(
+            warnings(&c),
+            ["workspace: remove.defines value `LOG` is not present in any target"]
+        );
+        assert!(has_define(&unit(&c, "d").public, "LOG"));
+    }
+
+    #[test]
+    fn a_removal_under_another_platforms_condition_is_not_counted() {
+        let src =
+            "[workspace]\nremove.defines.windows = [\"LOG\"]\n[bin.app]\nsources = [\"a.c\"]\n";
+        let c = cfg(src, &["a.c"], LINUX);
+        assert!(warnings(&c).is_empty(), "{:?}", warnings(&c));
+    }
+
+    #[test]
+    fn target_remove_of_an_absent_value_is_still_an_error() {
+        let src = "[workspace]\ndefines = [\"KEEP\"]\n[bin.app]\nsources = [\"a.c\"]\nremove.defines = [\"LOG\"]\n";
+        let e = err(src, &["a.c"], LINUX);
+        assert!(
+            e.starts_with("bin.app: ") && e.contains("`LOG` is not present"),
+            "{e}"
+        );
+    }
+
+    #[test]
     fn target_root_applies_to_its_own_paths_only() {
         let src = "[workspace]\ninclude.public = [\"include\"]\nsources = [\"common/*.cpp\"]\n[lib.engine]\nroot = \"engine\"\nsources = [\"srcs/*.cpp\"]\ninclude.public = [\"inc\"]\n";
         let c = cfg(
