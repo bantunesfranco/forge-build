@@ -26,7 +26,7 @@ plan without running anything.
 
 ## Quick start
 
-Requirements: a Rust toolchain and a C/C++ compiler (`gcc`, `clang` or MSVC `cl`).
+Requirements: a Rust toolchain and a C/C++ compiler (`gcc`, `clang`, Apple clang, MSVC `cl` or `clang-cl`).
 
 ```text
 cargo install --path .
@@ -134,9 +134,12 @@ libraries. A changed `options` entry or generator configures from a clean cache.
 
 ### Cross builds
 
-With `--target`, `clang` and `clang-cl` are given `--target=<triple>` for compiling
-and linking, when the platform differs from the host's. `gcc`, Apple clang and MSVC
-get nothing added: name their cross compilers in a `--toolchain` file. `cmake`
+With `--target`, `clang`, Apple clang and `clang-cl` are given `--target=<triple>`
+for compiling and linking, when the platform differs from the host's. `gcc` and MSVC
+choose their target by which compiler runs, so they get nothing added: name their
+cross compilers in a `--toolchain` file (or `CC`/`CXX`). Without one, forge prints
+`warning: --target <t>: <compiler> cannot cross-compile by flag` and builds for the
+host. `cmake`
 dependencies also get `CMAKE_SYSTEM_NAME` and `CMAKE_SYSTEM_PROCESSOR`, plus
 `CMAKE_<LANG>_COMPILER_TARGET` for clang.
 
@@ -182,18 +185,26 @@ the first reason that applies:
 | --- | --- |
 | `no previous build record` | Never built, or the last attempt left no trustworthy record. |
 | `<path> was rebuilt` | An upstream task is running, so this one must too. |
-| `command or compiler changed` | Flags, defines, standard, or the compiler's `--version` changed. |
+| `command or compiler changed` | Flags, defines, standard, or the compiler's identity changed (`--version`, or the `cl` banner, which names its host and target architecture). |
 | `output missing: <path>` / `output modified: <path>` | The object, depfile or executable is gone or was tampered with. |
 | `list of inputs changed` | A source was added or removed. |
 | `<path> changed` | A source, a header, or a linked library differs from what was recorded. |
 
 **Content, not timestamps.** Files are compared by BLAKE3 hash of their bytes, so
-touching a file does nothing and a restored older file is noticed. A rebuild that
-produces identical bytes does not cascade into the things that use them.
+touching a file does nothing and a restored older file is noticed. A task that
+reruns always reruns its dependents, even if it produced identical bytes (see
+Limitations).
 
-**Headers.** Compiles run with `-MMD -MF`. After a successful compile the depfile is
-parsed and the header list is stored with the task, so editing a header rebuilds
-exactly the files that include it.
+**Headers.** Compiles write a dependency file: `-MMD -MF` for gcc and clang,
+`/clang:-MMD` for `clang-cl` and `/sourceDependencies` (JSON) for `cl`. After a
+successful compile it is parsed and the header list is stored with the task, so
+editing a header rebuilds exactly the files that include it.
+
+**Archives.** A static library's archive is deleted before it is archived again, so
+a removed or renamed source never stays in it.
+
+**Debug info.** With MSVC-like compilers, `/Zi` writes its PDB into
+`build/<profile>/obj/<target>/` (one per target), never into the project directory.
 
 **Libraries.** Static libraries of the project and of its dependencies are inputs of
 the link, so rebuilding one relinks the program. Logical system libraries
@@ -267,15 +278,16 @@ clang-cl and clang (Windows), and runs the Rust tests of the Windows build under
 
 ## Platforms and limitations
 
-Linux, macOS and Windows (MSVC `cl` or `clang-cl`).
+Linux, macOS (Apple clang or Homebrew LLVM) and Windows (MSVC `cl`, `clang-cl`, `clang` or MinGW `gcc`).
 
 - **Environment variables** that change compilation (`CPATH`, `SDKROOT`, ...) are not
   part of the fingerprint.
-- **System headers** (omitted by `-MMD`) are covered only through the compiler's
-  `--version`, so a header-only system change goes unnoticed.
+- **System headers** are not listed by `-MMD` (gcc, clang, `clang-cl`), so they are
+  covered only through the compiler's identity and a header-only system change goes
+  unnoticed. `cl` lists them in its JSON and tracks them.
 - **A new header earlier in the include path that shadows an existing one** is not
   detected. Make and Ninja share this limit.
-- **No early cutoff.** If a compile produces identical bytes, the link still runs.
+- **No early cutoff.** If a compile produces identical bytes, the archive and the link still run.
 - **A small timing window:** a header edited within milliseconds after its compile
   starts can be recorded as clean.
 - **Ctrl-C is not handled specially.** A partially written output is caught on the

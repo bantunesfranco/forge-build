@@ -6,7 +6,7 @@ These scripts test Forge against real C and C++ toolchains. They are developer t
 
 - Python 3
 - A built Forge binary
-- A C compiler (`clang` or `gcc`)
+- A C and C++ compiler (`clang`, `gcc`, Apple clang, or on Windows `cl` or `clang-cl`)
 - A C++ compiler (`clang++` or `g++`)
 - An archiver (`ar`, `llvm-ar` or `lib`) if required by the examples
 

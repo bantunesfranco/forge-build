@@ -273,6 +273,22 @@ def test_cpp_profiles(temp_root: Path) -> None:
             f"{release_output}"
         )
 
+    # Header tracking works with whichever compiler built it: an edited
+    # header rebuilds exactly the files that include it, and nothing else.
+    header = project / "include" / "greeting.hpp"
+    header.write_text(header.read_text() + "\n// edited\n")
+    rebuilt = build(project, profile="debug").stdout
+    for source in ("src/main.cpp", "src/greeting.cpp"):
+        if f"Compiling {source}" not in rebuilt:
+            raise IntegrationTestFailure(
+                f"editing greeting.hpp did not rebuild {source}:\n{rebuilt}"
+            )
+    unchanged = build(project, profile="debug").stdout
+    if "Build is up to date" not in unchanged:
+        raise IntegrationTestFailure(
+            f"a second build after the header edit was not up to date:\n{unchanged}"
+        )
+
     graph = forge(project, "graph", "--dot")
     if "digraph" not in graph.stdout:
         raise IntegrationTestFailure(
