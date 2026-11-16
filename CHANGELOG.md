@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
+
+Second test release. Adds shared libraries; manifests written for 0.1.0 keep working unchanged (libraries stay static unless they say `kind = "shared"`).
+
+Also on crates.io from this release: `cargo install forge-build`.
 
 ### Added
 
@@ -10,6 +14,12 @@
   - Static libraries, `sources` dependencies and `cmake` dependencies that go into a shared library are built position-independent (not on Windows).
   - Programs run from the build directory without setup: DLLs sit next to the executables on Windows, and executables and shared libraries get `$ORIGIN` or `@loader_path` run paths elsewhere.
   - Spec draft 0.4.
+
+### Known limitations
+
+- Shared libraries from dependencies (a `cmake` shared target, a prebuilt `.so`/`.dll`) are not supported yet, and libraries have no version in their file names (`libfoo.so.1`).
+- The warning for a static library linked both directly and through a shared library covers your own libraries and `sources` dependencies only.
+- `output` names get `.dll` appended on Windows even when they already end in `.dll`.
 
 ## 0.1.0
 
