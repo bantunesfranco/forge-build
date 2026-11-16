@@ -19,6 +19,8 @@ use crate::{
     executor::{Executor, ProcessExecutor, path_arg},
     explain::explain_arg,
     graph::Graph,
+    init,
+    lang::Lang,
     platform::host_os_arch,
     project::{BuildTargetKind, Project},
 };
@@ -51,6 +53,12 @@ struct Cli {
     command: Option<Commands>,
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum InitLang {
+    C,
+    Cxx,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     Build {
@@ -73,6 +81,19 @@ enum Commands {
         /// Arguments for the program, after `--`.
         #[arg(last = true, value_name = "ARGS")]
         args: Vec<String>,
+    },
+    /// Create a project in a directory (the current one by default): a
+    /// manifest, and for a directory without sources a hello-world program.
+    /// Needs no existing project.toml.
+    Init {
+        /// The project directory; created if missing.
+        dir: Option<PathBuf>,
+        /// The name of the workspace and its bin (default: the directory's name).
+        #[arg(long)]
+        name: Option<String>,
+        /// The language of the starter program (default: what the sources use, else cxx).
+        #[arg(long, value_enum)]
+        lang: Option<InitLang>,
     },
     Clean {
         #[arg(short, long)]
@@ -176,6 +197,12 @@ fn load_project(
 /// run` exits with the program's own code. Failures are errors.
 pub fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let args: Cli = Cli::parse();
+    // `init` makes the manifest, so it must not look for one (or find a
+    // parent directory's).
+    if let Some(Commands::Init { dir, name, lang }) = &args.command {
+        init_project(dir.as_deref(), name.as_deref(), *lang)?;
+        return Ok(0);
+    }
     let manifest: PathBuf = find_manifest(args.manifest.as_deref())?;
     if let Some(Commands::Update { dep }) = &args.command {
         update(&manifest, dep.as_deref())?;
@@ -248,10 +275,43 @@ pub fn run() -> Result<i32, Box<dyn std::error::Error>> {
             let text = explain_arg(&project, target.as_deref(), &cwd, &ProcessExecutor)?;
             println!("{}", text)
         }
-        Some(Commands::Update { .. }) | None => {}
+        Some(Commands::Update { .. } | Commands::Init { .. }) | None => {}
     }
 
     Ok(0)
+}
+
+/// `forge init`: writes the project and says what it did and what to do next.
+fn init_project(
+    dir: Option<&Path>,
+    name: Option<&str>,
+    lang: Option<InitLang>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shown = dir.unwrap_or(Path::new("."));
+    let lang = lang.map(|l| match l {
+        InitLang::C => Lang::C,
+        InitLang::Cxx => Lang::Cxx,
+    });
+    let created = init::init(shown, name, lang)?;
+    println!("Created project `{}` in {}", created.name, shown.display());
+    if let Some(found) = &created.detected {
+        println!("Found {} source file(s)", found.files);
+        println!("  sources: {}", found.globs.join(", "));
+        if !found.include.is_empty() {
+            println!("  include: {}", found.include.join(", "));
+        }
+    }
+    for file in &created.files {
+        println!("  wrote {file}");
+    }
+    println!();
+    println!("Next steps:");
+    if let Some(dir) = dir.filter(|d| *d != Path::new(".")) {
+        println!("  cd {}", dir.display());
+    }
+    println!("  forge build");
+    println!("  forge run");
+    Ok(())
 }
 
 /// What `forge build` and `forge run` share: prepares the dependencies for the

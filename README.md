@@ -47,6 +47,8 @@ Build is up to date
 Build successful
 ```
 
+To start a new project, run `forge init my-app`, then `cd my-app && forge run`.
+
 `forge explain` shows what a rebuild would do and why, without running anything.
 The `examples/` directory has more projects. `examples/features` uses an option, a
 variant feature, a `${option.*}` lookup, `remove.*` and logical system libraries.
@@ -57,6 +59,7 @@ variant feature, a `${option.*}` lookup, `remove.*` and logical system libraries
 | --- | --- |
 | `forge build [NAME] [-j N] [-v]` | Build all targets, or the named target and its dependency closure. `-v` prints each command and why it runs. |
 | `forge run [NAME] [-j N] [-v] [-- ARGS...]` | Build the bin (and its dependency closure, like `forge build NAME`), then run it. Without a name, the manifest's only bin; with several bins you must name one. Arguments after `--` go to the program unchanged. It runs in the directory you started `forge` from, with your environment and standard streams, and `forge` exits with its exit code (128 plus the signal number on Unix when a signal killed it). A `Running <path>` line and the build progress (`Compiling ...`, `Build is up to date`) go to stderr, so stdout holds only the program's output. If the build fails the program is not run. With `--target` for another platform it builds but refuses to run. |
+| `forge init [DIR] [--name NAME] [--lang c\|cxx]` | Create a project in `DIR` (default: the current directory, created if missing); it needs no existing `project.toml` and ignores any in a parent directory. In an empty directory (or one without C/C++ sources) it writes `project.toml`, `src/main.cpp` (or `src/main.c`) that prints `Hello from <name>`, and adds `build/` to `.gitignore` (created, or appended to without touching other lines); it does not run `git init`. If sources already exist (outside `build/` and hidden directories) it writes only `project.toml`, with `sources` globs for the directories that hold them (`src/**/*.cpp`, or `**/*.cpp` at the top level) and `include` for an existing `include/`, `inc/` or `incs/`, and prints what it found. `--name` defaults to the directory name made valid (`My Game` becomes `My_Game`); `--lang` defaults to what the sources use, else `cxx`. The manifest sets `cxx = "20"` and/or `c = "17"` for the languages present and `warnings = "high"`. It refuses if `project.toml` already exists in `DIR`, and touches nothing then. |
 | `forge compdb` | Write `compile_commands.json` for editors without building anything (see Editor support). |
 | `forge explain [NAME\|PATH]` | With a lib, bin or dependency name: its merged configuration and where every value came from, then why its archive or link task would rebuild. With a path: why that file is rebuilt. With nothing: one line per task. |
 | `forge graph [NAME] [--dot]` | Print all tasks or a target's dependency closure; `--dot` emits Graphviz (`... \| dot -Tpng -o graph.png`). |
@@ -300,6 +303,7 @@ so switching between them never rebuilds.
 | `database`, `fingerprint` | Records and hashing; command and compiler fingerprints |
 | `headers`, `depfile` | Depfile parsing and path normalization |
 | `compdb` | The JSON compilation database for editors |
+| `init` | `forge init`: a starter project or a manifest for existing sources |
 | `build`, `executor` | The scheduler and the process boundary (a trait, so tests can fake it) |
 | `explain` | Renders merged configuration and the plan |
 

@@ -13,6 +13,7 @@ pub mod fingerprint;
 pub mod flags;
 pub mod graph;
 pub mod headers;
+pub mod init;
 pub mod lang;
 pub mod planner;
 pub mod platform;
