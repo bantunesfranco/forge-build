@@ -715,15 +715,19 @@ fn reset_configuration(build: &Path) -> std::io::Result<()> {
 /// Configures (when something changed) and builds the dependency in
 /// `<root>/<build_dir>/deps/<name>/cmake`, then reads what it exposes back
 /// from the File API. Library files are relative to the project root.
+///
+/// With `jobs` of `None` nothing is run and nothing is written: the result is
+/// read from the build directory of an earlier build, and is `None` when there
+/// is none that matches the current configuration.
 pub fn build_cmake(
     c: &Configured,
     root: &Path,
     build_dir: &Path,
     unit: usize,
     toolchains: &Toolchains,
-    jobs: usize,
+    jobs: Option<usize>,
     diags: &mut Diagnostics,
-) -> Result<Prepared, String> {
+) -> Result<Option<Prepared>, String> {
     let u = &c.units[unit];
     let dep = u.dep.as_ref().ok_or("not a dependency")?;
     let rel_build = build_dir.join("deps").join(&u.name).join("cmake");
@@ -751,8 +755,10 @@ pub fn build_cmake(
     );
     if let Some(script) = &probe {
         let file = build.join(PROBE_FILE);
-        write_if_changed(&file, script)
-            .map_err(|e| format!("cannot write {}: {e}", path_arg(&file)))?;
+        if jobs.is_some() {
+            write_if_changed(&file, script)
+                .map_err(|e| format!("cannot write {}: {e}", path_arg(&file)))?;
+        }
         tool_args.push(format!("-DCMAKE_PROJECT_INCLUDE={}", slashed(&file)));
     }
     let args = configure_args(
@@ -782,6 +788,22 @@ pub fn build_cmake(
         && newest_index(&build.join(REPLY_DIR)).is_some()
         && std::fs::read_to_string(&stamp_file).is_ok_and(|old| old == stamp);
 
+    let Some(jobs) = jobs else {
+        if !up_to_date {
+            return Ok(None);
+        }
+        return read_prepared(
+            c,
+            root,
+            &rel_build,
+            unit,
+            build_type,
+            probe.is_some(),
+            diags,
+            true,
+        );
+    };
+
     if !up_to_date {
         let io = |what: &str, path: &Path, e: std::io::Error| {
             format!("cannot {what} {}: {e}", path_arg(path))
@@ -806,7 +828,40 @@ pub fn build_cmake(
         jobs.max(1).to_string(),
     ])?;
 
-    let targets = read_reply_for(&build, Some(build_type))?;
+    read_prepared(
+        c,
+        root,
+        &rel_build,
+        unit,
+        build_type,
+        probe.is_some(),
+        diags,
+        false,
+    )
+}
+
+/// What the built dependency exposes, read from its File API reply. With
+/// `lenient`, a reply that cannot be read or a library that is missing mean
+/// that there is no usable build (`None`) rather than an error.
+#[allow(clippy::too_many_arguments)]
+fn read_prepared(
+    c: &Configured,
+    root: &Path,
+    rel_build: &Path,
+    unit: usize,
+    build_type: &str,
+    has_probe: bool,
+    diags: &mut Diagnostics,
+    lenient: bool,
+) -> Result<Option<Prepared>, String> {
+    let u = &c.units[unit];
+    let dep = u.dep.as_ref().ok_or("not a dependency")?;
+    let build = root.join(rel_build);
+    let compiler = c.platform.compiler;
+    let targets = match read_reply_for(&build, Some(build_type)) {
+        Err(_) if lenient => return Ok(None),
+        other => other?,
+    };
     let (libs, includes) = exposed(&targets, &dep.expose)?;
 
     let mut prepared = Prepared::default();
@@ -817,13 +872,16 @@ pub fn build_cmake(
             PathBuf::from(slashed(&rel_build.join(&lib)))
         };
         if !root.join(&rel).is_file() {
+            if lenient {
+                return Ok(None);
+            }
             return Err(format!("library {} was not built", slashed(&rel)));
         }
         prepared.lib_files.push(rel);
     }
 
     // What the exposed targets link besides their own libraries.
-    if probe.is_some() {
+    if has_probe {
         let msvc = matches!(compiler, Compiler::Msvc | Compiler::ClangCl);
         prepared.extra = probe_settings(&targets, &build, msvc, &u.name, diags);
     }
@@ -845,7 +903,7 @@ pub fn build_cmake(
             }
         }
     }
-    Ok(prepared)
+    Ok(Some(prepared))
 }
 
 #[cfg(test)]

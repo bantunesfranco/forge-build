@@ -94,8 +94,9 @@ build, with the commands `forge build` runs (minus the dependency-file options).
   "as project".
 
 `forge compdb` writes the database without compiling anything, for a fresh
-checkout. A CMake dependency that has not been built contributes only the
-include directories declared in the manifest until you run `forge build` once.
+checkout. It uses a CMake dependency that an earlier `forge build` built; one that is
+not built yet contributes only the include directories declared in the manifest (and
+`forge compdb` says so) until you run `forge build` once.
 
 ## Configuration
 

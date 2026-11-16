@@ -199,7 +199,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => return Err(Box::new(e)),
             }
         }
-        Some(Commands::Compdb) => write_compdb(&mut project, printed)?,
+        Some(Commands::Compdb) => write_compdb(&mut project, &ProcessExecutor, printed)?,
         Some(Commands::Graph { target, dot }) => {
             let mut graph: Graph = Graph::from_project(&project)?;
             if let Some(name) = target.as_deref() {
@@ -238,10 +238,17 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `forge compdb`: the dependencies are prepared as for `graph`, so a CMake
-/// dependency that has not been built contributes only its declared `include`
-/// keys. Nothing is compiled.
-fn write_compdb(project: &mut Project, printed: usize) -> Result<(), Box<dyn std::error::Error>> {
+/// `forge compdb`: the dependencies are prepared as for `graph`, except that a
+/// CMake dependency that an earlier build left behind is read from its build
+/// directory. One that has not been built, or whose configuration changed,
+/// contributes only its declared `include` keys. Nothing is compiled.
+fn write_compdb(
+    project: &mut Project,
+    exec: &dyn Executor,
+    printed: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    prepare_all(project, Phase::Reuse, exec, 1).map_err(|e| project.locations.locate(e))?;
+    project.rebuild_targets()?;
     let not_built: Vec<&str> = project
         .prepared
         .iter()
@@ -250,7 +257,7 @@ fn write_compdb(project: &mut Project, printed: usize) -> Result<(), Box<dyn std
         .collect();
     if !not_built.is_empty() {
         let message = format!(
-            "cmake dependencies are not built by `forge compdb`: {}; only their declared include directories are known (run `forge build` once for complete include paths)",
+            "cmake dependencies not built yet: {}; only their declared include directories are known (run `forge build` once for complete include paths)",
             not_built.join(", ")
         );
         project.diagnostics.info(message);
@@ -419,7 +426,7 @@ mod tests {
         let args = cli(&["compdb"]);
         assert!(matches!(args.command, Some(Commands::Compdb)));
         let mut p = load_project(&root.join("project.toml"), &args, &exec).unwrap();
-        write_compdb(&mut p, 0).unwrap();
+        write_compdb(&mut p, &Clang, 0).unwrap();
 
         for file in [
             "build/debug/compile_commands.json",
@@ -458,7 +465,7 @@ deps = [\"m\"]
         fs::write(root.join("project.toml"), manifest).unwrap();
         fs::create_dir_all(root.join("vendor/m")).unwrap();
         let mut p = load_project(&root.join("project.toml"), &cli(&["compdb"]), &Clang).unwrap();
-        write_compdb(&mut p, 0).unwrap();
+        write_compdb(&mut p, &Clang, 0).unwrap();
         let infos: Vec<String> = diagnostic_lines(&p.diagnostics, &p.locations, 0)
             .into_iter()
             .filter(|l| l.starts_with("info:") && l.contains("forge build"))
