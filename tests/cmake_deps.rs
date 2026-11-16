@@ -378,3 +378,50 @@ fn a_static_library_links_the_system_libraries_it_needs() {
         "{text}"
     );
 }
+
+#[test]
+fn compdb_reads_a_built_cmake_dependency_and_names_an_unbuilt_one() {
+    if !usable("cmake") {
+        eprintln!("skipped: cmake is not installed");
+        return;
+    }
+    let (Some(cc), Some(cxx)) = (real_cc(), real_cxx()) else {
+        eprintln!("skipped: no C and C++ compiler can be run");
+        return;
+    };
+    let f = project_dir(&cc, &cxx);
+    let forge = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_forge"))
+            .current_dir(&f.root)
+            .args(["--toolchain", "toolchain.toml"])
+            .args(args)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "forge {args:?} failed: {stderr}");
+        stderr
+    };
+    let database = || fs::read_to_string(f.root.join("build/compile_commands.json")).unwrap();
+    let include = |text: &str| text.contains("vendor/m/include");
+    let note = "cmake dependencies not built yet: m";
+
+    // Before a build: only the info line, and no File API include.
+    let stderr = forge(&["compdb"]);
+    assert!(stderr.contains(note), "{stderr}");
+    assert!(!include(&database()), "{}", database());
+    assert!(!f.root.join("build/debug/deps/m/cmake").exists());
+
+    forge(&["build"]);
+    let stderr = forge(&["compdb"]);
+    assert!(!stderr.contains(note), "{stderr}");
+    assert!(include(&database()), "{}", database());
+
+    // Another option value no longer matches what was built.
+    f.write(
+        "project.toml",
+        &MANIFEST.replace("M_RESULT = 7", "M_RESULT = 9"),
+    );
+    let stderr = forge(&["compdb"]);
+    assert!(stderr.contains(note), "{stderr}");
+    assert!(!include(&database()), "{}", database());
+}

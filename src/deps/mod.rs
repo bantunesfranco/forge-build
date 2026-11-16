@@ -45,6 +45,11 @@ pub enum Phase {
     /// `graph` and `explain`: dependencies are fetched and found, but none is
     /// built.
     Configure,
+    /// `compdb`: like `Configure`, except that a `cmake` dependency that an
+    /// earlier build left behind, and whose configuration still matches, is
+    /// read from its build directory instead of being marked `not_built`.
+    /// Nothing is run or written.
+    Reuse,
     Build,
 }
 
@@ -83,6 +88,9 @@ pub fn reached(c: &Configured) -> BTreeSet<usize> {
 /// marked `not_built` in `Phase::Configure` (its own `include` keys still
 /// reach its consumers); `Phase::Build` configures and builds it, and adds
 /// the include directories CMake reports unless it declares its own.
+/// `Phase::Reuse` does the same from the build directory of an earlier build,
+/// without running CMake, and leaves the dependency `not_built` if there is
+/// none or its configuration changed.
 pub fn prepare_all(
     project: &mut Project,
     phase: Phase,
@@ -103,7 +111,7 @@ pub fn prepare_all(
                 .is_some_and(|d| matches!(d.source, DepSource::Path(_) | DepSource::Git { .. }));
             let done = match kind {
                 DepKind::Sources => !u.sources.is_empty(),
-                DepKind::Cmake if phase == Phase::Build => {
+                DepKind::Cmake if phase != Phase::Configure => {
                     project.prepared.get(&unit).is_some_and(|p| !p.not_built)
                 }
                 _ => project.prepared.contains_key(&unit),
@@ -131,7 +139,7 @@ pub fn prepare_all(
 }
 
 /// A `cmake` dependency: only marked in `Phase::Configure`, built in
-/// `Phase::Build`.
+/// `Phase::Build`, read from an earlier build in `Phase::Reuse`.
 fn prepare_cmake(
     project: &mut Project,
     phase: Phase,
@@ -146,11 +154,12 @@ fn prepare_cmake(
             "kind `cmake` needs `expose.target`",
         ));
     }
+    let not_built = Prepared {
+        not_built: true,
+        ..Prepared::default()
+    };
     if phase == Phase::Configure {
-        return Ok(Prepared {
-            not_built: true,
-            ..Prepared::default()
-        });
+        return Ok(not_built);
     }
     let prepared = build_cmake(
         &project.configured,
@@ -158,10 +167,13 @@ fn prepare_cmake(
         &project.build_dir(),
         unit,
         &project.toolchains,
-        jobs,
+        (phase == Phase::Build).then_some(jobs),
         &mut project.diagnostics,
     )
     .map_err(|message| ConfigError::invalid(field, message))?;
+    let Some(prepared) = prepared else {
+        return Ok(not_built);
+    };
     // CMake's own include directories reach the consumers like `include` keys,
     // and the system libraries its targets link like `system` keys.
     let public = &mut project.configured.units[unit].public;

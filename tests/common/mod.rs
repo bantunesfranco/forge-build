@@ -70,6 +70,23 @@ impl Fixture {
         }
     }
 
+    /// Runs the real `forge` in the project directory with this fixture's
+    /// toolchain file.
+    pub fn forge(&self, args: &[&str]) -> std::process::Output {
+        self.forge_in(&self.root, args)
+    }
+
+    /// Like `forge`, started from `dir` (the manifest is found from there).
+    pub fn forge_in(&self, dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_forge"))
+            .current_dir(dir)
+            .arg("--toolchain")
+            .arg(self.root.join("toolchain.toml"))
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
     /// Loads the project with a stub executor (nothing is run).
     pub fn load(&self) -> Result<Project, ConfigError> {
         self.load_with(&self.invocation(), &VersionStub)
@@ -131,5 +148,6 @@ pub fn jobs(n: usize) -> BuildOptions {
     BuildOptions {
         jobs: n,
         verbose: false,
+        ..BuildOptions::default()
     }
 }

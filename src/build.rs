@@ -30,6 +30,28 @@ pub struct BuildPlan {
 pub struct BuildOptions {
     pub jobs: usize,
     pub verbose: bool,
+    /// Where the progress lines go (`Compiling ...`, `Build is up to date`, and
+    /// with `verbose` the reasons and commands). Compiler output always goes
+    /// to stderr.
+    pub progress: Stream,
+}
+
+/// A standard output stream.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Stream {
+    #[default]
+    Stdout,
+    Stderr,
+}
+
+impl Stream {
+    /// Prints one line to this stream.
+    pub fn line(self, text: std::fmt::Arguments) {
+        match self {
+            Stream::Stdout => println!("{text}"),
+            Stream::Stderr => eprintln!("{text}"),
+        }
+    }
 }
 
 impl Default for BuildOptions {
@@ -37,6 +59,7 @@ impl Default for BuildOptions {
         BuildOptions {
             jobs: std::thread::available_parallelism().map_or(1, |n| n.get()),
             verbose: false,
+            progress: Stream::Stdout,
         }
     }
 }
@@ -254,7 +277,7 @@ pub fn build(
     } = prepare(graph, project, exec);
     let db_file = db_path(project);
     if dirty.is_empty() {
-        println!("Build is up to date");
+        opts.progress.line(format_args!("Build is up to date"));
         return Ok(());
     }
 
@@ -323,13 +346,23 @@ pub fn build(
                 }
 
                 match task.kind {
-                    TaskKind::Compile => println!("Compiling {}", task.inputs[0].display()),
-                    TaskKind::Archive => println!("Archiving {}", out.display()),
-                    TaskKind::Link => println!("Linking {}", out.display()),
+                    TaskKind::Compile => opts
+                        .progress
+                        .line(format_args!("Compiling {}", task.inputs[0].display())),
+                    TaskKind::Archive => opts
+                        .progress
+                        .line(format_args!("Archiving {}", out.display())),
+                    TaskKind::Link => opts
+                        .progress
+                        .line(format_args!("Linking {}", out.display())),
                 }
                 if opts.verbose {
-                    println!("  reason: {}", dirty[&id]);
-                    println!("  {} {}", specs[id].program, specs[id].args.join(" "));
+                    opts.progress.line(format_args!("  reason: {}", dirty[&id]));
+                    opts.progress.line(format_args!(
+                        "  {} {}",
+                        specs[id].program,
+                        specs[id].args.join(" ")
+                    ));
                 }
 
                 // snapshot the inputs *before* the command can see them change
@@ -382,7 +415,8 @@ pub fn build(
                         Err(why) => {
                             db.tasks.remove(&task.outputs[0]);
                             if opts.verbose {
-                                println!("  not recording {out}: {why}");
+                                opts.progress
+                                    .line(format_args!("  not recording {out}: {why}"));
                             }
                         }
                     }
