@@ -126,6 +126,9 @@ pub struct Configured {
     /// The LLVM triple of the target platform, set only when `--target` names
     /// a platform other than the host's.
     pub cross_triple: Option<String>,
+    /// The toolchain file's `sysroot`, given to gcc, clang and Apple clang as
+    /// `--sysroot=`. Set by the project, which knows the toolchain.
+    pub sysroot: Option<PathBuf>,
     pub profile: String,
     pub profile_scalars: ProfileScalars,
     /// The profile's `defines` and `flags` (both visibilities); these apply to

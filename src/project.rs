@@ -198,6 +198,15 @@ impl Project {
         .map_err(|m| ConfigError::invalid("archiver", m))?;
 
         let mut diagnostics = std::mem::take(&mut configured.diagnostics);
+        configured.sysroot = toolchains.sysroot.clone();
+        if configured.sysroot.is_some()
+            && matches!(platform.compiler, Compiler::Msvc | Compiler::ClangCl)
+        {
+            diagnostics.warn(format!(
+                "the toolchain's sysroot is ignored: {} has no --sysroot option",
+                platform.compiler.as_str()
+            ));
+        }
         if let Some(target) = inv.target.as_deref()
             && host_os_arch().is_ok_and(|host| host != (platform.os, platform.arch))
             && let Some(warning) = cross_compile_warning(

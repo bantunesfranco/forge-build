@@ -40,7 +40,7 @@ struct Cli {
     #[arg(long = "target", value_name = "ARCH-OS", global = true)]
     platform_target: Option<String>,
 
-    /// A toolchain file naming the compilers (`[toolchain]` with c, cxx, ar)
+    /// A toolchain file (`[toolchain]` with c, cxx, ar, pkg_config, sysroot)
     #[arg(long, value_name = "FILE", global = true)]
     toolchain: Option<PathBuf>,
 

@@ -702,6 +702,7 @@ pub fn configure(
     Ok(Configured {
         platform,
         cross_triple,
+        sysroot: None,
         profile,
         profile_scalars,
         profile_settings,
