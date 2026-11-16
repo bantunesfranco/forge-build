@@ -122,8 +122,10 @@ does not have to exist on the others. Their `project.lock` entries are kept.
 `forge clean` fetches and builds nothing. A relative `git` URL (`./repo`,
 `../repo`) is taken from the manifest directory.
 
-A static CMake library does not report the system libraries it needs, so add them
-with `system` keys on the dependency. Only static libraries can be exposed: a
+forge detects the system libraries that the exposed targets need (`gdi32`, `m`,
+`-framework Cocoa`, ...) through a probe executable that CMake never builds, so they
+reach the link of every bin without `system` keys; this needs CMake 3.19 or newer
+(with an older one forge warns, and the keys are needed). Only static libraries can be exposed: a
 `SHARED_LIBRARY` target is an error (set `BUILD_SHARED_LIBS=OFF` or expose a static
 target). forge picks the CMake generator so that the dependency is built with its own
 compiler: `CMAKE_GENERATOR` if set, otherwise Ninja if it is installed, otherwise on
@@ -292,8 +294,6 @@ Linux, macOS (Apple clang or Homebrew LLVM) and Windows (MSVC `cl`, `clang-cl`, 
   starts can be recorded as clean.
 - **Ctrl-C is not handled specially.** A partially written output is caught on the
   next build, because its hash will not match the record.
-- **Static CMake libraries** do not report their system link dependencies; declare
-  them with `system` keys.
 - **Deferred features** are listed in section 15 of the [manifest specification](docs/manifest-spec.md).
 
 ## Roadmap

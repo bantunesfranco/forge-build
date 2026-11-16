@@ -99,8 +99,13 @@ pub fn shell_words(text: &str) -> Vec<String> {
 /// always does, and `-framework` keeps both tokens together. A bare token is a
 /// library file and goes to the linker.
 pub fn split_flags(tokens: &str) -> Found {
+    split_tokens(shell_words(tokens))
+}
+
+/// `split_flags` for tokens that are already split into words.
+pub fn split_tokens(tokens: Vec<String>) -> Found {
     let mut found = Found::default();
-    let mut it = shell_words(tokens).into_iter();
+    let mut it = tokens.into_iter();
     while let Some(token) = it.next() {
         let token = token.as_str();
         if token == "-isystem" {
@@ -242,7 +247,7 @@ fn push_unique<T: PartialEq>(list: &mut Vec<T>, item: T) {
 
 /// Turns what a finder found into the dependency's public interface. With an
 /// MSVC-like linker the GNU-only tokens are dropped, with a warning.
-fn to_prepared(
+pub fn to_prepared(
     found: &Found,
     system_headers: bool,
     msvc: bool,
