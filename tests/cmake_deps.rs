@@ -425,3 +425,58 @@ fn compdb_reads_a_built_cmake_dependency_and_names_an_unbuilt_one() {
     assert!(stderr.contains(note), "{stderr}");
     assert!(!include(&database()), "{}", database());
 }
+
+#[test]
+fn a_cmake_dependency_inside_a_shared_library_is_position_independent() {
+    if !usable("cmake") {
+        eprintln!("skipped: cmake is not installed");
+        return;
+    }
+    let (Some(cc), Some(cxx)) = (real_cc(), real_cxx()) else {
+        eprintln!("skipped: no C and C++ compiler can be run");
+        return;
+    };
+    let manifest = MANIFEST.replace(
+        "[bin.app]\nsources = [\"main.c\"]\ndeps = [\"m\"]\n",
+        concat!(
+            "[lib.engine]\nkind = \"shared\"\nsources = [\"engine.c\"]\ninclude.public = [\"inc\"]\ndeps = [\"m\"]\n",
+            "[bin.app]\nsources = [\"main.c\"]\ndeps = [\"engine\"]\n",
+        ),
+    );
+    let f = project_dir(&cc, &cxx);
+    f.write("project.toml", &manifest);
+    f.write(
+        "inc/engine.h",
+        concat!(
+            "#if defined(ENGINE_SHARED) && defined(_WIN32)\n",
+            "#  if defined(ENGINE_BUILDING)\n#    define ENGINE_API __declspec(dllexport)\n",
+            "#  else\n#    define ENGINE_API __declspec(dllimport)\n#  endif\n",
+            "#elif defined(ENGINE_SHARED)\n#  define ENGINE_API __attribute__((visibility(\"default\")))\n",
+            "#else\n#  define ENGINE_API\n#endif\n",
+            "ENGINE_API int engine_value(void);\n",
+        ),
+    );
+    f.write(
+        "engine.c",
+        "#include <engine.h>\n#include <m.h>\nint engine_value(void) { return m_value(); }\n",
+    );
+    f.write(
+        "main.c",
+        "#include <engine.h>\nint main(void) { return engine_value(); }\n",
+    );
+    let p = load_and_prepare(&f);
+    let cache = fs::read_to_string(f.root.join("build/debug/deps/m/cmake/CMakeCache.txt")).unwrap();
+    let asked = cache
+        .lines()
+        .any(|l| l.starts_with("CMAKE_POSITION_INDEPENDENT_CODE:") && l.ends_with("=ON"));
+    assert_eq!(asked, !cfg!(windows), "{cache}");
+    // The consumer of the shared library does not link the dependency's library.
+    let g = Graph::from_project(&p).unwrap();
+    let app = p.targets.iter().find(|t| t.name == "app").unwrap();
+    assert!(app.link_inputs.is_empty(), "{app:?}");
+    build(&p, &g, &ProcessExecutor, jobs(2)).unwrap_or_else(|e| panic!("{e}"));
+    let status = Command::new(f.root.join(format!("build/debug/bin/{}", exe("app"))))
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(7));
+}

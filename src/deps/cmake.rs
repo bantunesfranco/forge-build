@@ -22,7 +22,7 @@ use crate::{
         system::{shell_words, split_tokens, to_prepared},
     },
     executor::path_arg,
-    flags::{archiver, cmake_build_type, profile_args},
+    flags::{archiver, cmake_build_type, position_independent, profile_args},
     lang::Lang,
     platform::Toolchains,
 };
@@ -72,6 +72,8 @@ pub struct CmakeTarget {
 /// for MSVC-like compilers. `tool_args` (generator and archiver, see
 /// `generator_args` and `archiver_args`) and `platform_args` (see
 /// `platform_args`) follow the compilers; `options` come last so they win.
+/// `pic` asks for position-independent code (spec 6.5), which a dependency
+/// that goes into a shared library needs.
 #[allow(clippy::too_many_arguments)]
 pub fn configure_args(
     src: &Path,
@@ -83,6 +85,7 @@ pub fn configure_args(
     flags_c: &[String],
     flags_cxx: &[String],
     msvc_runtime: Option<&str>,
+    pic: bool,
     options: &BTreeMap<String, String>,
 ) -> Vec<String> {
     let mut args = vec![
@@ -107,6 +110,9 @@ pub fn configure_args(
     if let Some(runtime) = msvc_runtime {
         args.push("-DCMAKE_POLICY_DEFAULT_CMP0091=NEW".to_string());
         args.push(format!("-DCMAKE_MSVC_RUNTIME_LIBRARY={runtime}"));
+    }
+    if pic {
+        args.push("-DCMAKE_POSITION_INDEPENDENT_CODE=ON".to_string());
     }
     args.extend(options.iter().map(|(k, v)| format!("-D{k}={v}")));
     args
@@ -771,6 +777,7 @@ pub fn build_cmake(
         &profile_args(c, Lang::C),
         &profile_args(c, Lang::Cxx),
         runtime,
+        position_independent(c, unit),
         &dep.cmake_options,
     );
 
@@ -960,6 +967,7 @@ mod tests {
             &s(&["-O2", "-g"]),
             &s(&["-O2", "-g", "-flto"]),
             None,
+            false,
             &options,
         );
         assert_eq!(
@@ -989,6 +997,7 @@ mod tests {
             &s(&["/Od"]),
             &s(&["/Od"]),
             Some("MultiThreadedDebugDLL"),
+            false,
             &BTreeMap::new(),
         );
         assert!(!msvc.iter().any(|a| a.contains("_COMPILER")), "{msvc:?}");
@@ -1000,6 +1009,36 @@ mod tests {
                 .iter()
                 .any(|a| a.contains("CMP0091") || a.contains("MSVC_RUNTIME"))
         );
+    }
+
+    #[test]
+    fn position_independent_code_is_asked_for_before_the_options() {
+        let options = BTreeMap::from([(
+            "CMAKE_POSITION_INDEPENDENT_CODE".to_string(),
+            "OFF".to_string(),
+        )]);
+        let args = |pic, options: &BTreeMap<String, String>| {
+            configure_args(
+                Path::new("/src"),
+                Path::new("/b"),
+                "Debug",
+                Some(("cc", "c++")),
+                &[],
+                &[],
+                &[],
+                &[],
+                None,
+                pic,
+                options,
+            )
+        };
+        let on = "-DCMAKE_POSITION_INDEPENDENT_CODE=ON".to_string();
+        assert!(!args(false, &BTreeMap::new()).contains(&on));
+        assert!(args(true, &BTreeMap::new()).contains(&on));
+        // An option the manifest sets comes later, so it wins.
+        let both = args(true, &options);
+        let at = |what: &str| both.iter().position(|a| a == what).unwrap();
+        assert!(at(&on) < at("-DCMAKE_POSITION_INDEPENDENT_CODE=OFF"));
     }
 
     #[test]
@@ -1046,6 +1085,7 @@ mod tests {
             &[],
             &[],
             None,
+            false,
             &options,
         );
         let at = |what: &str| args.iter().position(|a| a == what).unwrap();
@@ -1459,6 +1499,7 @@ mod tests {
             &s(&["-g"]),
             &s(&["-g"]),
             None,
+            false,
             &BTreeMap::new(),
         );
         let at = |what: &str| args.iter().position(|a| a == what).unwrap();
