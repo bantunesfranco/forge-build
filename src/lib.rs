@@ -1,3 +1,10 @@
+//! Forge, an incremental C/C++ build system. The `forge` and `forge-build`
+//! binaries are the product; see the README for how to use them.
+//!
+//! This library exists so the binaries and the integration tests can share
+//! code. It is **not a stable API**: anything in it may change in any release,
+//! including patch releases. Don't depend on it from other crates.
+
 pub mod build;
 pub mod cli;
 pub mod compdb;
